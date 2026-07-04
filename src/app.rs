@@ -23,9 +23,15 @@ const MAX_TURNS: u32 = 8;
 pub struct RunOptions {
     pub question: String,
     pub config_path: PathBuf,
-    pub events_path: PathBuf,
+    pub ledger: RunLedger,
     pub workspace_root: PathBuf,
     pub approval_mode: ApprovalMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunLedger {
+    Jsonl(PathBuf),
+    Sqlite(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -67,7 +73,10 @@ pub fn run_question(options: RunOptions) -> AppResult<()> {
         config.provider.app_title.clone(),
         token_limit_field(&config.provider.kind),
     )?;
-    let mut recorder = EventRecorder::create(&options.events_path)?;
+    let mut recorder = match &options.ledger {
+        RunLedger::Jsonl(path) => EventRecorder::create_jsonl(path)?,
+        RunLedger::Sqlite(path) => EventRecorder::create_sqlite(path, &run_id)?,
+    };
     let agent_id = AgentId::new("plato")?;
     let model = ModelName::new(config.provider.model.clone())?;
     let stdin_actor_id = ActorId::new("stdin")?;

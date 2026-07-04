@@ -15,7 +15,7 @@ This document copies the topology decision from the Platonic workspace issue tha
 - Fallback rule: provider fallback is per-run ledger evidence. The process that computes it is mechanics; unrecorded fallback is forbidden.
 - Daemon noun: `plato-agentd` is the persistent runtime. Gateways are future ingress adapters and never own agent semantics.
 - TUI decision: `plato-tui` is a separate binary in this crate once it exists.
-- Daemon ownership: `plato-agentd` owns the Unix socket, event database, and process lock. XDG runtime/state paths are keyed by `workspace-id`; derivation is TBD.
+- Daemon ownership: `plato-agentd` owns the Unix socket, event database, and process lock. XDG runtime/state paths are keyed by `workspace-id` = sanitized root basename + first 16 SHA-256 hex chars of the canonical root path.
 - Single-writer invariant: one live writer owns a workspace store. Before daemon and CLI coexist on SQLite, decide whether CLI writes directly, delegates to the daemon, or refuses while the daemon is active.
 - Daemon API sketch: start run, append message, stream events, approve/deny, cancel, list sessions, read transcript.
 - Connector rule: connectors and gateways never own sessions, policy, approvals, provider fallback, or run semantics. Process placement is host mechanics; the semantic boundary is binding.
