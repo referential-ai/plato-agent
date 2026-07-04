@@ -260,7 +260,6 @@ struct ChatFunctionDefinition {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ChatToolCall {
     id: String,
     #[serde(rename = "type")]
@@ -269,7 +268,6 @@ struct ChatToolCall {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ChatFunctionCall {
     name: String,
     arguments: String,
@@ -595,6 +593,40 @@ mod tests {
         let response = response.into_model_response().unwrap();
 
         assert_eq!(response.stop, ModelStop::ToolUse);
+        assert_eq!(
+            response.tool_uses(),
+            vec![(
+                "call_1".into(),
+                "file.read".into(),
+                json!({"path": "README.md"})
+            )]
+        );
+    }
+
+    #[test]
+    fn ignores_extra_fields_on_provider_tool_calls() {
+        let response: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "index": 0,
+                        "function": {
+                            "name": "file_read",
+                            "arguments": "{\"path\":\"README.md\"}",
+                            "parsed_arguments": {"path": "README.md"}
+                        }
+                    }]
+                }
+            }]
+        }))
+        .unwrap();
+
+        let response = response.into_model_response().unwrap();
+
         assert_eq!(
             response.tool_uses(),
             vec![(

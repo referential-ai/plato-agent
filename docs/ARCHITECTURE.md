@@ -11,6 +11,8 @@ This document copies the topology decision from the Platonic workspace issue tha
   - `plato-tui`: terminal client for rendering and keyboard UX only.
 - Bootstrap rule: create only `plato.rs` at repo creation. No stub binaries.
 - Permanent invariant: `plato` one-shot and `plato replay` work without a daemon.
+- Host-loop rule: `plato` and `plato-agentd` share one run-driving implementation. Binaries do not fork model/tool/policy event choreography.
+- Fallback rule: provider fallback is per-run ledger evidence. The process that computes it is mechanics; unrecorded fallback is forbidden.
 - TUI decision: `plato-tui` is a separate binary once it exists.
 - Connector rule: connectors never own sessions, policy, approvals, provider fallback, or run semantics. Process placement is host mechanics; the semantic boundary is binding.
 
@@ -33,4 +35,3 @@ The CLI writes a `plato-agent` JSONL envelope around `platonic-core::RecordedEve
 ```
 
 Bare `RecordedEvent` lines are not persisted by this app shell.
-

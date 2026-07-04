@@ -21,6 +21,8 @@
 
 - Bootstrap with `src/bin/plato.rs` only.
 - `plato` one-shot execution and `plato replay` must work without a daemon permanently.
+- `plato` and future `plato-agentd` must share one run-driving implementation. Do not duplicate model/tool/policy event choreography.
+- Provider fallback changes run outcome and must be recorded in the run ledger. Unrecorded fallback is forbidden.
 - Add `plato-agentd` only when a second client needs a persistent runtime.
 - Add `plato-tui` only after a daemon/client API exists.
 - Connectors must not own sessions, policy, approvals, provider fallback, or run semantics.
