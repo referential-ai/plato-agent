@@ -29,6 +29,12 @@ pub struct RunOptions {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunOutcome {
+    pub run_id: RunId,
+    pub final_answer: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunLedger {
     Jsonl(PathBuf),
     Sqlite(PathBuf),
@@ -58,7 +64,7 @@ impl ApprovalMode {
     }
 }
 
-pub fn run_question(options: RunOptions) -> AppResult<()> {
+pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
     if options.question.trim().is_empty() {
         return Err(AppError::EmptyQuestion);
     }
@@ -162,9 +168,14 @@ pub fn run_question(options: RunOptions) -> AppResult<()> {
             ));
         }
         if tool_uses.is_empty() {
-            println!("{}", response.text());
-            recorder.record(HarnessEvent::RunFinished { run_id })?;
-            return Ok(());
+            let final_answer = response.text();
+            recorder.record(HarnessEvent::RunFinished {
+                run_id: run_id.clone(),
+            })?;
+            return Ok(RunOutcome {
+                run_id,
+                final_answer,
+            });
         }
 
         if tool_uses.len() > 1 {

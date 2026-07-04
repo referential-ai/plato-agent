@@ -1,9 +1,13 @@
 use clap::{Parser, Subcommand};
 use plato_agent::{
-    AppError, ApprovalMode, RunLedger, RunOptions, paths::default_sqlite_path, replay_file,
-    replay_sqlite, run_question,
+    AppError, ApprovalMode, RunLedger, RunOptions, RunOutcome, paths::default_sqlite_path,
+    replay_file, replay_sqlite, run_question,
 };
-use std::path::PathBuf;
+use platonic_core::RunId;
+use std::{
+    io::{self, Write},
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "plato")]
@@ -100,24 +104,122 @@ fn run() -> plato_agent::AppResult<()> {
                     RunLedger::Jsonl(cli.events.unwrap_or_else(|| PathBuf::from("events.jsonl")))
                 }
             };
-            run_question(RunOptions {
+            let outcome = run_question(RunOptions {
                 question,
                 config_path: cli.config,
-                ledger,
+                ledger: ledger.clone(),
                 workspace_root,
                 approval_mode: ApprovalMode::from_yolo(cli.yolo),
-            })
+            })?;
+            write_run_success_output(&mut io::stdout(), &mut io::stderr(), &outcome, &ledger)
         }
     }
 }
 
 fn sqlite_path(
     db: Option<Option<PathBuf>>,
-    workspace_root: &std::path::Path,
+    workspace_root: &Path,
 ) -> plato_agent::AppResult<Option<PathBuf>> {
     match db {
         None => Ok(None),
-        Some(Some(path)) => Ok(Some(path)),
+        Some(Some(path)) => Ok(Some(resolve_cli_path(path, workspace_root))),
         Some(None) => Ok(Some(default_sqlite_path(workspace_root)?)),
+    }
+}
+
+fn resolve_cli_path(path: PathBuf, workspace_root: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        workspace_root.join(path)
+    }
+}
+
+fn write_run_success_output(
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    outcome: &RunOutcome,
+    ledger: &RunLedger,
+) -> plato_agent::AppResult<()> {
+    writeln!(stdout, "{}", outcome.final_answer)?;
+    if let RunLedger::Sqlite(path) = ledger {
+        write_sqlite_replay_hint(stderr, &outcome.run_id, path)?;
+    }
+    Ok(())
+}
+
+fn write_sqlite_replay_hint(
+    stderr: &mut impl Write,
+    run_id: &RunId,
+    path: &Path,
+) -> plato_agent::AppResult<()> {
+    let path = path.to_string_lossy();
+    writeln!(stderr, "run_id: {run_id}")?;
+    writeln!(stderr, "ledger_path: {path}")?;
+    writeln!(
+        stderr,
+        "replay: plato replay --db={} --run {run_id}",
+        shell_quote(&path)
+    )?;
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "_./:-".contains(character))
+    {
+        value.into()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_success_hint_goes_to_stderr_without_changing_stdout() {
+        let outcome = RunOutcome {
+            run_id: RunId::new("run_1").unwrap(),
+            final_answer: "done".into(),
+        };
+        let ledger = RunLedger::Sqlite(PathBuf::from("/tmp/plato proof/agent.db"));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_run_success_output(&mut stdout, &mut stderr, &outcome, &ledger).unwrap();
+
+        assert_eq!(String::from_utf8(stdout).unwrap(), "done\n");
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "run_id: run_1\nledger_path: /tmp/plato proof/agent.db\nreplay: plato replay --db='/tmp/plato proof/agent.db' --run run_1\n"
+        );
+    }
+
+    #[test]
+    fn jsonl_success_does_not_print_replay_hint() {
+        let outcome = RunOutcome {
+            run_id: RunId::new("run_1").unwrap(),
+            final_answer: "done".into(),
+        };
+        let ledger = RunLedger::Jsonl(PathBuf::from("events.jsonl"));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_run_success_output(&mut stdout, &mut stderr, &outcome, &ledger).unwrap();
+
+        assert_eq!(String::from_utf8(stdout).unwrap(), "done\n");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn explicit_sqlite_path_is_resolved_against_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let path = sqlite_path(Some(Some(PathBuf::from("agent.db"))), dir.path()).unwrap();
+
+        assert_eq!(path, Some(dir.path().join("agent.db")));
     }
 }
