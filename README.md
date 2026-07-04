@@ -58,6 +58,78 @@ cargo run --bin plato -- replay --db=/tmp/plato-agent.db
 cargo run --bin plato -- replay --db=/tmp/plato-agent.db --run run_123
 ```
 
+## Daemon
+
+`plato-agentd` is the local runtime daemon for session-facing clients such as
+the future `plato-tui`. The runtime topology and verb set are defined in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#runtime-topology) and issue
+[#11](https://github.com/referential-ai/plato-agent/issues/11).
+
+Start it for a workspace:
+
+```bash
+cargo run --bin plato-agentd -- --workspace "$PWD"
+```
+
+On startup it prints:
+
+```text
+workspace_id: <workspace-id>
+socket_path: <runtime-path>/agent.sock
+ledger_path: <state-path>/agent.db
+```
+
+Default paths are keyed by the workspace id:
+
+- socket: `${XDG_RUNTIME_DIR:-/tmp/plato-agent/$USER}/plato-agent/workspaces/<workspace-id>/agent.sock`
+- lock: `${XDG_RUNTIME_DIR:-/tmp/plato-agent/$USER}/plato-agent/workspaces/<workspace-id>/agent.lock`
+- ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/plato-agent/workspaces/<workspace-id>/agent.db`
+
+The daemon holds the lock while it is active. Current shutdown is by stopping
+the process. There is no SIGINT cleanup handler yet, so a forced stop can leave
+a stale socket or lock. If that happens, inspect `agent.lock`, verify the
+recorded process is gone, then remove the stale `agent.lock` and `agent.sock`.
+Do not remove a lock for a live daemon.
+
+Minimal NDJSON-over-Unix-socket check, using the `workspace_id` and
+`socket_path` printed by the daemon:
+
+```bash
+WORKSPACE_ROOT="$PWD" \
+WORKSPACE_ID="<workspace-id>" \
+SOCKET_PATH="<socket-path>" \
+python3 - <<'PY'
+import json
+import os
+import socket
+
+def send(file, request):
+    file.write(json.dumps(request) + "\n")
+    file.flush()
+    print(file.readline(), end="")
+
+with socket.socket(socket.AF_UNIX) as sock:
+    sock.connect(os.environ["SOCKET_PATH"])
+    file = sock.makefile("rw")
+    send(file, {
+        "v": 1,
+        "id": "hello_1",
+        "kind": "request",
+        "method": "hello",
+        "params": {
+            "workspace_root": os.environ["WORKSPACE_ROOT"],
+            "workspace_id": os.environ["WORKSPACE_ID"],
+        },
+    })
+    send(file, {
+        "v": 1,
+        "id": "sessions_1",
+        "kind": "request",
+        "method": "sessions.list",
+    })
+PY
+```
+
 ## Commands
 
 ```bash
