@@ -202,12 +202,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_has_the_two_bootstrap_tools() {
+    fn default_config_has_the_bootstrap_tools() {
         let config = Config::default();
 
         assert_eq!(config.provider.api_key_env, "OPENAI_API_KEY");
         assert_eq!(config.provider.base_url, "https://api.openai.com/v1");
-        assert_eq!(config.tools.enabled, vec!["file.read", "file.write"]);
+        assert_eq!(
+            config.tools.enabled,
+            vec!["file.read", "file.list", "file.write"]
+        );
     }
 
     #[test]

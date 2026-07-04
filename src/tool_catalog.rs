@@ -3,9 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const FILE_READ: &str = "file.read";
+pub const FILE_LIST: &str = "file.list";
 pub const FILE_WRITE: &str = "file.write";
 
 const PROVIDER_FILE_READ: &str = "file_read";
+const PROVIDER_FILE_LIST: &str = "file_list";
 const PROVIDER_FILE_WRITE: &str = "file_write";
 
 const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
@@ -14,14 +16,21 @@ const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
         provider_name: PROVIDER_FILE_READ,
         effect: EffectClass::ReadOnly,
         description: "Read a UTF-8 text file inside the current workspace.",
-        input_schema: ToolInputSchema::FileRead,
+        input_schema: ToolInputSchema::Read,
+    },
+    ToolDefinition {
+        internal_name: FILE_LIST,
+        provider_name: PROVIDER_FILE_LIST,
+        effect: EffectClass::ReadOnly,
+        description: "List direct entries in one directory inside the current workspace.",
+        input_schema: ToolInputSchema::List,
     },
     ToolDefinition {
         internal_name: FILE_WRITE,
         provider_name: PROVIDER_FILE_WRITE,
         effect: EffectClass::WorkspaceWrite,
         description: "Write UTF-8 text to a relative path inside the current workspace after approval.",
-        input_schema: ToolInputSchema::FileWrite,
+        input_schema: ToolInputSchema::Write,
     },
 ];
 
@@ -36,8 +45,9 @@ pub struct ToolDefinition {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ToolInputSchema {
-    FileRead,
-    FileWrite,
+    Read,
+    List,
+    Write,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -107,7 +117,7 @@ impl ToolSpec {
 impl ToolInputSchema {
     fn to_json(self) -> Value {
         match self {
-            Self::FileRead => json!({
+            Self::Read => json!({
                 "type": "object",
                 "properties": {
                     "path": {
@@ -118,7 +128,18 @@ impl ToolInputSchema {
                 "required": ["path"],
                 "additionalProperties": false
             }),
-            Self::FileWrite => json!({
+            Self::List => json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path inside the current workspace."
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            Self::Write => json!({
                 "type": "object",
                 "properties": {
                     "path": {
@@ -142,7 +163,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bootstrap_catalog_is_exactly_file_read_and_file_write() {
+    fn bootstrap_catalog_is_exactly_file_read_file_list_and_file_write() {
         let actual = bootstrap_tools()
             .iter()
             .map(|tool| (tool.internal_name, tool.effect.clone()))
@@ -152,6 +173,7 @@ mod tests {
             actual,
             vec![
                 (FILE_READ, EffectClass::ReadOnly),
+                (FILE_LIST, EffectClass::ReadOnly),
                 (FILE_WRITE, EffectClass::WorkspaceWrite),
             ]
         );
@@ -172,10 +194,11 @@ mod tests {
 
     #[test]
     fn emits_provider_tool_specs_from_catalog() {
-        let specs = tool_specs(&[FILE_READ.into(), FILE_WRITE.into()]);
+        let specs = tool_specs(&[FILE_READ.into(), FILE_LIST.into(), FILE_WRITE.into()]);
 
-        assert_eq!(specs.len(), 2);
+        assert_eq!(specs.len(), 3);
         assert_eq!(specs[0].name, PROVIDER_FILE_READ);
-        assert_eq!(specs[1].name, PROVIDER_FILE_WRITE);
+        assert_eq!(specs[1].name, PROVIDER_FILE_LIST);
+        assert_eq!(specs[2].name, PROVIDER_FILE_WRITE);
     }
 }
