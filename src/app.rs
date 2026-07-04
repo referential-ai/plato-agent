@@ -463,6 +463,21 @@ mod tests {
     }
 
     #[test]
+    fn enabled_file_list_is_allowed() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            tool: ToolName::new("file.list").unwrap(),
+            effect: EffectClass::ReadOnly,
+            input: json!({"path": "."}),
+        };
+
+        assert_eq!(
+            evaluate_policy(&["file.list".into()], &call),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
     fn enabled_file_write_requires_approval() {
         let call = ToolCall {
             id: ToolCallId::new("call_1").unwrap(),

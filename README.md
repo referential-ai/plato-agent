@@ -24,7 +24,7 @@ token_budget = 4000
 max_output_tokens = 1024
 
 [tools]
-enabled = ["file.read", "file.write"]
+enabled = ["file.read", "file.list", "file.write"]
 ```
 
 For OpenRouter:
@@ -38,7 +38,7 @@ http_referer = "https://example.invalid"
 app_title = "Plato Agent"
 ```
 
-`file.read` is auto-allowed. `file.write` requires stdin approval and defaults to no.
+`file.read` and `file.list` are auto-allowed. `file.write` requires stdin approval and defaults to no.
 Use `--yolo` to auto-approve enabled tools that would otherwise prompt. Yolo
 mode does not enable disabled or unknown tools, permit deny-class effects such
 as external side effects or secret access, or bypass workspace path checks.

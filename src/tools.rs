@@ -1,7 +1,7 @@
-use crate::tool_catalog::{FILE_READ, FILE_WRITE};
+use crate::tool_catalog::{FILE_LIST, FILE_READ, FILE_WRITE};
 use crate::{AppError, AppResult};
 use platonic_core::{ResultVisibility, ToolResult};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -10,11 +10,19 @@ use std::{
 };
 
 const MAX_READ_BYTES: usize = 64 * 1024;
+const MAX_LIST_ENTRIES: usize = 200;
+const MAX_LIST_DATA_BYTES: usize = 32 * 1024;
 const APPROVAL_PREVIEW_CHARS: usize = 1_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileReadInput {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileListInput {
     path: String,
 }
 
@@ -39,6 +47,7 @@ pub fn execute_tool(
 ) -> AppResult<ToolResult> {
     match tool_name {
         FILE_READ => read_file(workspace_root, call_id, input),
+        FILE_LIST => list_directory(workspace_root, call_id, input),
         FILE_WRITE => write_file(workspace_root, call_id, input),
         _ => Err(AppError::Tool(format!("unknown tool: {tool_name}"))),
     }
@@ -86,6 +95,65 @@ fn read_file(
     })
 }
 
+fn list_directory(
+    workspace_root: &Path,
+    call_id: platonic_core::ToolCallId,
+    input: Value,
+) -> AppResult<ToolResult> {
+    let input: FileListInput = serde_json::from_value(input)?;
+    let path = resolve_existing_path(workspace_root, &input.path)?;
+    if !path.metadata()?.is_dir() {
+        return Err(AppError::Tool(format!("not a directory: {}", input.path)));
+    }
+
+    let mut entries = fs::read_dir(&path)?
+        .map(|entry| {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            Ok(ListEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                kind: file_kind(&file_type),
+            })
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let entry_count = entries.len();
+    let mut returned = Vec::new();
+    let mut data_bytes = 0usize;
+    let mut truncated = false;
+    for entry in entries {
+        let entry_bytes = estimated_list_entry_bytes(&entry);
+        if returned.len() >= MAX_LIST_ENTRIES
+            || data_bytes.saturating_add(entry_bytes) > MAX_LIST_DATA_BYTES
+        {
+            truncated = true;
+            break;
+        }
+        data_bytes += entry_bytes;
+        returned.push(entry);
+    }
+    truncated |= returned.len() < entry_count;
+    let returned_count = returned.len();
+
+    Ok(ToolResult {
+        call_id,
+        summary: format!(
+            "listed {} of {} entries in {}",
+            returned_count, entry_count, input.path
+        ),
+        data: json!({
+            "path": input.path,
+            "entries": returned,
+            "truncated": truncated,
+            "entry_count": entry_count,
+            "returned_count": returned_count
+        }),
+        artifacts: vec![],
+        visibility: ResultVisibility::Both,
+    })
+}
+
 fn write_file(
     workspace_root: &Path,
     call_id: platonic_core::ToolCallId,
@@ -105,6 +173,28 @@ fn write_file(
         artifacts: vec![],
         visibility: ResultVisibility::Both,
     })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ListEntry {
+    name: String,
+    kind: &'static str,
+}
+
+fn file_kind(file_type: &fs::FileType) -> &'static str {
+    if file_type.is_symlink() {
+        "symlink"
+    } else if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_file() {
+        "file"
+    } else {
+        "other"
+    }
+}
+
+fn estimated_list_entry_bytes(entry: &ListEntry) -> usize {
+    entry.name.len() + entry.kind.len() + 32
 }
 
 fn resolve_existing_path(workspace_root: &Path, raw_path: &str) -> AppResult<PathBuf> {
@@ -235,6 +325,111 @@ mod tests {
         let content = result.data["content"].as_str().unwrap();
         assert!(content.is_char_boundary(content.len()));
         assert!(result.data["truncated"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn list_directory_lists_single_level_entries_in_sorted_order() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("b.txt"), "b").unwrap();
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
+        fs::create_dir(dir.path().join("nested")).unwrap();
+        fs::write(dir.path().join("nested").join("c.txt"), "c").unwrap();
+
+        let result = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            "file.list",
+            json!({"path": "."}),
+        )
+        .unwrap();
+
+        assert_eq!(result.summary, "listed 3 of 3 entries in .");
+        assert_eq!(result.data["truncated"], false);
+        assert_eq!(result.data["entry_count"], 3);
+        assert_eq!(result.data["returned_count"], 3);
+        assert_eq!(
+            result.data["entries"],
+            json!([
+                {"name": "a.txt", "kind": "file"},
+                {"name": "b.txt", "kind": "file"},
+                {"name": "nested", "kind": "directory"}
+            ])
+        );
+    }
+
+    #[test]
+    fn list_directory_rejects_paths_outside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            "file.list",
+            json!({"path": "../outside"}),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::PathEscapesWorkspace(_)));
+    }
+
+    #[test]
+    fn list_directory_rejects_file_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("note.txt"), "hello").unwrap();
+
+        let err = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            "file.list",
+            json!({"path": "note.txt"}),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AppError::Tool(message) if message == "not a directory: note.txt"
+        ));
+    }
+
+    #[test]
+    fn list_directory_truncates_after_max_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_LIST_ENTRIES {
+            fs::write(dir.path().join(format!("file_{index:03}.txt")), "x").unwrap();
+        }
+
+        let result = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            "file.list",
+            json!({"path": "."}),
+        )
+        .unwrap();
+
+        assert_eq!(result.data["truncated"], true);
+        assert_eq!(result.data["entry_count"], MAX_LIST_ENTRIES + 1);
+        assert_eq!(result.data["returned_count"], MAX_LIST_ENTRIES);
+        assert_eq!(
+            result.data["entries"].as_array().unwrap().len(),
+            MAX_LIST_ENTRIES
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_directory_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("outside")).unwrap();
+
+        let err = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            "file.list",
+            json!({"path": "outside"}),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::PathEscapesWorkspace(_)));
     }
 
     #[cfg(unix)]
