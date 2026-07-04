@@ -4,6 +4,7 @@ use serde_json::Value;
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub const ERROR_MALFORMED_REQUEST: &str = "malformed_request";
+pub const ERROR_RUN_FAILED: &str = "run_failed";
 pub const ERROR_UNSUPPORTED_METHOD: &str = "unsupported_method";
 pub const ERROR_UNSUPPORTED_VERSION: &str = "unsupported_version";
 pub const ERROR_WORKSPACE_MISMATCH: &str = "workspace_mismatch";
@@ -87,6 +88,21 @@ pub struct HelloResult {
     pub workspace_id: String,
     pub ledger_path: String,
     pub capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunStartParams {
+    pub question: String,
+    #[serde(default)]
+    pub config_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RunStartResult {
+    pub run_id: String,
+    pub ledger_path: String,
+    pub final_answer: String,
 }
 
 pub fn decode_request(line: &str) -> Result<Envelope, Box<Envelope>> {

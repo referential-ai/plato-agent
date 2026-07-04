@@ -45,6 +45,9 @@ pub enum ApprovalMode {
     #[default]
     Prompt,
     AutoApprove,
+    Deny {
+        actor: &'static str,
+    },
 }
 
 impl ApprovalMode {
@@ -59,6 +62,13 @@ impl ApprovalMode {
     fn auto_grant_actor(self, policy: &PolicyDecision) -> Option<&'static str> {
         match (self, policy) {
             (Self::AutoApprove, PolicyDecision::RequireApproval { .. }) => Some("yolo"),
+            _ => None,
+        }
+    }
+
+    fn deny_actor(self, policy: &PolicyDecision) -> Option<&'static str> {
+        match (self, policy) {
+            (Self::Deny { actor }, PolicyDecision::RequireApproval { .. }) => Some(actor),
             _ => None,
         }
     }
@@ -216,7 +226,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &tool_name,
                 input,
             )?,
-            PolicyDecision::RequireApproval { reason: _ } => {
+            PolicyDecision::RequireApproval { ref reason } => {
                 if let Some(actor) = options.approval_mode.auto_grant_actor(&policy) {
                     let actor_id = ActorId::new(actor)?;
                     recorder.record(HarnessEvent::ApprovalGranted {
@@ -232,6 +242,19 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                         &tool_name,
                         input,
                     )?
+                } else if let Some(actor) = options.approval_mode.deny_actor(&policy) {
+                    let reason =
+                        format!("approval required but no approval channel is available: {reason}");
+                    recorder.record(HarnessEvent::ApprovalDenied {
+                        run_id: run_id.clone(),
+                        call_id,
+                        actor_id: ActorId::new(actor)?,
+                        reason: reason.clone(),
+                    })?;
+                    ToolMessage {
+                        content: reason,
+                        is_error: true,
+                    }
                 } else {
                     match ask_for_approval(&tool_name, &call.input)? {
                         ApprovalOutcome::Granted => {
@@ -432,6 +455,23 @@ mod tests {
             Some("yolo")
         );
         assert_eq!(ApprovalMode::Prompt.auto_grant_actor(&policy), None);
+        assert_eq!(
+            (ApprovalMode::Deny { actor: "daemon" }).auto_grant_actor(&policy),
+            None
+        );
+    }
+
+    #[test]
+    fn deny_mode_marks_required_approval_as_denied() {
+        let policy = PolicyDecision::RequireApproval {
+            reason: "requires approval".into(),
+        };
+
+        assert_eq!(
+            (ApprovalMode::Deny { actor: "daemon" }).deny_actor(&policy),
+            Some("daemon")
+        );
+        assert_eq!(ApprovalMode::Prompt.deny_actor(&policy), None);
     }
 
     #[test]
