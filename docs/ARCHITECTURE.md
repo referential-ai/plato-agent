@@ -13,8 +13,12 @@ This document copies the topology decision from the Platonic workspace issue tha
 - Permanent invariant: `plato` one-shot and `plato replay` work without a daemon.
 - Host-loop rule: `plato` and `plato-agentd` share one run-driving implementation. Binaries do not fork model/tool/policy event choreography.
 - Fallback rule: provider fallback is per-run ledger evidence. The process that computes it is mechanics; unrecorded fallback is forbidden.
-- TUI decision: `plato-tui` is a separate binary once it exists.
-- Connector rule: connectors never own sessions, policy, approvals, provider fallback, or run semantics. Process placement is host mechanics; the semantic boundary is binding.
+- Daemon noun: `plato-agentd` is the persistent runtime. Gateways are future ingress adapters and never own agent semantics.
+- TUI decision: `plato-tui` is a separate binary in this crate once it exists.
+- Daemon ownership: `plato-agentd` owns the Unix socket, event database, and process lock. XDG runtime/state paths are keyed by `workspace-id`; derivation is TBD.
+- Single-writer invariant: one live writer owns a workspace store. Before daemon and CLI coexist on SQLite, decide whether CLI writes directly, delegates to the daemon, or refuses while the daemon is active.
+- Daemon API sketch: start run, append message, stream events, approve/deny, cancel, list sessions, read transcript.
+- Connector rule: connectors and gateways never own sessions, policy, approvals, provider fallback, or run semantics. Process placement is host mechanics; the semantic boundary is binding.
 
 ## Sequence
 
