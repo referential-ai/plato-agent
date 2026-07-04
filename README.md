@@ -37,11 +37,14 @@ app_title = "Plato Agent"
 ```
 
 `file.read` is auto-allowed. `file.write` requires stdin approval and defaults to no.
+Use `--yolo` to auto-approve enabled tools that would otherwise prompt. Yolo
+mode does not enable unknown tools or bypass workspace path checks.
 
 ## Commands
 
 ```bash
 cargo run --bin plato -- "read README.md and summarize it"
+cargo run --bin plato -- --yolo "write local-proof.txt with hello from Plato"
 cargo run --bin plato -- replay events.jsonl
 ```
 
