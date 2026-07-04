@@ -8,6 +8,12 @@ pub fn replay_file(path: &Path) -> AppResult<String> {
     Ok(format_readback(&readback))
 }
 
+pub fn replay_sqlite(path: &Path, run_id: Option<&str>) -> AppResult<String> {
+    let records = ledger::read_sqlite_records(path, run_id)?;
+    let readback = RunReadback::from_events(&records)?;
+    Ok(format_readback(&readback))
+}
+
 pub fn format_readback(readback: &RunReadback) -> String {
     let mut lines = Vec::new();
     lines.push(format!("final_phase: {:?}", readback.final_phase));

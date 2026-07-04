@@ -5,7 +5,9 @@ Plato Agent is the first application shell built on `platonic-core`.
 The bootstrap surface is intentionally small:
 
 - `plato "question"` runs one bounded CLI invocation and writes `events.jsonl`.
-- `plato replay <file>` validates and prints a deterministic readback without network calls or tool execution.
+- `plato --db "question"` writes the run ledger to the default XDG SQLite path.
+- `plato replay <file>` validates and prints a deterministic JSONL readback without network calls or tool execution.
+- `plato replay --db[=<path>] [--run <id>]` replays a SQLite run; omitted `--run` selects the latest run.
 
 ## Configuration
 
@@ -47,6 +49,8 @@ as external side effects or secret access, or bypass workspace path checks.
 cargo run --bin plato -- "read README.md and summarize it"
 cargo run --bin plato -- --yolo "write local-proof.txt with hello from Plato"
 cargo run --bin plato -- replay events.jsonl
+cargo run --bin plato -- --db "read README.md and summarize it"
+cargo run --bin plato -- replay --db
 ```
 
 ## Boundary
