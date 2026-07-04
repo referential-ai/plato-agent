@@ -20,6 +20,17 @@ This document copies the topology decision from the Platonic workspace issue tha
 - Daemon API sketch: start run, append message, stream events, approve/deny, cancel, list sessions, read transcript.
 - Connector rule: connectors and gateways never own sessions, policy, approvals, provider fallback, or run semantics. Process placement is host mechanics; the semantic boundary is binding.
 
+## Boundary Ladder
+
+Issue #3 and its [boundary addendum](https://github.com/referential-ai/plato-agent/issues/3#issuecomment-4883961697) are the evidence source for this ladder.
+Default to a clear module with a narrow surface.
+Promote to a Cargo feature only when a real build wants exclusion.
+Promote to a crate only on a trigger: second consumer, independent process/deployable, or compile/dependency isolation.
+`sqlite` as a feature is a later discussion candidate only; the current SQLite path stays concrete.
+Connectors and gateways are future crate/process candidates when real ingress adapters exist; provider adapters come next.
+The store becomes a crate only with out-of-crate consumers; scheduler, cron, and memory are daemon-era modules/features if they ever become real.
+Crate-per-function upfront is rejected.
+
 ## Sequence
 
 1. Build one-shot JSONL CLI.
