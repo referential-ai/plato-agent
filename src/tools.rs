@@ -9,6 +9,7 @@ use std::{
 };
 
 const MAX_READ_BYTES: usize = 64 * 1024;
+const APPROVAL_PREVIEW_CHARS: usize = 1_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,7 +52,8 @@ pub fn execute_tool(
 }
 
 pub fn ask_for_approval(tool_name: &str, input: &Value) -> AppResult<ApprovalOutcome> {
-    eprint!("Approve {tool_name} {input}? [y/N] ");
+    let preview = approval_preview(input);
+    eprint!("Approve {tool_name} {preview}? [y/N] ");
     io::stderr().flush()?;
 
     let mut line = String::new();
@@ -134,6 +136,15 @@ fn resolve_write_path(workspace_root: &Path, raw_path: &str) -> AppResult<PathBu
 
     let root = workspace_root.canonicalize()?;
     let candidate = root.join(raw);
+    if let Ok(metadata) = fs::symlink_metadata(&candidate) {
+        if metadata.file_type().is_symlink() {
+            return Err(AppError::PathEscapesWorkspace(candidate));
+        }
+        let canonical = candidate.canonicalize()?;
+        if !canonical.starts_with(&root) {
+            return Err(AppError::PathEscapesWorkspace(canonical));
+        }
+    }
     let parent = candidate
         .parent()
         .ok_or_else(|| AppError::PathEscapesWorkspace(candidate.clone()))?
@@ -163,6 +174,19 @@ fn truncate_utf8(content: &str, max_bytes: usize) -> &str {
         .last()
         .unwrap_or(0);
     &content[..boundary]
+}
+
+fn approval_preview(input: &Value) -> String {
+    let input = input.to_string();
+    if input.chars().count() <= APPROVAL_PREVIEW_CHARS {
+        return input;
+    }
+
+    let truncated = input
+        .chars()
+        .take(APPROVAL_PREVIEW_CHARS)
+        .collect::<String>();
+    format!("{truncated}...(truncated)")
 }
 
 #[cfg(test)]
@@ -218,5 +242,23 @@ mod tests {
         let content = result.data["content"].as_str().unwrap();
         assert!(content.is_char_boundary(content.len()));
         assert!(result.data["truncated"].as_bool().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_rejects_existing_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link.txt")).unwrap();
+
+        let err = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            "file.write",
+            json!({"path": "link.txt", "content": "hello"}),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, AppError::PathEscapesWorkspace(_)));
     }
 }

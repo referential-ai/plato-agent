@@ -13,6 +13,7 @@
 - GitHub Issues are the scope and acceptance contract.
 - GitHub PRs are the implementation and proof surface.
 - Link every PR to its issue and include verification commands or manual proof.
+- A generic “proceed” is not merge authority. Merge requires explicit human “merge” or “land” instruction.
 - Do not use local TODOs, wiki pages, tmux pane names, or chat history as active-work authority.
 - Do not start implementation unless a GitHub issue or direct human task has clear scope, non-goals, acceptance, target surface, and proof.
 
@@ -31,4 +32,3 @@ cargo fmt --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
-

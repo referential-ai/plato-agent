@@ -4,7 +4,7 @@ pub type AppResult<T> = Result<T, AppError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("anthropic api key env var {0} is not set")]
+    #[error("provider api key env var {0} is not set")]
     MissingApiKey(String),
 
     #[error("config error: {0}")]
@@ -21,6 +21,9 @@ pub enum AppError {
 
     #[error("ledger path is empty")]
     EmptyLedger,
+
+    #[error("ledger already exists: {0}")]
+    LedgerExists(PathBuf),
 
     #[error("question is empty")]
     EmptyQuestion,

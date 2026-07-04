@@ -2,7 +2,7 @@ use crate::{AppError, AppResult};
 use platonic_core::{HarnessEvent, RecordedEvent, RunState};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Write},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
@@ -28,7 +28,17 @@ impl EventRecorder {
             return Err(AppError::EmptyLedger);
         }
 
-        let file = File::create(path)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    AppError::LedgerExists(path.into())
+                } else {
+                    AppError::Io(error)
+                }
+            })?;
         Ok(Self {
             writer: BufWriter::new(file),
             state: RunState::new(),
@@ -119,6 +129,18 @@ mod tests {
                 expected: LEDGER_VERSION,
                 actual: 2
             })
+        ));
+    }
+
+    #[test]
+    fn refuses_to_overwrite_existing_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        assert!(matches!(
+            EventRecorder::create(&path),
+            Err(AppError::LedgerExists(_))
         ));
     }
 }

@@ -21,4 +21,3 @@ ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
 tempfile = "3"
-

@@ -1,14 +1,17 @@
 use crate::{
     AppError, AppResult,
-    anthropic::{AnthropicClient, AnthropicMessage, AnthropicResponse, system_prompt},
-    config::Config,
+    config::{Config, ProviderKind},
     ledger::EventRecorder,
+    model::{
+        ModelMessage, ModelRequest, ModelResponse, ModelStop, OpenAiCompatibleClient,
+        TokenLimitField, system_prompt, tool_specs,
+    },
     tools::{ApprovalOutcome, ask_for_approval, effect_for_tool, execute_tool},
 };
 use platonic_core::{
     ActorId, AgentId, ContextFragment, ContextLane, ContextPack, HarnessEvent, Message,
-    MessageRole, ModelName, ModelUsage, PolicyDecision, RunId, ToolCall, ToolCallId, ToolName,
-    ToolProposal, TurnId,
+    MessageRole, ModelName, PolicyDecision, RunId, ToolCall, ToolCallId, ToolName, ToolProposal,
+    TurnId,
 };
 use serde_json::Value;
 use std::path::PathBuf;
@@ -29,9 +32,16 @@ pub fn run_question(options: RunOptions) -> AppResult<()> {
     }
 
     let config = Config::load(&options.config_path)?;
-    let client = AnthropicClient::from_env(&config.provider.api_key_env)?;
-    let mut recorder = EventRecorder::create(&options.events_path)?;
     let run_id = RunId::new(new_run_id())?;
+    let client = OpenAiCompatibleClient::from_config(
+        &config.provider.api_key_env,
+        config.provider.base_url.clone(),
+        config.provider.timeout_ms,
+        config.provider.http_referer.clone(),
+        config.provider.app_title.clone(),
+        token_limit_field(&config.provider.kind),
+    )?;
+    let mut recorder = EventRecorder::create(&options.events_path)?;
     let agent_id = AgentId::new("plato")?;
     let model = ModelName::new(config.provider.model.clone())?;
     let actor_id = ActorId::new("stdin")?;
@@ -41,12 +51,19 @@ pub fn run_question(options: RunOptions) -> AppResult<()> {
         agent_id,
     })?;
 
-    let mut messages = vec![AnthropicMessage::user_text(options.question.clone())];
-    let mut next_context = options.question;
+    let mut messages = vec![ModelMessage::user_text(options.question)];
+    let tools = tool_specs(&config.tools.enabled);
 
     for turn_index in 0..MAX_TURNS {
         let turn_id = TurnId::new(format!("turn_{}", turn_index + 1))?;
-        let context = context_pack(&next_context, config.limits.token_budget);
+        let request = ModelRequest {
+            model: config.provider.model.clone(),
+            system: system_prompt().into(),
+            max_output_tokens: config.limits.max_output_tokens,
+            messages: messages.clone(),
+            tools: tools.clone(),
+        };
+        let context = context_pack(&request, config.limits.token_budget)?;
         recorder.record(HarnessEvent::ContextBuilt {
             run_id: run_id.clone(),
             turn_id: turn_id.clone(),
@@ -59,12 +76,7 @@ pub fn run_question(options: RunOptions) -> AppResult<()> {
             model: model.clone(),
         })?;
 
-        let response = match client.send(
-            model.as_str(),
-            system_prompt(),
-            &messages,
-            &config.tools.enabled,
-        ) {
+        let response = match client.send(&request) {
             Ok(response) => response,
             Err(error) => {
                 recorder.record(HarnessEvent::RunFailed {
@@ -85,13 +97,35 @@ pub fn run_question(options: RunOptions) -> AppResult<()> {
                 content: response.text(),
             },
             proposed_calls: proposals.clone(),
-            usage: ModelUsage {
-                input_tokens: response.usage.input_tokens,
-                output_tokens: response.usage.output_tokens,
-            },
+            usage: response.usage.clone(),
         })?;
 
+        match response.stop {
+            ModelStop::MaxOutput => {
+                let reason = "model reached max output tokens".to_string();
+                recorder.record(HarnessEvent::RunFailed { run_id, reason })?;
+                return Err(AppError::RunFailed(
+                    "model reached max output tokens".into(),
+                ));
+            }
+            ModelStop::ContentFilter => {
+                let reason = "model response was stopped by content filter".to_string();
+                recorder.record(HarnessEvent::RunFailed { run_id, reason })?;
+                return Err(AppError::RunFailed(
+                    "model response was stopped by content filter".into(),
+                ));
+            }
+            ModelStop::EndTurn | ModelStop::ToolUse => {}
+        }
+
         let tool_uses = response.tool_uses();
+        if response.stop == ModelStop::ToolUse && tool_uses.is_empty() {
+            let reason = "provider reported tool use without tool calls".to_string();
+            recorder.record(HarnessEvent::RunFailed { run_id, reason })?;
+            return Err(AppError::RunFailed(
+                "provider reported tool use without tool calls".into(),
+            ));
+        }
         if tool_uses.is_empty() {
             println!("{}", response.text());
             recorder.record(HarnessEvent::RunFinished { run_id })?;
@@ -110,7 +144,7 @@ pub fn run_question(options: RunOptions) -> AppResult<()> {
             eprintln!("{}", response.text());
         }
 
-        messages.push(AnthropicMessage::assistant_blocks(response.content.clone()));
+        messages.push(ModelMessage::assistant_blocks(response.content.clone()));
         let (tool_use_id, tool_name, input) = tool_uses.into_iter().next().expect("checked len");
         let call_id = ToolCallId::new(tool_use_id.clone())?;
         let call = tool_call(call_id.clone(), &tool_name, input.clone())?;
@@ -184,8 +218,7 @@ pub fn run_question(options: RunOptions) -> AppResult<()> {
             },
         };
 
-        next_context = format!("Tool result for {tool_use_id}: {}", tool_message.content);
-        messages.push(AnthropicMessage::tool_result(
+        messages.push(ModelMessage::tool_result(
             tool_use_id,
             tool_message.content,
             tool_message.is_error,
@@ -247,7 +280,7 @@ fn execute_and_record_tool(
     }
 }
 
-fn proposals_from_response(response: &AnthropicResponse) -> AppResult<Vec<ToolProposal>> {
+fn proposals_from_response(response: &ModelResponse) -> AppResult<Vec<ToolProposal>> {
     response
         .tool_uses()
         .into_iter()
@@ -269,15 +302,38 @@ fn tool_call(call_id: ToolCallId, name: &str, input: Value) -> AppResult<ToolCal
     })
 }
 
-fn context_pack(content: &str, token_budget: u32) -> ContextPack {
-    ContextPack {
+fn context_pack(request: &ModelRequest, token_budget: u32) -> AppResult<ContextPack> {
+    let messages = serde_json::to_string(&request.messages)?;
+    let tools = serde_json::to_string(&request.tools)?;
+    Ok(ContextPack {
         token_budget,
-        fragments: vec![ContextFragment {
-            lane: ContextLane::CurrentTask,
-            source: "cli".into(),
-            content: content.into(),
-            estimated_tokens: estimate_tokens(content),
-        }],
+        fragments: vec![
+            ContextFragment {
+                lane: ContextLane::SystemContract,
+                source: "system_prompt".into(),
+                content: request.system.clone(),
+                estimated_tokens: estimate_tokens(&request.system),
+            },
+            ContextFragment {
+                lane: ContextLane::RecentTurns,
+                source: "model.messages".into(),
+                estimated_tokens: estimate_tokens(&messages),
+                content: messages,
+            },
+            ContextFragment {
+                lane: ContextLane::ToolSchemas,
+                source: "model.tools".into(),
+                estimated_tokens: estimate_tokens(&tools),
+                content: tools,
+            },
+        ],
+    })
+}
+
+fn token_limit_field(kind: &ProviderKind) -> TokenLimitField {
+    match kind {
+        ProviderKind::OpenAi => TokenLimitField::MaxCompletionTokens,
+        ProviderKind::OpenRouter => TokenLimitField::MaxTokens,
     }
 }
 
