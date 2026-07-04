@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out plato-agent
+        uses: actions/checkout@v4
+
+      - name: Configure SSH for private platonic-core dependency
+        env:
+          PLATONIC_CORE_DEPLOY_KEY: ${{ secrets.PLATONIC_CORE_DEPLOY_KEY }}
+        run: |
+          test -n "$PLATONIC_CORE_DEPLOY_KEY"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$PLATONIC_CORE_DEPLOY_KEY" > ~/.ssh/platonic_core_deploy_key
+          chmod 600 ~/.ssh/platonic_core_deploy_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<'EOF'
+          Host github.com
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/platonic_core_deploy_key
+            IdentitiesOnly yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Install Rust components
+        run: |
+          rustup component add rustfmt clippy
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Check CLI help
+        run: cargo run --locked --bin plato -- --help
