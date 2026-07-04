@@ -10,6 +10,22 @@ pub fn default_sqlite_path(workspace_root: &Path) -> AppResult<PathBuf> {
         .join("agent.db"))
 }
 
+pub fn default_socket_path(workspace_root: &Path) -> AppResult<PathBuf> {
+    Ok(runtime_home()?
+        .join("plato-agent")
+        .join("workspaces")
+        .join(workspace_id(workspace_root)?)
+        .join("agent.sock"))
+}
+
+pub fn default_lock_path(workspace_root: &Path) -> AppResult<PathBuf> {
+    Ok(runtime_home()?
+        .join("plato-agent")
+        .join("workspaces")
+        .join(workspace_id(workspace_root)?)
+        .join("agent.lock"))
+}
+
 pub fn workspace_id(workspace_root: &Path) -> AppResult<String> {
     let canonical = workspace_root.canonicalize()?;
     Ok(workspace_id_from_canonical_path(&canonical))
@@ -75,6 +91,16 @@ fn state_home() -> AppResult<PathBuf> {
     Ok(PathBuf::from(home).join(".local").join("state"))
 }
 
+fn runtime_home() -> AppResult<PathBuf> {
+    if let Some(value) = std::env::var_os("XDG_RUNTIME_DIR")
+        && !value.is_empty()
+    {
+        return Ok(PathBuf::from(value));
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+    Ok(std::env::temp_dir().join("plato-agent").join(user))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +128,27 @@ mod tests {
                 .any(|component| component.as_os_str() == "workspaces")
         );
         assert_eq!(path.file_name().unwrap(), "agent.db");
+    }
+
+    #[test]
+    fn default_socket_and_lock_paths_use_workspace_directory() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let socket_path = default_socket_path(dir.path()).unwrap();
+        let lock_path = default_lock_path(dir.path()).unwrap();
+
+        assert!(
+            socket_path
+                .components()
+                .any(|component| component.as_os_str() == "plato-agent")
+        );
+        assert!(
+            socket_path
+                .components()
+                .any(|component| component.as_os_str() == "workspaces")
+        );
+        assert_eq!(socket_path.file_name().unwrap(), "agent.sock");
+        assert_eq!(lock_path.file_name().unwrap(), "agent.lock");
+        assert_eq!(socket_path.parent(), lock_path.parent());
     }
 }
