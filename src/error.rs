@@ -40,6 +40,12 @@ pub enum AppError {
     #[error("run did not finish: {0}")]
     RunFailed(String),
 
+    #[error("daemon lock held at {path}: {owner}")]
+    DaemonLockHeld { path: PathBuf, owner: String },
+
+    #[error("daemon protocol error: {0}")]
+    DaemonProtocol(String),
+
     #[error("path escapes workspace: {0}")]
     PathEscapesWorkspace(PathBuf),
 

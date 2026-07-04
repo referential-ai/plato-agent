@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
 use plato_agent::{
-    AppError, ApprovalMode, RunLedger, RunOptions, RunOutcome, paths::default_sqlite_path,
-    replay_file, replay_sqlite, run_question,
+    AppError, ApprovalMode, RunLedger, RunOptions, RunOutcome,
+    daemon::lock::ensure_workspace_unlocked, paths::default_sqlite_path, replay_file,
+    replay_sqlite, run_question,
 };
 use platonic_core::RunId;
 use std::{
@@ -69,6 +70,7 @@ fn run() -> plato_agent::AppResult<()> {
             let db_path = sqlite_path(cli.db, &workspace_root)?;
             match (db_path, file) {
                 (Some(path), None) => {
+                    ensure_workspace_unlocked(&workspace_root)?;
                     println!("{}", replay_sqlite(&path, run.as_deref())?);
                 }
                 (None, Some(file)) => {
@@ -92,18 +94,7 @@ fn run() -> plato_agent::AppResult<()> {
         }
         None => {
             let question = cli.question.join(" ");
-            let db_path = sqlite_path(cli.db, &workspace_root)?;
-            if db_path.is_some() && cli.events.is_some() {
-                return Err(AppError::Config(
-                    "--events and --db are mutually exclusive".into(),
-                ));
-            }
-            let ledger = match db_path {
-                Some(path) => RunLedger::Sqlite(path),
-                None => {
-                    RunLedger::Jsonl(cli.events.unwrap_or_else(|| PathBuf::from("events.jsonl")))
-                }
-            };
+            let ledger = run_ledger(cli.events, cli.db, &workspace_root)?;
             let outcome = run_question(RunOptions {
                 question,
                 config_path: cli.config,
@@ -113,6 +104,28 @@ fn run() -> plato_agent::AppResult<()> {
             })?;
             write_run_success_output(&mut io::stdout(), &mut io::stderr(), &outcome, &ledger)
         }
+    }
+}
+
+fn run_ledger(
+    events: Option<PathBuf>,
+    db: Option<Option<PathBuf>>,
+    workspace_root: &Path,
+) -> plato_agent::AppResult<RunLedger> {
+    let db_path = sqlite_path(db, workspace_root)?;
+    if db_path.is_some() && events.is_some() {
+        return Err(AppError::Config(
+            "--events and --db are mutually exclusive".into(),
+        ));
+    }
+    match db_path {
+        Some(path) => {
+            ensure_workspace_unlocked(workspace_root)?;
+            Ok(RunLedger::Sqlite(path))
+        }
+        None => Ok(RunLedger::Jsonl(
+            events.unwrap_or_else(|| PathBuf::from("events.jsonl")),
+        )),
     }
 }
 
@@ -221,5 +234,41 @@ mod tests {
         let path = sqlite_path(Some(Some(PathBuf::from("agent.db"))), dir.path()).unwrap();
 
         assert_eq!(path, Some(dir.path().join("agent.db")));
+    }
+
+    #[test]
+    fn sqlite_run_fails_closed_when_daemon_lock_exists() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket = workspace.path().join("agent.sock");
+        let _lock = plato_agent::daemon::lock::WorkspaceLock::acquire_for_workspace(
+            workspace.path(),
+            &socket,
+        )
+        .unwrap();
+
+        let error = run_ledger(
+            None,
+            Some(Some(PathBuf::from("agent.db"))),
+            workspace.path(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, AppError::DaemonLockHeld { .. }));
+    }
+
+    #[test]
+    fn jsonl_run_does_not_check_daemon_lock() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket = workspace.path().join("agent.sock");
+        let _lock = plato_agent::daemon::lock::WorkspaceLock::acquire_for_workspace(
+            workspace.path(),
+            &socket,
+        )
+        .unwrap();
+
+        let ledger =
+            run_ledger(Some(PathBuf::from("events.jsonl")), None, workspace.path()).unwrap();
+
+        assert_eq!(ledger, RunLedger::Jsonl(PathBuf::from("events.jsonl")));
     }
 }

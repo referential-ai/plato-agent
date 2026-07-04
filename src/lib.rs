@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod config;
+pub mod daemon;
 pub mod error;
 pub mod ledger;
 pub mod model;
