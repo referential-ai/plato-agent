@@ -11,6 +11,8 @@ pub mod replay;
 pub mod tool_catalog;
 pub mod tools;
 
-pub use app::{ApprovalMode, RunLedger, RunOptions, RunOutcome, run_question};
+pub use app::{
+    ApprovalMode, ApprovalRequest, RunLedger, RunOptions, RunOutcome, new_run_id, run_question,
+};
 pub use error::{AppError, AppResult};
 pub use replay::{replay_file, replay_sqlite};
