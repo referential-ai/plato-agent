@@ -8,6 +8,6 @@ pub mod model;
 pub mod replay;
 pub mod tools;
 
-pub use app::{RunOptions, run_question};
+pub use app::{ApprovalMode, RunOptions, run_question};
 pub use error::{AppError, AppResult};
 pub use replay::replay_file;

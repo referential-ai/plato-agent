@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use plato_agent::{RunOptions, replay_file, run_question};
+use plato_agent::{ApprovalMode, RunOptions, replay_file, run_question};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -11,6 +11,13 @@ struct Cli {
 
     #[arg(long, global = true, default_value = "events.jsonl")]
     events: PathBuf,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Auto-approve enabled tool calls that would otherwise prompt"
+    )]
+    yolo: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -48,6 +55,7 @@ fn run() -> plato_agent::AppResult<()> {
                 config_path: cli.config,
                 events_path: cli.events,
                 workspace_root: std::env::current_dir()?,
+                approval_mode: ApprovalMode::from_yolo(cli.yolo),
             })
         }
     }

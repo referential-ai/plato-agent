@@ -24,6 +24,31 @@ pub struct RunOptions {
     pub config_path: PathBuf,
     pub events_path: PathBuf,
     pub workspace_root: PathBuf,
+    pub approval_mode: ApprovalMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ApprovalMode {
+    #[default]
+    Prompt,
+    AutoApprove,
+}
+
+impl ApprovalMode {
+    pub fn from_yolo(enabled: bool) -> Self {
+        if enabled {
+            Self::AutoApprove
+        } else {
+            Self::Prompt
+        }
+    }
+
+    fn auto_grant_actor(self, policy: &PolicyDecision) -> Option<&'static str> {
+        match (self, policy) {
+            (Self::AutoApprove, PolicyDecision::RequireApproval { .. }) => Some("yolo"),
+            _ => None,
+        }
+    }
 }
 
 pub fn run_question(options: RunOptions) -> AppResult<()> {
@@ -44,7 +69,7 @@ pub fn run_question(options: RunOptions) -> AppResult<()> {
     let mut recorder = EventRecorder::create(&options.events_path)?;
     let agent_id = AgentId::new("plato")?;
     let model = ModelName::new(config.provider.model.clone())?;
-    let actor_id = ActorId::new("stdin")?;
+    let stdin_actor_id = ActorId::new("stdin")?;
 
     recorder.record(HarnessEvent::RunStarted {
         run_id: run_id.clone(),
@@ -154,18 +179,7 @@ pub fn run_question(options: RunOptions) -> AppResult<()> {
             call: call.clone(),
         })?;
 
-        let policy = if config
-            .tools
-            .enabled
-            .iter()
-            .any(|enabled| enabled == &tool_name)
-        {
-            call.effect.default_policy()
-        } else {
-            PolicyDecision::Deny {
-                reason: format!("tool is not enabled: {tool_name}"),
-            }
-        };
+        let policy = evaluate_policy(&config.tools.enabled, &call);
         recorder.record(HarnessEvent::PolicyEvaluated {
             run_id: run_id.clone(),
             call_id: call_id.clone(),
@@ -182,32 +196,49 @@ pub fn run_question(options: RunOptions) -> AppResult<()> {
                 input,
             )?,
             PolicyDecision::RequireApproval { reason: _ } => {
-                match ask_for_approval(&tool_name, &call.input)? {
-                    ApprovalOutcome::Granted => {
-                        recorder.record(HarnessEvent::ApprovalGranted {
-                            run_id: run_id.clone(),
-                            call_id: call_id.clone(),
-                            actor_id: actor_id.clone(),
-                        })?;
-                        execute_and_record_tool(
-                            &mut recorder,
-                            &run_id,
-                            &options.workspace_root,
-                            call_id.clone(),
-                            &tool_name,
-                            input,
-                        )?
-                    }
-                    ApprovalOutcome::Denied { reason } => {
-                        recorder.record(HarnessEvent::ApprovalDenied {
-                            run_id: run_id.clone(),
-                            call_id,
-                            actor_id: actor_id.clone(),
-                            reason: reason.clone(),
-                        })?;
-                        ToolMessage {
-                            content: reason,
-                            is_error: true,
+                if let Some(actor) = options.approval_mode.auto_grant_actor(&policy) {
+                    let actor_id = ActorId::new(actor)?;
+                    recorder.record(HarnessEvent::ApprovalGranted {
+                        run_id: run_id.clone(),
+                        call_id: call_id.clone(),
+                        actor_id,
+                    })?;
+                    execute_and_record_tool(
+                        &mut recorder,
+                        &run_id,
+                        &options.workspace_root,
+                        call_id.clone(),
+                        &tool_name,
+                        input,
+                    )?
+                } else {
+                    match ask_for_approval(&tool_name, &call.input)? {
+                        ApprovalOutcome::Granted => {
+                            recorder.record(HarnessEvent::ApprovalGranted {
+                                run_id: run_id.clone(),
+                                call_id: call_id.clone(),
+                                actor_id: stdin_actor_id.clone(),
+                            })?;
+                            execute_and_record_tool(
+                                &mut recorder,
+                                &run_id,
+                                &options.workspace_root,
+                                call_id.clone(),
+                                &tool_name,
+                                input,
+                            )?
+                        }
+                        ApprovalOutcome::Denied { reason } => {
+                            recorder.record(HarnessEvent::ApprovalDenied {
+                                run_id: run_id.clone(),
+                                call_id,
+                                actor_id: stdin_actor_id.clone(),
+                                reason: reason.clone(),
+                            })?;
+                            ToolMessage {
+                                content: reason,
+                                is_error: true,
+                            }
                         }
                     }
                 }
@@ -302,6 +333,19 @@ fn tool_call(call_id: ToolCallId, name: &str, input: Value) -> AppResult<ToolCal
     })
 }
 
+fn evaluate_policy(enabled_tools: &[String], call: &ToolCall) -> PolicyDecision {
+    if enabled_tools
+        .iter()
+        .any(|enabled| enabled == call.tool.as_str())
+    {
+        call.effect.default_policy()
+    } else {
+        PolicyDecision::Deny {
+            reason: format!("tool is not enabled: {}", call.tool),
+        }
+    }
+}
+
 fn context_pack(request: &ModelRequest, token_budget: u32) -> AppResult<ContextPack> {
     let messages = serde_json::to_string(&request.messages)?;
     let tools = serde_json::to_string(&request.tools)?;
@@ -348,4 +392,63 @@ fn new_run_id() -> String {
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
     format!("run_{}_{}", millis, std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use platonic_core::EffectClass;
+    use serde_json::json;
+
+    #[test]
+    fn yolo_auto_grants_required_approval() {
+        let policy = PolicyDecision::RequireApproval {
+            reason: "requires approval".into(),
+        };
+
+        assert_eq!(
+            ApprovalMode::AutoApprove.auto_grant_actor(&policy),
+            Some("yolo")
+        );
+        assert_eq!(ApprovalMode::Prompt.auto_grant_actor(&policy), None);
+    }
+
+    #[test]
+    fn yolo_does_not_auto_grant_denials() {
+        let policy = PolicyDecision::Deny {
+            reason: "disabled".into(),
+        };
+
+        assert_eq!(ApprovalMode::AutoApprove.auto_grant_actor(&policy), None);
+    }
+
+    #[test]
+    fn disabled_tools_still_deny() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            tool: ToolName::new("file.write").unwrap(),
+            effect: EffectClass::WorkspaceWrite,
+            input: json!({"path": "out.txt", "content": "hello"}),
+        };
+
+        assert!(matches!(
+            evaluate_policy(&["file.read".into()], &call),
+            PolicyDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn enabled_file_write_requires_approval() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            tool: ToolName::new("file.write").unwrap(),
+            effect: EffectClass::WorkspaceWrite,
+            input: json!({"path": "out.txt", "content": "hello"}),
+        };
+
+        assert!(matches!(
+            evaluate_policy(&["file.write".into()], &call),
+            PolicyDecision::RequireApproval { .. }
+        ));
+    }
 }
