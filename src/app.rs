@@ -4,9 +4,10 @@ use crate::{
     ledger::EventRecorder,
     model::{
         ModelMessage, ModelRequest, ModelResponse, ModelStop, OpenAiCompatibleClient,
-        TokenLimitField, system_prompt, tool_specs,
+        TokenLimitField, system_prompt,
     },
-    tools::{ApprovalOutcome, ask_for_approval, effect_for_tool, execute_tool},
+    tool_catalog::{effect_for_tool, tool_specs},
+    tools::{ApprovalOutcome, ask_for_approval, execute_tool},
 };
 use platonic_core::{
     ActorId, AgentId, ContextFragment, ContextLane, ContextPack, HarnessEvent, Message,
@@ -435,6 +436,21 @@ mod tests {
             evaluate_policy(&["file.read".into()], &call),
             PolicyDecision::Deny { .. }
         ));
+    }
+
+    #[test]
+    fn enabled_file_read_is_allowed() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            tool: ToolName::new("file.read").unwrap(),
+            effect: EffectClass::ReadOnly,
+            input: json!({"path": "README.md"}),
+        };
+
+        assert_eq!(
+            evaluate_policy(&["file.read".into()], &call),
+            PolicyDecision::Allow
+        );
     }
 
     #[test]

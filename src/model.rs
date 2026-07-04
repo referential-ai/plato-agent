@@ -1,7 +1,10 @@
-use crate::{AppError, AppResult};
+use crate::{
+    AppError, AppResult,
+    tool_catalog::{ToolSpec, internal_name_for_provider, provider_name_for_internal},
+};
 use platonic_core::ModelUsage;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -62,14 +65,6 @@ pub struct ModelResponse {
     pub content: Vec<ModelBlock>,
     pub stop: ModelStop,
     pub usage: ModelUsage,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ToolSpec {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
 }
 
 pub struct OpenAiCompatibleClient {
@@ -355,17 +350,25 @@ impl ChatMessage {
                     .content
                     .iter()
                     .filter_map(|block| match block {
-                        ModelBlock::ToolUse { id, name, input } => Some(ChatToolCall {
+                        ModelBlock::ToolUse { id, name, input } => Some((id, name, input)),
+                        ModelBlock::Text { .. } | ModelBlock::ToolResult { .. } => None,
+                    })
+                    .map(|(id, name, input)| {
+                        let provider_name = provider_name_for_internal(name).ok_or_else(|| {
+                            AppError::Provider(format!(
+                                "model message contained unknown tool {name}"
+                            ))
+                        })?;
+                        Ok(ChatToolCall {
                             id: id.clone(),
                             tool_type: ChatToolType::Function,
                             function: ChatFunctionCall {
-                                name: provider_tool_name(name).into(),
+                                name: provider_name.into(),
                                 arguments: serde_json::to_string(input).unwrap_or_default(),
                             },
-                        }),
-                        ModelBlock::Text { .. } | ModelBlock::ToolResult { .. } => None,
+                        })
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<AppResult<Vec<_>>>()?;
                 Ok(Self {
                     role: ChatRole::Assistant,
                     content: (!text.is_empty()).then_some(text),
@@ -401,7 +404,7 @@ impl ChatTool {
         Self {
             tool_type: ChatToolType::Function,
             function: ChatFunctionDefinition {
-                name: provider_tool_name(&spec.name).into(),
+                name: spec.name.clone(),
                 description: spec.description.clone(),
                 parameters: spec.input_schema.clone(),
             },
@@ -421,7 +424,7 @@ impl ChatCompletionResponse {
             content.push(ModelBlock::Text { text });
         }
         for call in choice.message.tool_calls.unwrap_or_default() {
-            let tool_name = internal_tool_name(&call.function.name).ok_or_else(|| {
+            let tool_name = internal_name_for_provider(&call.function.name).ok_or_else(|| {
                 AppError::Provider(format!(
                     "provider returned unknown tool {}",
                     call.function.name
@@ -461,67 +464,8 @@ impl ChatCompletionResponse {
     }
 }
 
-pub fn tool_specs(enabled_tools: &[String]) -> Vec<ToolSpec> {
-    enabled_tools
-        .iter()
-        .filter_map(|tool| match tool.as_str() {
-            "file.read" => Some(ToolSpec {
-                name: "file_read".into(),
-                description: "Read a UTF-8 text file inside the current workspace.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Relative path inside the current workspace."
-                        }
-                    },
-                    "required": ["path"],
-                    "additionalProperties": false
-                }),
-            }),
-            "file.write" => Some(ToolSpec {
-                name: "file_write".into(),
-                description: "Write UTF-8 text to a relative path inside the current workspace after approval.".into(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Relative path inside the current workspace."
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "UTF-8 content to write."
-                        }
-                    },
-                    "required": ["path", "content"],
-                    "additionalProperties": false
-                }),
-            }),
-            _ => None,
-        })
-        .collect()
-}
-
 pub fn system_prompt() -> &'static str {
     "You are Plato Agent. Use at most one tool call in a response. Use file_read when you need to inspect workspace files. Use file_write only when the user explicitly asks you to write or edit a file. After a tool result, answer the user directly or request exactly one next tool call."
-}
-
-fn provider_tool_name(internal_name: &str) -> &str {
-    match internal_name {
-        "file.read" => "file_read",
-        "file.write" => "file_write",
-        other => other,
-    }
-}
-
-fn internal_tool_name(provider_name: &str) -> Option<&'static str> {
-    match provider_name {
-        "file_read" | "file.read" => Some("file.read"),
-        "file_write" | "file.write" => Some("file.write"),
-        _ => None,
-    }
 }
 
 fn text_from_blocks(blocks: &[ModelBlock]) -> String {
@@ -538,6 +482,7 @@ fn text_from_blocks(blocks: &[ModelBlock]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn extracts_text_and_tool_uses_from_response() {
@@ -601,6 +546,34 @@ mod tests {
                 json!({"path": "README.md"})
             )]
         );
+    }
+
+    #[test]
+    fn provider_unknown_tool_names_fail_response_parse() {
+        let response: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "shell_exec",
+                            "arguments": "{\"command\":\"pwd\"}"
+                        }
+                    }]
+                }
+            }]
+        }))
+        .unwrap();
+
+        let err = response.into_model_response().unwrap_err();
+
+        assert!(matches!(
+            err,
+            AppError::Provider(message) if message == "provider returned unknown tool shell_exec"
+        ));
     }
 
     #[test]
