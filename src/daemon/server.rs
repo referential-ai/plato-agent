@@ -1,13 +1,14 @@
 use crate::{
-    AppResult,
+    AppResult, ApprovalMode, RunLedger, RunOptions,
     daemon::{
         lock::WorkspaceLock,
         protocol::{
-            ERROR_MALFORMED_REQUEST, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH, Envelope,
-            HelloParams, HelloResult, decode_request,
+            ERROR_MALFORMED_REQUEST, ERROR_RUN_FAILED, ERROR_UNSUPPORTED_METHOD,
+            ERROR_WORKSPACE_MISMATCH, Envelope, HelloParams, HelloResult, RunStartParams,
+            RunStartResult, decode_request,
         },
     },
-    paths,
+    paths, run_question,
 };
 use std::{
     fs,
@@ -106,6 +107,7 @@ impl DaemonServer {
     fn handle_request(&self, request: Envelope) -> Envelope {
         match request.method.as_deref() {
             Some("hello") => self.handle_hello(request),
+            Some("run.start") => self.handle_run_start(request),
             Some(method) => Envelope::error(
                 request.id,
                 Some(method.into()),
@@ -187,10 +189,73 @@ impl DaemonServer {
                 daemon_version: env!("CARGO_PKG_VERSION").into(),
                 workspace_id: self.paths.workspace_id.clone(),
                 ledger_path: self.paths.ledger_path.to_string_lossy().into_owned(),
-                capabilities: vec!["hello".into()],
+                capabilities: vec!["hello".into(), "run.start".into()],
             })
             .expect("hello result serializes"),
         )
+    }
+
+    fn handle_run_start(&self, request: Envelope) -> Envelope {
+        let params = match request.params {
+            Some(params) => match serde_json::from_value::<RunStartParams>(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return Envelope::error(
+                        request.id,
+                        Some("run.start".into()),
+                        ERROR_MALFORMED_REQUEST,
+                        format!("run.start params are invalid: {error}"),
+                    );
+                }
+            },
+            None => {
+                return Envelope::error(
+                    request.id,
+                    Some("run.start".into()),
+                    ERROR_MALFORMED_REQUEST,
+                    "run.start params are required",
+                );
+            }
+        };
+
+        match run_question(RunOptions {
+            question: params.question,
+            config_path: self.resolve_config_path(params.config_path),
+            ledger: RunLedger::Sqlite(self.paths.ledger_path.clone()),
+            workspace_root: self.paths.workspace_root.clone(),
+            approval_mode: ApprovalMode::Deny { actor: "daemon" },
+        }) {
+            Ok(outcome) => Envelope::response(
+                request.id,
+                Some("run.start".into()),
+                serde_json::to_value(RunStartResult {
+                    run_id: outcome.run_id.to_string(),
+                    ledger_path: self.paths.ledger_path.to_string_lossy().into_owned(),
+                    final_answer: outcome.final_answer,
+                })
+                .expect("run.start result serializes"),
+            ),
+            Err(error) => Envelope::error(
+                request.id,
+                Some("run.start".into()),
+                ERROR_RUN_FAILED,
+                error.to_string(),
+            ),
+        }
+    }
+
+    fn resolve_config_path(&self, config_path: Option<String>) -> PathBuf {
+        match config_path {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                if path.is_absolute() {
+                    path
+                } else {
+                    self.paths.workspace_root.join(path)
+                }
+            }
+            None => self.paths.workspace_root.join("plato.toml"),
+        }
     }
 }
 
@@ -236,7 +301,10 @@ mod tests {
         assert_eq!(response.method.as_deref(), Some("hello"));
         let result = response.result.unwrap();
         assert_eq!(result["workspace_id"], paths.workspace_id);
-        assert_eq!(result["capabilities"], serde_json::json!(["hello"]));
+        assert_eq!(
+            result["capabilities"],
+            serde_json::json!(["hello", "run.start"])
+        );
     }
 
     #[test]
@@ -265,5 +333,51 @@ mod tests {
 
         assert_eq!(response.kind, EnvelopeKind::Error);
         assert_eq!(error.code, ERROR_WORKSPACE_MISMATCH);
+    }
+
+    #[test]
+    fn run_start_reports_shared_driver_error() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[provider]
+kind = "open_ai"
+model = "gpt-5.5"
+api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
+"#,
+        )
+        .unwrap();
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+
+        let response = server.handle_line(&format!(
+            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        let error = response.error.unwrap();
+
+        assert_eq!(response.kind, EnvelopeKind::Error);
+        assert_eq!(response.method.as_deref(), Some("run.start"));
+        assert_eq!(error.code, ERROR_RUN_FAILED);
+        assert!(error.message.contains("PLATO_AGENT_TEST_MISSING_KEY"));
+    }
+
+    #[test]
+    fn run_start_rejects_invalid_params_before_driver() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+
+        let response = server.handle_line(
+            r#"{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{}}"#,
+        );
+        let error = response.error.unwrap();
+
+        assert_eq!(response.kind, EnvelopeKind::Error);
+        assert_eq!(error.code, ERROR_MALFORMED_REQUEST);
     }
 }
