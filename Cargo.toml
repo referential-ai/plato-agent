@@ -1,0 +1,24 @@
+[package]
+name = "plato-agent"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Plato Agent runtime and CLI built on platonic-core."
+license = "UNLICENSED"
+
+[[bin]]
+name = "plato"
+path = "src/bin/plato.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+platonic-core = { git = "ssh://git@github.com/referential-ai/platonic-core.git", rev = "ca2a697ae7114815044acb63e578c6b93b9da007" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.9"
+ureq = { version = "2", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3"
+
