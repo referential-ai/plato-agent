@@ -1,5 +1,6 @@
+use crate::tool_catalog::{FILE_READ, FILE_WRITE};
 use crate::{AppError, AppResult};
-use platonic_core::{EffectClass, ResultVisibility, ToolResult};
+use platonic_core::{ResultVisibility, ToolResult};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -30,14 +31,6 @@ pub enum ApprovalOutcome {
     Denied { reason: String },
 }
 
-pub fn effect_for_tool(name: &str) -> EffectClass {
-    match name {
-        "file.read" => EffectClass::ReadOnly,
-        "file.write" => EffectClass::WorkspaceWrite,
-        _ => EffectClass::ExternalSideEffect,
-    }
-}
-
 pub fn execute_tool(
     workspace_root: &Path,
     call_id: platonic_core::ToolCallId,
@@ -45,8 +38,8 @@ pub fn execute_tool(
     input: Value,
 ) -> AppResult<ToolResult> {
     match tool_name {
-        "file.read" => read_file(workspace_root, call_id, input),
-        "file.write" => write_file(workspace_root, call_id, input),
+        FILE_READ => read_file(workspace_root, call_id, input),
+        FILE_WRITE => write_file(workspace_root, call_id, input),
         _ => Err(AppError::Tool(format!("unknown tool: {tool_name}"))),
     }
 }

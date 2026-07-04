@@ -1,4 +1,7 @@
-use crate::{AppError, AppResult};
+use crate::{
+    AppError, AppResult,
+    tool_catalog::{default_enabled_tools, is_known_tool},
+};
 use serde::Deserialize;
 use std::{fs, path::Path};
 
@@ -115,16 +118,11 @@ impl Config {
         }
         let kind = provider.kind.unwrap_or(ProviderKind::OpenAi);
 
-        let enabled = tools
-            .enabled
-            .unwrap_or_else(|| vec!["file.read".into(), "file.write".into()]);
+        let enabled = tools.enabled.unwrap_or_else(default_enabled_tools);
         if enabled.is_empty() {
             return Err(AppError::Config("tools.enabled must not be empty".into()));
         }
-        if let Some(tool) = enabled
-            .iter()
-            .find(|tool| !matches!(tool.as_str(), "file.read" | "file.write"))
-        {
+        if let Some(tool) = enabled.iter().find(|tool| !is_known_tool(tool)) {
             return Err(AppError::Config(format!(
                 "unknown tool in tools.enabled: {tool}"
             )));
@@ -172,7 +170,7 @@ impl Default for Config {
                 max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             },
             tools: ToolsConfig {
-                enabled: vec!["file.read".into(), "file.write".into()],
+                enabled: default_enabled_tools(),
             },
         }
     }
@@ -250,7 +248,12 @@ mod tests {
             }),
         };
 
-        assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
+        let err = Config::from_raw(raw).unwrap_err();
+
+        assert!(matches!(
+            err,
+            AppError::Config(message) if message == "unknown tool in tools.enabled: shell.exec"
+        ));
     }
 
     #[test]
