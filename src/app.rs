@@ -436,4 +436,19 @@ mod tests {
             PolicyDecision::Deny { .. }
         ));
     }
+
+    #[test]
+    fn enabled_file_write_requires_approval() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            tool: ToolName::new("file.write").unwrap(),
+            effect: EffectClass::WorkspaceWrite,
+            input: json!({"path": "out.txt", "content": "hello"}),
+        };
+
+        assert!(matches!(
+            evaluate_policy(&["file.write".into()], &call),
+            PolicyDecision::RequireApproval { .. }
+        ));
+    }
 }

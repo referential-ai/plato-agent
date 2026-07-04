@@ -38,7 +38,8 @@ app_title = "Plato Agent"
 
 `file.read` is auto-allowed. `file.write` requires stdin approval and defaults to no.
 Use `--yolo` to auto-approve enabled tools that would otherwise prompt. Yolo
-mode does not enable unknown tools or bypass workspace path checks.
+mode does not enable disabled or unknown tools, permit deny-class effects such
+as external side effects or secret access, or bypass workspace path checks.
 
 ## Commands
 
