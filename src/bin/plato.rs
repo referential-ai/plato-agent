@@ -101,6 +101,9 @@ fn run() -> plato_agent::AppResult<()> {
                 ledger: ledger.clone(),
                 workspace_root,
                 approval_mode: ApprovalMode::from_yolo(cli.yolo),
+                run_id: None,
+                event_sender: None,
+                cancel: None,
             })?;
             write_run_success_output(&mut io::stdout(), &mut io::stderr(), &outcome, &ledger)
         }

@@ -6,10 +6,11 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Write},
     path::Path,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub const LEDGER_VERSION: u32 = 1;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -116,6 +117,7 @@ impl SqliteLedger {
             std::fs::create_dir_all(parent)?;
         }
         let mut connection = Connection::open(path)?;
+        configure_sqlite_connection(&connection)?;
         migrate_sqlite(&mut connection)?;
         Ok(Self { connection })
     }
@@ -123,6 +125,7 @@ impl SqliteLedger {
     pub fn open_readonly(path: &Path) -> AppResult<Self> {
         let connection =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        configure_sqlite_connection(&connection)?;
         Ok(Self { connection })
     }
 
@@ -247,6 +250,11 @@ fn row_u64(row: &rusqlite::Row<'_>, index: usize, field: &str) -> rusqlite::Resu
             )),
         )
     })
+}
+
+fn configure_sqlite_connection(connection: &Connection) -> AppResult<()> {
+    connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+    Ok(())
 }
 
 fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {

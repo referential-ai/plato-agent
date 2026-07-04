@@ -4,6 +4,9 @@ use serde_json::Value;
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub const ERROR_MALFORMED_REQUEST: &str = "malformed_request";
+pub const ERROR_LAGGED: &str = "lagged";
+pub const ERROR_NOT_FOUND: &str = "not_found";
+pub const ERROR_OVERLOAD: &str = "overload";
 pub const ERROR_RUN_FAILED: &str = "run_failed";
 pub const ERROR_UNSUPPORTED_METHOD: &str = "unsupported_method";
 pub const ERROR_UNSUPPORTED_VERSION: &str = "unsupported_version";
@@ -96,13 +99,98 @@ pub struct RunStartParams {
     pub question: String,
     #[serde(default)]
     pub config_path: Option<String>,
+    #[serde(default)]
+    pub wait: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RunStartResult {
     pub run_id: String,
+    pub session_id: String,
     pub ledger_path: String,
-    pub final_answer: String,
+    pub status: String,
+    pub final_answer: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageAppendParams {
+    pub message: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub config_path: Option<String>,
+    #[serde(default)]
+    pub wait: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventsStreamParams {
+    pub run_id: String,
+    #[serde(default)]
+    pub from_offset: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct EventsStreamResult {
+    pub run_id: String,
+    pub from_offset: u64,
+    pub next_offset: u64,
+    pub status: String,
+    pub events: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalDecideParams {
+    pub run_id: String,
+    pub tool_call_id: String,
+    pub decision: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunCancelParams {
+    pub run_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CommandAcceptedResult {
+    pub run_id: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SessionsListResult {
+    pub sessions: Vec<SessionSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub run_id: String,
+    pub status: String,
+    pub ledger_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptReadParams {
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TranscriptReadResult {
+    pub run_id: String,
+    pub transcript: String,
 }
 
 pub fn decode_request(line: &str) -> Result<Envelope, Box<Envelope>> {
