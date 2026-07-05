@@ -114,6 +114,7 @@ fn run() -> plato_agent::AppResult<()> {
                 run_id: None,
                 session,
                 event_sender: None,
+                stream_to_stderr: true,
                 cancel: None,
             })?;
             write_run_success_output(&mut io::stdout(), &mut io::stderr(), &outcome, &ledger)

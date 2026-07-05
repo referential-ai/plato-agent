@@ -27,7 +27,7 @@ max_output_tokens = 1024
 max_turns = 8
 
 [tools]
-enabled = ["file.read", "file.list", "file.write"]
+enabled = ["file.read", "file.list", "file.write", "file.edit", "shell.exec"]
 ```
 
 ## 1. First run (60-second smoke test)
@@ -38,9 +38,10 @@ plato -c "name the most important file from that summary"
 plato replay        # audit the latest default SQLite session
 ```
 
-The answer prints to stdout; the complete run ledger lands in the default XDG
-SQLite store for the workspace. `-c` continues the latest workspace session.
-Use `--events <file>` when you want JSONL.
+Live assistant text prints to stderr; the final answer prints to stdout. The
+complete run ledger lands in the default XDG SQLite store for the workspace.
+`-c` continues the latest workspace session. Use `--events <file>` when you
+want JSONL.
 
 ## 2. Test the approval boundary
 
@@ -71,7 +72,8 @@ plato replay                # replays the latest session
 
 Explicit SQLite paths need the equals form: `--db=/tmp/run.db`. If the
 workspace daemon lock is held, SQLite CLI run/replay paths fail closed instead
-of competing with the daemon-owned store.
+of competing with the daemon-owned store. Replay shows final assistant messages,
+not partial live deltas.
 
 ## 4. The full experience: TUI
 

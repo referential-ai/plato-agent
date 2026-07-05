@@ -6,7 +6,7 @@ Plato Agent is the first application shell built on `platonic-core`.
 
 The bootstrap surface is intentionally small:
 
-- `plato "question"` runs one bounded CLI invocation and writes the run ledger to the default XDG SQLite path.
+- `plato "question"` runs one bounded CLI invocation, streams live assistant text to stderr, and writes the run ledger to the default XDG SQLite path.
 - `plato -c "follow-up"` continues the latest workspace session from the SQLite ledger.
 - `plato --events <file> "question"` writes an explicit JSONL ledger.
 - `plato replay <file>` validates and prints a deterministic JSONL readback without network calls or tool execution.
@@ -66,7 +66,8 @@ workspace path checks.
 - `--db` also writes to the default XDG state path.
 - `--db=<path>` writes to that SQLite file; relative paths resolve against the current workspace.
 - Use `=` for explicit paths because `--db` also has a bare default form.
-- Successful `--db` runs print `run_id`, `ledger_path`, and a replay command to stderr. Stdout remains only the final answer.
+- Live assistant text, `run_id`, `ledger_path`, and replay hints print to stderr. Stdout remains only the final answer.
+- Replay shows final assistant messages, not partial streaming deltas.
 - `plato replay` without arguments replays the latest session from the default XDG SQLite ledger.
 - `plato replay --run <id>` replays a single run.
 - `--events <file>` is the explicit JSONL export/debug path.
@@ -111,6 +112,8 @@ Default paths are keyed by the workspace id:
 The daemon holds the lock while it is active. SIGINT and SIGTERM trigger
 a graceful shutdown: the daemon stops accepting new connections, then removes
 the socket and lock before exiting. Do not remove a lock for a live daemon.
+Live assistant deltas are transient `events.stream` events and are not written
+to the ledger.
 
 Minimal NDJSON-over-Unix-socket check, using the `workspace_id` and
 `socket_path` printed by the daemon:
@@ -163,6 +166,8 @@ cargo run --bin plato -- --tui --config plato.toml
 `plato-tui` remains a terminal client for a manually started `plato-agentd`. It
 does not spawn, supervise, restart, or stop the daemon, and it does not call
 providers, execute tools, or write SQLite directly.
+Assistant text appears live through daemon `events.stream`; replay remains
+based on final ledger messages.
 
 ```bash
 cargo run --bin plato-agentd -- --workspace "$PWD"

@@ -1,4 +1,7 @@
-use crate::{AppResult, ApprovalRequest, daemon::server::DaemonPaths, tools::ApprovalOutcome};
+use crate::{
+    AppResult, ApprovalRequest, AssistantDeltaEvent, daemon::server::DaemonPaths,
+    tools::ApprovalOutcome,
+};
 use platonic_core::RecordedEvent;
 use serde_json::{Value, json};
 use std::{
@@ -126,6 +129,17 @@ impl RunRecord {
         }));
     }
 
+    pub(super) fn push_assistant_delta(&self, delta: AssistantDeltaEvent) {
+        self.push_event(json!({
+            "kind": "assistant_delta",
+            "run_id": delta.run_id.to_string(),
+            "turn_id": delta.turn_id.to_string(),
+            "step": delta.step,
+            "delta_index": delta.delta_index,
+            "text": delta.text,
+        }));
+    }
+
     pub(super) fn status(&self) -> RunStatus {
         self.status
             .lock()
@@ -203,6 +217,7 @@ fn approval_requested_event(request: &ApprovalRequest) -> Value {
 mod tests {
     use super::*;
     use platonic_core::{EffectClass, RunId, ToolCallId};
+    use std::path::PathBuf;
 
     #[test]
     fn approval_requested_event_carries_diff_preview_when_present() {
@@ -251,5 +266,32 @@ mod tests {
             event["approval_preview"],
             "command: cargo test\ncwd: /tmp/work"
         );
+    }
+
+    #[test]
+    fn push_assistant_delta_buffers_transient_event() {
+        let record = RunRecord::new(
+            "run_1".into(),
+            "session_1".into(),
+            PathBuf::from("/tmp/agent.db"),
+        );
+
+        record.push_assistant_delta(AssistantDeltaEvent {
+            run_id: RunId::new("run_1").unwrap(),
+            turn_id: platonic_core::TurnId::new("turn_1").unwrap(),
+            step: 0,
+            delta_index: 1,
+            text: "hello".into(),
+        });
+
+        let buffer = record.events.lock().unwrap();
+        assert_eq!(buffer.next_offset, 1);
+        assert_eq!(buffer.events[0]["offset"], 0);
+        assert_eq!(buffer.events[0]["event"]["kind"], "assistant_delta");
+        assert_eq!(buffer.events[0]["event"]["run_id"], "run_1");
+        assert_eq!(buffer.events[0]["event"]["turn_id"], "turn_1");
+        assert_eq!(buffer.events[0]["event"]["step"], 0);
+        assert_eq!(buffer.events[0]["event"]["delta_index"], 1);
+        assert_eq!(buffer.events[0]["event"]["text"], "hello");
     }
 }

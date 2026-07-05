@@ -84,6 +84,11 @@ pub fn live_event_line(value: &Value) -> LiveEventLine {
                 .unwrap_or("unknown effect");
             format!("approval pending {tool_name} ({effect})")
         }
+        Some("assistant_delta") => event
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| format!("assistant {text}"))
+            .unwrap_or_else(|| "assistant delta".into()),
         Some(kind) => kind.into(),
         None => serde_json::to_string(event).unwrap_or_else(|_| "unrenderable event".into()),
     };
@@ -148,6 +153,13 @@ mod tests {
                 }
             }
         }));
+        let delta = live_event_line(&serde_json::json!({
+            "offset": 6,
+            "event": {
+                "kind": "assistant_delta",
+                "text": "hello"
+            }
+        }));
 
         assert_eq!(
             approval,
@@ -157,6 +169,7 @@ mod tests {
             ledger,
             LiveEventLine::new(Some(5), "tool proposed file.read")
         );
+        assert_eq!(delta, LiveEventLine::new(Some(6), "assistant hello"));
     }
 
     #[test]

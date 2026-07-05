@@ -18,6 +18,7 @@ This document copies the topology decision from the Platonic workspace issue tha
 - Daemon ownership: `plato-agentd` owns the Unix socket, event database, and process lock. XDG runtime/state paths are keyed by `workspace-id` = sanitized root basename + first 16 SHA-256 hex chars of the canonical root path.
 - Single-writer invariant: one live writer owns a workspace store. Before daemon and CLI coexist on SQLite, decide whether CLI writes directly, delegates to the daemon, or refuses while the daemon is active.
 - Daemon API sketch: start run, append message, stream events, approve/deny, cancel, list sessions, read transcript.
+- Live assistant text deltas are transient daemon/app events; final `model_responded` ledger messages remain the replay source of truth.
 - Connector rule: connectors and gateways never own sessions, policy, approvals, provider fallback, or run semantics. Process placement is host mechanics; the semantic boundary is binding.
 
 ## Boundary Ladder

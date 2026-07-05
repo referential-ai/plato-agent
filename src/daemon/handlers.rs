@@ -1,5 +1,5 @@
 use crate::{
-    ApprovalMode, RunLedger, RunOptions, RunSession,
+    ApprovalMode, RunEvent, RunLedger, RunOptions, RunSession,
     daemon::{
         protocol::{
             ApprovalDecideParams, CommandAcceptedResult, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
@@ -14,7 +14,6 @@ use crate::{
     new_run_id, new_session_id, replay_sqlite, replay_sqlite_session, run_question,
     tools::ApprovalOutcome,
 };
-use platonic_core::RecordedEvent;
 use serde_json::{json, to_value};
 use std::{
     path::PathBuf,
@@ -227,7 +226,7 @@ fn start_run(
         .expect("runs lock poisoned")
         .insert(run_id_string.clone(), record.clone());
 
-    let (event_sender, event_receiver) = mpsc::channel::<RecordedEvent>();
+    let (event_sender, event_receiver) = mpsc::channel::<RunEvent>();
     spawn_event_collector(record.clone(), event_receiver);
     let options = RunOptions {
         question,
@@ -238,6 +237,7 @@ fn start_run(
         run_id: Some(run_id),
         session: Some(session),
         event_sender: Some(event_sender),
+        stream_to_stderr: false,
         cancel: Some(record.cancel.clone()),
     };
 
@@ -517,10 +517,13 @@ fn decode_params<T: serde::de::DeserializeOwned>(
     }
 }
 
-fn spawn_event_collector(record: Arc<RunRecord>, receiver: mpsc::Receiver<RecordedEvent>) {
+fn spawn_event_collector(record: Arc<RunRecord>, receiver: mpsc::Receiver<RunEvent>) {
     thread::spawn(move || {
         for event in receiver {
-            record.push_recorded_event(event);
+            match event {
+                RunEvent::Ledger(recorded) => record.push_recorded_event(recorded),
+                RunEvent::AssistantDelta(delta) => record.push_assistant_delta(delta),
+            }
         }
     });
 }
