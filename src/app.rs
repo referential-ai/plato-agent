@@ -8,9 +8,9 @@ use crate::{
     tools::{ApprovalOutcome, approval_diff_preview, ask_for_approval, execute_tool},
 };
 use platonic_core::{
-    ActorId, AgentId, ContextFragment, ContextLane, ContextPack, EffectClass, HarnessEvent,
-    Message, MessageRole, ModelName, PolicyDecision, RecordedEvent, RunId, ToolCall, ToolCallId,
-    ToolName, ToolProposal, TurnId,
+    ActorId, AgentId, ContextFragment, ContextLane, ContextPack, EffectClass, Error as CoreError,
+    HarnessEvent, Message, MessageRole, ModelName, PolicyDecision, RecordedEvent, RunId, ToolCall,
+    ToolCallId, ToolName, ToolProposal, TurnId,
 };
 use serde_json::Value;
 use std::{
@@ -180,15 +180,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         };
         let context = context_pack(&request, config.limits.token_budget)?;
         check_cancel(&mut recorder, &options, &run_id)?;
-        record_event(
-            &mut recorder,
-            &options,
-            HarnessEvent::ContextBuilt {
-                run_id: run_id.clone(),
-                turn_id: turn_id.clone(),
-                context,
-            },
-        )?;
+        record_context_built(&mut recorder, &options, &run_id, turn_id.clone(), context)?;
         record_event(
             &mut recorder,
             &options,
@@ -512,6 +504,39 @@ fn record_event(
     Ok(record)
 }
 
+fn record_context_built(
+    recorder: &mut EventRecorder,
+    options: &RunOptions,
+    run_id: &RunId,
+    turn_id: TurnId,
+    context: ContextPack,
+) -> AppResult<()> {
+    match record_event(
+        recorder,
+        options,
+        HarnessEvent::ContextBuilt {
+            run_id: run_id.clone(),
+            turn_id,
+            context,
+        },
+    ) {
+        Ok(_) => Ok(()),
+        Err(AppError::Core(CoreError::ContextBudgetExceeded { used, budget })) => {
+            let error = CoreError::ContextBudgetExceeded { used, budget };
+            record_event(
+                recorder,
+                options,
+                HarnessEvent::RunFailed {
+                    run_id: run_id.clone(),
+                    reason: error.to_string(),
+                },
+            )?;
+            Err(AppError::Core(error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn check_cancel(
     recorder: &mut EventRecorder,
     options: &RunOptions,
@@ -680,8 +705,9 @@ pub fn new_run_id() -> AppResult<RunId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use platonic_core::EffectClass;
+    use platonic_core::{EffectClass, RunPhase, RunReadback};
     use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn yolo_auto_grants_required_approval() {
@@ -795,5 +821,116 @@ mod tests {
             evaluate_policy(&["file.edit".into()], &call),
             PolicyDecision::RequireApproval { .. }
         ));
+    }
+
+    #[test]
+    fn jsonl_context_budget_abort_records_terminal_run_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        write_over_budget_config(&config_path);
+        let ledger_path = dir.path().join("events.jsonl");
+
+        let err = run_question(over_budget_options(
+            &config_path,
+            RunLedger::Jsonl(ledger_path.clone()),
+            dir.path().to_path_buf(),
+            "run_budget_jsonl",
+        ))
+        .unwrap_err();
+
+        assert_context_budget_error(&err);
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert_context_budget_terminal_records(&records);
+        let replay = crate::replay::replay_file(&ledger_path).unwrap();
+        assert!(replay.contains("final_phase: Failed"));
+    }
+
+    #[test]
+    fn sqlite_context_budget_abort_records_terminal_run_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        write_over_budget_config(&config_path);
+        let ledger_path = dir.path().join("events.db");
+
+        let err = run_question(over_budget_options(
+            &config_path,
+            RunLedger::Sqlite(ledger_path.clone()),
+            dir.path().to_path_buf(),
+            "run_budget_sqlite",
+        ))
+        .unwrap_err();
+
+        assert_context_budget_error(&err);
+        let records =
+            crate::ledger::read_sqlite_records(&ledger_path, Some("run_budget_sqlite")).unwrap();
+        assert_context_budget_terminal_records(&records);
+        let replay = crate::replay::replay_sqlite(&ledger_path, Some("run_budget_sqlite")).unwrap();
+        assert!(replay.contains("final_phase: Failed"));
+    }
+
+    fn write_over_budget_config(path: &Path) {
+        std::fs::write(
+            path,
+            r#"
+[provider]
+api_key_env = "PATH"
+base_url = "https://example.invalid"
+timeout_ms = 1
+
+[limits]
+token_budget = 1
+max_output_tokens = 1
+
+[tools]
+enabled = ["file.read"]
+"#,
+        )
+        .unwrap();
+    }
+
+    fn over_budget_options(
+        config_path: &Path,
+        ledger: RunLedger,
+        workspace_root: PathBuf,
+        run_id: &str,
+    ) -> RunOptions {
+        RunOptions {
+            question: "hello".into(),
+            config_path: config_path.to_path_buf(),
+            ledger,
+            workspace_root,
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(RunId::new(run_id).unwrap()),
+            event_sender: None,
+            cancel: None,
+        }
+    }
+
+    fn assert_context_budget_error(error: &AppError) {
+        assert!(
+            error.to_string().contains("context budget exceeded: used "),
+            "{error}"
+        );
+    }
+
+    fn assert_context_budget_terminal_records(records: &[RecordedEvent]) {
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[0].event, HarnessEvent::RunStarted { .. }));
+        match &records[1].event {
+            HarnessEvent::RunFailed { reason, .. } => {
+                assert!(reason.contains("context budget exceeded: used "));
+                assert!(reason.contains("budget 1"));
+            }
+            event => panic!("expected run_failed, got {event:?}"),
+        }
+
+        let readback = RunReadback::from_events(records).unwrap();
+        match readback.final_phase {
+            RunPhase::Failed { reason } => {
+                assert!(reason.contains("context budget exceeded: used "));
+                assert!(reason.contains("budget 1"));
+            }
+            phase => panic!("expected failed final phase, got {phase:?}"),
+        }
     }
 }
