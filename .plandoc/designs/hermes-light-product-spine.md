@@ -187,7 +187,7 @@ Not checked yet:
 ## Open Questions
 - Should the last workspace session be selected by latest successful run, latest session record, or an explicit session pointer?
 - How should long sessions compact or select context under token budget?
-- Should `plato tui` spawn/connect to the daemon, or remain a wrapper over separately started binaries for the MVP?
+- Resolved by PR #47: `plato --tui` attaches to an existing workspace daemon or starts an embedded daemon for the TUI session.
 - What exact environment variables are safe to pass to `shell.exec`?
 - Does the first gateway target need pairing, local-only callback URLs, or daemon socket brokering?
 - Should approved learnings be scoped per user, per workspace, or both?
