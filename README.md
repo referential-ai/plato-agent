@@ -132,8 +132,15 @@ PY
 
 ## TUI
 
-`plato-tui` is a terminal client for a manually started `plato-agentd`. It does
-not spawn, supervise, restart, or stop the daemon, and it does not call
+`plato --tui` is the interactive local entrypoint. It attaches to the workspace
+daemon if one is running, or starts an embedded daemon for the TUI session.
+
+```bash
+cargo run --bin plato -- --tui --config plato.toml
+```
+
+`plato-tui` remains a terminal client for a manually started `plato-agentd`. It
+does not spawn, supervise, restart, or stop the daemon, and it does not call
 providers, execute tools, or write SQLite directly.
 
 ```bash
@@ -165,6 +172,7 @@ cargo run --bin plato -- --db "read README.md and summarize it"
 cargo run --bin plato -- --db=/tmp/plato-agent.db "read README.md and summarize it"
 cargo run --bin plato -- replay --db
 cargo run --bin plato -- replay --db=/tmp/plato-agent.db --run run_123
+cargo run --bin plato -- --tui --config plato.toml
 cargo run --bin plato-tui -- --workspace "$PWD"
 ```
 

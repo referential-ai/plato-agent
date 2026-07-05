@@ -1,18 +1,34 @@
 use clap::{Parser, Subcommand};
 use plato_agent::{
     AppError, ApprovalMode, RunLedger, RunOptions, RunOutcome,
-    daemon::lock::ensure_workspace_unlocked, paths::default_sqlite_path, replay_file,
-    replay_sqlite, run_question,
+    daemon::{
+        client::{DaemonClient, DaemonConnectionConfig},
+        lock::ensure_workspace_unlocked,
+        server::DaemonServer,
+    },
+    paths::default_sqlite_path,
+    replay_file, replay_sqlite, run_question,
+    tui::{TuiOptions, run_tui},
 };
 use platonic_core::RunId;
 use std::{
     io::{self, Write},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
+
+const EMBEDDED_DAEMON_TIMEOUT: Duration = Duration::from_secs(3);
+const EMBEDDED_DAEMON_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Parser)]
 #[command(name = "plato")]
-#[command(about = "One-shot Plato Agent CLI")]
+#[command(about = "Plato Agent CLI")]
 struct Cli {
     #[arg(long, global = true, default_value = "plato.toml")]
     config: PathBuf,
@@ -36,6 +52,9 @@ struct Cli {
         help = "Auto-approve enabled tool calls that would otherwise prompt"
     )]
     yolo: bool,
+
+    #[arg(long, global = true, help = "Start the interactive terminal UI")]
+    tui: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -65,6 +84,9 @@ fn main() {
 fn run() -> plato_agent::AppResult<()> {
     let cli = Cli::parse();
     let workspace_root = std::env::current_dir()?;
+    if cli.tui {
+        return run_tui_mode(cli, workspace_root);
+    }
     match cli.command {
         Some(Command::Replay { run, file }) => {
             let db_path = sqlite_path(cli.db, &workspace_root)?;
@@ -106,6 +128,126 @@ fn run() -> plato_agent::AppResult<()> {
                 cancel: None,
             })?;
             write_run_success_output(&mut io::stdout(), &mut io::stderr(), &outcome, &ledger)
+        }
+    }
+}
+
+fn run_tui_mode(cli: Cli, workspace_root: PathBuf) -> plato_agent::AppResult<()> {
+    let options = tui_options_from_cli(&cli, &workspace_root)?;
+    let _embedded_daemon = ensure_tui_daemon(&workspace_root)?;
+    run_tui(options)
+}
+
+fn tui_options_from_cli(cli: &Cli, workspace_root: &Path) -> plato_agent::AppResult<TuiOptions> {
+    validate_tui_cli(cli)?;
+    let mut options = TuiOptions::new(workspace_root.to_path_buf());
+    options.config = Some(cli.config.clone());
+    Ok(options)
+}
+
+fn validate_tui_cli(cli: &Cli) -> plato_agent::AppResult<()> {
+    if cli.command.is_some() {
+        return Err(AppError::Config(
+            "plato --tui cannot be combined with subcommands".into(),
+        ));
+    }
+    if !cli.question.is_empty() {
+        return Err(AppError::Config(
+            "plato --tui cannot be combined with a question".into(),
+        ));
+    }
+    if cli.events.is_some() || cli.db.is_some() || cli.yolo {
+        return Err(AppError::Config(
+            "plato --tui cannot be combined with --events, --db, or --yolo".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_tui_daemon(workspace_root: &Path) -> plato_agent::AppResult<Option<EmbeddedDaemon>> {
+    let config = DaemonConnectionConfig::resolve(workspace_root, None)?;
+    if daemon_accepts_hello(&config) {
+        return Ok(None);
+    }
+    start_embedded_daemon(workspace_root, &config).map(Some)
+}
+
+fn start_embedded_daemon(
+    workspace_root: &Path,
+    config: &DaemonConnectionConfig,
+) -> plato_agent::AppResult<EmbeddedDaemon> {
+    let server = DaemonServer::bind(workspace_root, None)?;
+    let socket_path = server.paths().socket_path.clone();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let thread_shutdown = shutdown.clone();
+    let handle = thread::spawn(move || server.serve_forever(thread_shutdown));
+    let mut daemon = EmbeddedDaemon {
+        shutdown,
+        socket_path,
+        handle: Some(handle),
+    };
+    wait_for_embedded_daemon(config, &mut daemon)?;
+    Ok(daemon)
+}
+
+fn wait_for_embedded_daemon(
+    config: &DaemonConnectionConfig,
+    daemon: &mut EmbeddedDaemon,
+) -> plato_agent::AppResult<()> {
+    let deadline = Instant::now() + EMBEDDED_DAEMON_TIMEOUT;
+    loop {
+        if daemon_accepts_hello(config) {
+            return Ok(());
+        }
+        if daemon.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            return daemon_finished_before_ready(daemon);
+        }
+        if Instant::now() >= deadline {
+            return Err(AppError::Config(format!(
+                "timed out waiting for embedded plato-agentd at {}",
+                config.socket_path.display()
+            )));
+        }
+        thread::sleep(EMBEDDED_DAEMON_POLL);
+    }
+}
+
+fn daemon_accepts_hello(config: &DaemonConnectionConfig) -> bool {
+    let Ok(mut client) = DaemonClient::connect(&config.socket_path) else {
+        return false;
+    };
+    client.hello(&config.workspace_root).is_ok()
+}
+
+fn daemon_finished_before_ready(daemon: &mut EmbeddedDaemon) -> plato_agent::AppResult<()> {
+    let Some(handle) = daemon.handle.take() else {
+        return Err(AppError::Config(
+            "embedded plato-agentd stopped before accepting connections".into(),
+        ));
+    };
+    match handle.join() {
+        Ok(Ok(())) => Err(AppError::Config(
+            "embedded plato-agentd exited before accepting connections".into(),
+        )),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(AppError::Config(
+            "embedded plato-agentd panicked before accepting connections".into(),
+        )),
+    }
+}
+
+struct EmbeddedDaemon {
+    shutdown: Arc<AtomicBool>,
+    socket_path: PathBuf,
+    handle: Option<JoinHandle<plato_agent::AppResult<()>>>,
+}
+
+impl Drop for EmbeddedDaemon {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = UnixStream::connect(&self.socket_path);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -228,6 +370,47 @@ mod tests {
 
         assert_eq!(String::from_utf8(stdout).unwrap(), "done\n");
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn tui_flag_builds_tui_options_with_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["plato", "--tui", "--config", "custom.toml"]).unwrap();
+
+        let options = tui_options_from_cli(&cli, dir.path()).unwrap();
+
+        assert_eq!(options.workspace, dir.path());
+        assert_eq!(options.config.as_deref(), Some(Path::new("custom.toml")));
+        assert_eq!(options.socket, None);
+        assert_eq!(options.run, None);
+        assert!(!options.snapshot);
+    }
+
+    #[test]
+    fn tui_flag_rejects_one_shot_only_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["plato", "--tui", "--yolo"]).unwrap();
+
+        let error = tui_options_from_cli(&cli, dir.path()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Config(message)
+                if message == "plato --tui cannot be combined with --events, --db, or --yolo"
+        ));
+    }
+
+    #[test]
+    fn tui_flag_rejects_questions() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from(["plato", "--tui", "hello"]).unwrap();
+
+        let error = tui_options_from_cli(&cli, dir.path()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Config(message) if message == "plato --tui cannot be combined with a question"
+        ));
     }
 
     #[test]
