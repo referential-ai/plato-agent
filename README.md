@@ -38,7 +38,7 @@ max_output_tokens = 1024
 max_turns = 8
 
 [tools]
-enabled = ["file.read", "file.list", "file.write", "file.edit"]
+enabled = ["file.read", "file.list", "file.write", "file.edit", "shell.exec"]
 ```
 
 OpenAI-compatible direct OpenAI config remains available:
@@ -50,10 +50,14 @@ model = "gpt-5.5"
 api_key_env = "OPENAI_API_KEY"
 ```
 
-`file.read` and `file.list` are auto-allowed. `file.write` and `file.edit` require stdin approval and default to no.
+`file.read` and `file.list` are auto-allowed. `file.write`, `file.edit`, and
+`shell.exec` require stdin approval and default to no. `shell.exec` runs from
+the workspace root with a scrubbed child environment, no provider credentials,
+bounded stdout/stderr, and a timeout.
 Use `--yolo` to auto-approve enabled tools that would otherwise prompt. Yolo
 mode does not enable disabled or unknown tools, permit deny-class effects such
-as external side effects or secret access, or bypass workspace path checks.
+as external side effects or secret access, approve `shell.exec`, or bypass
+workspace path checks.
 
 ## SQLite Ledgers
 
@@ -185,6 +189,7 @@ Keys:
 cargo run --bin plato -- "read README.md and summarize it"
 cargo run --bin plato -- -c "what did you just summarize?"
 cargo run --bin plato -- --yolo "write local-proof.txt with hello from Plato"
+cargo run --bin plato -- "run cargo test --locked and summarize the result"
 cargo run --bin plato -- replay
 cargo run --bin plato -- replay events.jsonl
 cargo run --bin plato -- --db "read README.md and summarize it"

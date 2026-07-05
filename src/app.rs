@@ -4,8 +4,11 @@ use crate::{
     ledger::{EventRecorder, SessionTurn, SqliteLedger},
     model::{ModelBlock, ModelMessage, ModelRequest, ModelResponse, ModelStop, system_prompt},
     provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
-    tool_catalog::{ToolSpec, effect_for_tool, tool_specs},
-    tools::{ApprovalOutcome, approval_diff_preview, ask_for_approval, execute_tool},
+    tool_catalog::{SHELL_EXEC, ToolSpec, effect_for_tool, tool_specs},
+    tools::{
+        ApprovalOutcome, ToolExecutionContext, approval_command_preview, approval_diff_preview,
+        ask_for_approval, execute_tool_with_context,
+    },
 };
 use platonic_core::{
     ActorId, AgentId, ContextFragment, ContextLane, ContextPack, EffectClass, Error as CoreError,
@@ -116,6 +119,7 @@ pub struct ApprovalRequest {
     pub tool_name: String,
     pub effect: EffectClass,
     pub reason: String,
+    pub approval_preview: Option<String>,
     pub diff_preview: Option<String>,
 }
 
@@ -128,9 +132,13 @@ impl ApprovalMode {
         }
     }
 
-    fn auto_grant_actor(&self, policy: &PolicyDecision) -> Option<&'static str> {
+    fn auto_grant_actor(&self, call: &ToolCall, policy: &PolicyDecision) -> Option<&'static str> {
         match (self, policy) {
-            (Self::AutoApprove, PolicyDecision::RequireApproval { .. }) => Some("yolo"),
+            (Self::AutoApprove, PolicyDecision::RequireApproval { .. })
+                if call.tool.as_str() != SHELL_EXEC =>
+            {
+                Some("yolo")
+            }
             _ => None,
         }
     }
@@ -487,14 +495,14 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             PolicyDecision::Allow => execute_and_record_tool(
                 &mut recorder,
                 &options,
+                &config,
                 &run_id,
-                &options.workspace_root,
                 call_id.clone(),
                 &tool_name,
                 input,
             )?,
             PolicyDecision::RequireApproval { ref reason } => {
-                if let Some(actor) = options.approval_mode.auto_grant_actor(&policy) {
+                if let Some(actor) = options.approval_mode.auto_grant_actor(&call, &policy) {
                     let actor_id = ActorId::new(actor)?;
                     record_event(
                         &mut recorder,
@@ -508,8 +516,8 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     execute_and_record_tool(
                         &mut recorder,
                         &options,
+                        &config,
                         &run_id,
-                        &options.workspace_root,
                         call_id.clone(),
                         &tool_name,
                         input,
@@ -532,12 +540,19 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                         is_error: true,
                     }
                 } else if let ApprovalMode::External(handler) = options.approval_mode.clone() {
+                    let approval_preview = approval_command_preview(
+                        &options.workspace_root,
+                        call.tool.as_str(),
+                        &call.input,
+                        Some(&config.provider.api_key_env),
+                    );
                     let request = ApprovalRequest {
                         run_id: run_id.clone(),
                         call_id: call_id.clone(),
                         tool_name: call.tool.to_string(),
                         effect: call.effect.clone(),
                         reason: reason.clone(),
+                        approval_preview,
                         diff_preview: approval_diff_preview(
                             &options.workspace_root,
                             call.tool.as_str(),
@@ -558,8 +573,8 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                             execute_and_record_tool(
                                 &mut recorder,
                                 &options,
+                                &config,
                                 &run_id,
-                                &options.workspace_root,
                                 call_id.clone(),
                                 &tool_name,
                                 input,
@@ -583,7 +598,13 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                         }
                     }
                 } else {
-                    match ask_for_approval(&tool_name, &call.input)? {
+                    let approval_preview = approval_command_preview(
+                        &options.workspace_root,
+                        call.tool.as_str(),
+                        &call.input,
+                        Some(&config.provider.api_key_env),
+                    );
+                    match ask_for_approval(&tool_name, &call.input, approval_preview.as_deref())? {
                         ApprovalOutcome::Granted => {
                             record_event(
                                 &mut recorder,
@@ -597,8 +618,8 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                             execute_and_record_tool(
                                 &mut recorder,
                                 &options,
+                                &config,
                                 &run_id,
-                                &options.workspace_root,
                                 call_id.clone(),
                                 &tool_name,
                                 input,
@@ -729,8 +750,8 @@ fn check_cancel(
 fn execute_and_record_tool(
     recorder: &mut EventRecorder,
     options: &RunOptions,
+    config: &Config,
     run_id: &RunId,
-    workspace_root: &std::path::Path,
     call_id: ToolCallId,
     tool_name: &str,
     input: Value,
@@ -745,9 +766,15 @@ fn execute_and_record_tool(
         },
     )?;
 
-    match execute_tool(workspace_root, call_id.clone(), tool_name, input) {
+    let context = ToolExecutionContext {
+        workspace_root: &options.workspace_root,
+        provider_api_key_env: Some(&config.provider.api_key_env),
+        cancel: options.cancel.as_deref(),
+    };
+    match execute_tool_with_context(context, call_id.clone(), tool_name, input) {
         Ok(result) => {
             let content = serde_json::to_string(&result.data)?;
+            let is_error = tool_result_is_error(tool_name, &result);
             record_event(
                 recorder,
                 options,
@@ -756,10 +783,7 @@ fn execute_and_record_tool(
                     result: result.clone(),
                 },
             )?;
-            Ok(ToolMessage {
-                content,
-                is_error: false,
-            })
+            Ok(ToolMessage { content, is_error })
         }
         Err(error) => {
             let reason = error.to_string();
@@ -778,6 +802,14 @@ fn execute_and_record_tool(
             })
         }
     }
+}
+
+fn tool_result_is_error(tool_name: &str, result: &platonic_core::ToolResult) -> bool {
+    tool_name == SHELL_EXEC
+        && result
+            .data
+            .get("exit_code")
+            .is_some_and(|exit_code| exit_code.as_i64() != Some(0))
 }
 
 fn proposals_from_response(response: &ModelResponse) -> AppResult<Vec<ToolProposal>> {
@@ -807,6 +839,11 @@ fn evaluate_policy(enabled_tools: &[String], call: &ToolCall) -> PolicyDecision 
         .iter()
         .any(|enabled| enabled == call.tool.as_str())
     {
+        if call.tool.as_str() == SHELL_EXEC {
+            return PolicyDecision::RequireApproval {
+                reason: "shell.exec requires explicit local approval".into(),
+            };
+        }
         call.effect.default_policy()
     } else {
         PolicyDecision::Deny {
@@ -887,14 +924,38 @@ mod tests {
         let policy = PolicyDecision::RequireApproval {
             reason: "requires approval".into(),
         };
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            tool: ToolName::new("file.write").unwrap(),
+            effect: EffectClass::WorkspaceWrite,
+            input: json!({"path": "out.txt", "content": "hello"}),
+        };
 
         assert_eq!(
-            ApprovalMode::AutoApprove.auto_grant_actor(&policy),
+            ApprovalMode::AutoApprove.auto_grant_actor(&call, &policy),
             Some("yolo")
         );
-        assert_eq!(ApprovalMode::Prompt.auto_grant_actor(&policy), None);
+        assert_eq!(ApprovalMode::Prompt.auto_grant_actor(&call, &policy), None);
         assert_eq!(
-            (ApprovalMode::Deny { actor: "daemon" }).auto_grant_actor(&policy),
+            (ApprovalMode::Deny { actor: "daemon" }).auto_grant_actor(&call, &policy),
+            None
+        );
+    }
+
+    #[test]
+    fn yolo_does_not_auto_grant_shell_exec() {
+        let policy = PolicyDecision::RequireApproval {
+            reason: "requires approval".into(),
+        };
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            tool: ToolName::new(SHELL_EXEC).unwrap(),
+            effect: EffectClass::ExternalSideEffect,
+            input: json!({"command": "cargo test"}),
+        };
+
+        assert_eq!(
+            ApprovalMode::AutoApprove.auto_grant_actor(&call, &policy),
             None
         );
     }
@@ -918,7 +979,17 @@ mod tests {
             reason: "disabled".into(),
         };
 
-        assert_eq!(ApprovalMode::AutoApprove.auto_grant_actor(&policy), None);
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            tool: ToolName::new("file.write").unwrap(),
+            effect: EffectClass::WorkspaceWrite,
+            input: json!({"path": "out.txt", "content": "hello"}),
+        };
+
+        assert_eq!(
+            ApprovalMode::AutoApprove.auto_grant_actor(&call, &policy),
+            None
+        );
     }
 
     #[test]
@@ -993,6 +1064,36 @@ mod tests {
         assert!(matches!(
             evaluate_policy(&["file.edit".into()], &call),
             PolicyDecision::RequireApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn enabled_shell_exec_requires_approval() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            tool: ToolName::new(SHELL_EXEC).unwrap(),
+            effect: EffectClass::ExternalSideEffect,
+            input: json!({"command": "cargo test"}),
+        };
+
+        assert!(matches!(
+            evaluate_policy(&[SHELL_EXEC.into()], &call),
+            PolicyDecision::RequireApproval { reason } if reason == "shell.exec requires explicit local approval"
+        ));
+    }
+
+    #[test]
+    fn disabled_shell_exec_denies() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            tool: ToolName::new(SHELL_EXEC).unwrap(),
+            effect: EffectClass::ExternalSideEffect,
+            input: json!({"command": "cargo test"}),
+        };
+
+        assert!(matches!(
+            evaluate_policy(&["file.read".into()], &call),
+            PolicyDecision::Deny { reason } if reason == "tool is not enabled: shell.exec"
         ));
     }
 

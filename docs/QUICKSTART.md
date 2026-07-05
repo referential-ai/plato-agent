@@ -50,9 +50,14 @@ plato --events w1.jsonl "write hello.txt containing: hi from plato"
 
 plato --yolo --events w2.jsonl "write hello.txt containing: hi from plato"
 # -> auto-approved; the ledger records actor "yolo"
+
+plato --events w3.jsonl "run cargo test --locked and summarize the result"
+# -> Approve shell.exec?   press y to run the command
 ```
 
-Reads and listings never prompt. Writes always prompt unless `--yolo`.
+Reads and listings never prompt. Writes prompt unless `--yolo`.
+`shell.exec` always prompts, even with `--yolo`, and runs with a scrubbed
+environment that does not inherit provider credentials.
 Nothing escapes the workspace: `../`, absolute paths, and symlinks out are refused.
 
 ## 3. Durable runs (SQLite)

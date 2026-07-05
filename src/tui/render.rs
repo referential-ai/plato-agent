@@ -204,6 +204,13 @@ fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalM
     if let Some(diff_preview) = &approval.diff_preview {
         lines.push(Line::from("diff preview:"));
         lines.extend(diff_preview.lines().map(|line| Line::from(line.to_owned())));
+    } else if let Some(approval_preview) = &approval.approval_preview {
+        lines.push(Line::from("approval preview:"));
+        lines.extend(
+            approval_preview
+                .lines()
+                .map(|line| Line::from(line.to_owned())),
+        );
     } else {
         lines.push(Line::from("input preview:"));
         lines.push(Line::from(approval.input_preview.clone()));
@@ -415,6 +422,7 @@ mod tests {
             effect: "WorkspaceWrite".into(),
             reason: "file.write requires approval".into(),
             input_preview: r#"{"path":"scratch.txt"}"#.into(),
+            approval_preview: None,
             diff_preview: None,
         });
 
@@ -449,6 +457,7 @@ mod tests {
             effect: "WorkspaceWrite".into(),
             reason: "file.edit requires approval".into(),
             input_preview: r#"{"path":"scratch.txt"}"#.into(),
+            approval_preview: None,
             diff_preview: Some("--- a/scratch.txt\n+++ b/scratch.txt\n-old\n+new\n".into()),
         });
 
@@ -485,6 +494,7 @@ mod tests {
             effect: "WorkspaceWrite".into(),
             reason: "file.edit requires approval".into(),
             input_preview: r#"{"path":"scratch.txt"}"#.into(),
+            approval_preview: None,
             diff_preview: Some(format!("--- a/scratch.txt\n+++ b/scratch.txt\n{body}")),
         });
 
@@ -494,6 +504,39 @@ mod tests {
         assert!(output.contains("d deny"));
         assert!(output.contains("diff preview"));
         assert!(output.contains("--- a/scratch.txt"));
+    }
+
+    #[test]
+    fn renders_approval_modal_approval_preview_when_present() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+        state.approval = Some(ApprovalModalView {
+            run_id: "run_1".into(),
+            tool_call_id: "call_1".into(),
+            tool_name: "shell.exec".into(),
+            effect: "ExternalSideEffect".into(),
+            reason: "shell.exec requires approval".into(),
+            input_preview: r#"{"command":"cargo test"}"#.into(),
+            approval_preview: Some("command: cargo test\ncwd: /tmp/work".into()),
+            diff_preview: None,
+        });
+
+        let output = render_to_text(&state);
+
+        assert!(output.contains("approval preview"));
+        assert!(output.contains("command: cargo test"));
+        assert!(output.contains("cwd: /tmp/work"));
+        assert!(!output.contains("input preview:"));
     }
 
     fn render_to_text(state: &TuiState) -> String {

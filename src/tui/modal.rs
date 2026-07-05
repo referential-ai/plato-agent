@@ -10,6 +10,7 @@ pub struct ApprovalModalView {
     pub effect: String,
     pub reason: String,
     pub input_preview: String,
+    pub approval_preview: Option<String>,
     pub diff_preview: Option<String>,
 }
 
@@ -36,6 +37,11 @@ pub fn approval_from_event(
             .unwrap_or("approval required")
             .into(),
         input_preview: input_preview.unwrap_or_else(|| "input preview unavailable".into()),
+        approval_preview: event
+            .get("approval_preview")
+            .and_then(Value::as_str)
+            .filter(|preview| !preview.is_empty())
+            .map(str::to_owned),
         diff_preview: event
             .get("diff_preview")
             .and_then(Value::as_str)
@@ -193,6 +199,7 @@ mod tests {
         assert_eq!(modal.run_id, "run_1");
         assert!(modal.input_preview.contains("scratch.txt"));
         assert!(modal.input_preview.contains("hello"));
+        assert_eq!(modal.approval_preview, None);
         assert_eq!(modal.diff_preview, None);
     }
 
@@ -213,6 +220,7 @@ mod tests {
         let modal = approval_from_event(&approval, Some(r#"{"path":"note.txt"}"#.into())).unwrap();
 
         assert!(modal.input_preview.contains("note.txt"));
+        assert_eq!(modal.approval_preview, None);
         assert!(modal.diff_preview.as_ref().unwrap().contains("-old"));
     }
 
@@ -233,6 +241,31 @@ mod tests {
         let modal = approval_from_event(&approval, Some(r#"{"path":"note.txt"}"#.into())).unwrap();
 
         assert!(modal.input_preview.contains("note.txt"));
+        assert_eq!(modal.approval_preview, None);
+        assert_eq!(modal.diff_preview, None);
+    }
+
+    #[test]
+    fn approval_modal_extracts_shell_approval_preview() {
+        let approval = serde_json::json!({
+            "offset": 4,
+            "event": {
+                "kind": "approval_requested",
+                "run_id": "run_1",
+                "tool_call_id": "call_1",
+                "tool_name": "shell.exec",
+                "effect": "ExternalSideEffect",
+                "reason": "shell.exec requires approval",
+                "approval_preview": "command: cargo test\ncwd: /tmp/work"
+            }
+        });
+        let modal =
+            approval_from_event(&approval, Some(r#"{"command":"cargo test"}"#.into())).unwrap();
+
+        assert_eq!(
+            modal.approval_preview.as_deref(),
+            Some("command: cargo test\ncwd: /tmp/work")
+        );
         assert_eq!(modal.diff_preview, None);
     }
 }

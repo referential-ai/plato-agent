@@ -193,6 +193,9 @@ fn approval_requested_event(request: &ApprovalRequest) -> Value {
     if let Some(diff_preview) = &request.diff_preview {
         event["diff_preview"] = json!(diff_preview);
     }
+    if let Some(approval_preview) = &request.approval_preview {
+        event["approval_preview"] = json!(approval_preview);
+    }
     event
 }
 
@@ -209,6 +212,7 @@ mod tests {
             tool_name: "file.edit".into(),
             effect: EffectClass::WorkspaceWrite,
             reason: "file.edit requires approval".into(),
+            approval_preview: None,
             diff_preview: Some("--- a/note.txt\n+++ b/note.txt\n".into()),
         });
 
@@ -224,9 +228,28 @@ mod tests {
             tool_name: "file.write".into(),
             effect: EffectClass::WorkspaceWrite,
             reason: "file.write requires approval".into(),
+            approval_preview: None,
             diff_preview: None,
         });
 
         assert!(event.get("diff_preview").is_none());
+    }
+
+    #[test]
+    fn approval_requested_event_carries_approval_preview_when_present() {
+        let event = approval_requested_event(&ApprovalRequest {
+            run_id: RunId::new("run_1").unwrap(),
+            call_id: ToolCallId::new("call_1").unwrap(),
+            tool_name: "shell.exec".into(),
+            effect: EffectClass::ExternalSideEffect,
+            reason: "shell.exec requires approval".into(),
+            approval_preview: Some("command: cargo test\ncwd: /tmp/work".into()),
+            diff_preview: None,
+        });
+
+        assert_eq!(
+            event["approval_preview"],
+            "command: cargo test\ncwd: /tmp/work"
+        );
     }
 }
