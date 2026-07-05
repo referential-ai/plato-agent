@@ -85,11 +85,9 @@ Default paths are keyed by the workspace id:
 - lock: `${XDG_RUNTIME_DIR:-/tmp/plato-agent/$USER}/plato-agent/workspaces/<workspace-id>/agent.lock`
 - ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/plato-agent/workspaces/<workspace-id>/agent.db`
 
-The daemon holds the lock while it is active. Current shutdown is by stopping
-the process. There is no SIGINT cleanup handler yet, so a forced stop can leave
-a stale socket or lock. If that happens, inspect `agent.lock`, verify the
-recorded process is gone, then remove the stale `agent.lock` and `agent.sock`.
-Do not remove a lock for a live daemon.
+The daemon holds the lock while it is active. SIGINT and SIGTERM trigger
+a graceful shutdown: the daemon stops accepting new connections, then removes
+the socket and lock before exiting. Do not remove a lock for a live daemon.
 
 Minimal NDJSON-over-Unix-socket check, using the `workspace_id` and
 `socket_path` printed by the daemon:

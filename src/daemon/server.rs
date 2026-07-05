@@ -8,6 +8,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
 };
 
@@ -65,8 +69,11 @@ impl DaemonServer {
         &self.runtime.paths
     }
 
-    pub fn serve_forever(&self) -> AppResult<()> {
+    pub fn serve_forever(&self, shutdown: Arc<AtomicBool>) -> AppResult<()> {
         for stream in self.listener.incoming() {
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
             let stream = stream?;
             let runtime = self.runtime.clone();
             thread::spawn(move || {
