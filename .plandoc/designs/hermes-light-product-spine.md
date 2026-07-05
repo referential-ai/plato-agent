@@ -11,6 +11,7 @@ issue: https://github.com/referential-ai/plato-agent/issues/42
 - `plato-agent/docs/ARCHITECTURE.md`: `plato-agentd` owns runtime semantics; gateways are future ingress adapters.
 - `platonic-core/docs/ARCHITECTURE.md`: core stays sans-IO; gateways, providers, stores, tools, and UI stay outside core.
 - Claude architecture-lane input, 2026-07-05: sessions are the real product gap; do not lead with gateway work.
+- Human direction, 2026-07-05: the product should eventually let the user see how the agent learns about them over time.
 
 ## Source Grounding
 Checked:
@@ -37,6 +38,7 @@ Not checked yet:
 - Runs persist by default without polluting the workspace directory.
 - A continued session remembers prior turns from the ledger.
 - Local command execution is useful, approval-gated, and designed before implementation.
+- The user can eventually inspect how the agent forms and revises its model of them.
 - Gateways come later as thin daemon clients after local sessions and safety are real.
 
 ## Scope / Anchor Boundary
@@ -59,6 +61,29 @@ Not checked yet:
 - Real sessions must precede gateway work.
 - `shell.exec` is the first non-file tool candidate, but it needs a safety design before coding.
 - Gateway v1 must not carry approvals. Remote channels may notify or deny approval-required effects; grants stay local.
+- Learning must be transparent adaptation, not hidden personalization.
+- Durable user-model changes require user approval or correction.
+
+## Transparent Learning Product Shape
+- The product should make learning visible as:
+  - observation;
+  - hypothesis;
+  - evidence;
+  - confidence;
+  - proposed behavior change.
+- Example product loop:
+  - `plato reflect` proposes what the agent thinks it learned from recent sessions;
+  - `plato learnings` lists approved and provisional learnings;
+  - `plato learnings why <id>` shows evidence;
+  - `plato approve-learning <id>` makes a proposal durable;
+  - `plato correct-learning <id>` edits the claim;
+  - `plato forget-learning <id>` removes it.
+- Learning entries should distinguish facts, preferences, operating rules, current goals, hypotheses, and rejected assumptions.
+- Every durable learning must cite local evidence such as run ids, transcript excerpts, explicit user corrections, or repeated observed behavior.
+- The agent must state the behavior change caused by a learning, for example: "Before major implementation, gather design consensus and codify the plan."
+- Provisional hypotheses may guide a conversation, but they must not become durable defaults without approval.
+- Rejected assumptions are useful product evidence when the user approves recording them as corrections.
+- A reviewer lane can audit proposed learnings before they become durable, using the same checked-truth rule as design review.
 
 ## Constraints
 - `platonic-core` remains sans-IO and unchanged for this product spine.
@@ -74,6 +99,8 @@ Not checked yet:
 - No provider fallback design in the first MVP slices.
 - No Anthropic-native provider work in the first MVP slices.
 - No new core crates or crate split from this design alone.
+- No hidden background user profile mutation.
+- No remote or shared learning store in the MVP.
 
 ## Forbidden Operations
 - Do not add gateway-owned sessions, policy, approvals, provider fallback, run semantics, or ledger writes.
@@ -97,6 +124,7 @@ Not checked yet:
 - Config must keep credentials indirect via `api_key_env`.
 - `shell.exec` must run with a deliberately constructed environment and workspace cwd.
 - Remote gateway v1 must deny or notify approval-required effects; local CLI/TUI remains the grant surface.
+- Learning data must be local, inspectable, correctable, and forgettable.
 - Daemon socket access and protocol compatibility must be designed before a gateway or second client class ships.
 
 ## First Slices
@@ -120,6 +148,9 @@ Not checked yet:
    - answer session, first-run, minimal-tool, permission, gateway-boundary, and streaming questions.
 6. Gateway design after the local spine:
    - define socket security, protocol evolution, pairing/identity, event-stream recovery, and remote-deny behavior.
+7. Transparent learning design after sessions:
+   - define local storage, evidence links, approval/correction UX, and reviewer audit;
+   - keep it out of the config/defaults and first session implementation slices.
 
 ## Acceptance Criteria
 - `plato "..."` works from a normal workspace without creating `events.jsonl` by default.
@@ -129,6 +160,7 @@ Not checked yet:
 - `shell.exec` cannot leak provider credentials to child processes.
 - Approval-required local effects can be granted locally and denied remotely.
 - Gateway design is not admitted until local sessions and command safety are proven.
+- Durable user learning is not admitted until sessions provide replayable evidence and the approval/correction UX is designed.
 
 ## Verifiable End Condition
 - In a scratch workspace with only provider credentials available, a user can run:
@@ -142,6 +174,7 @@ Not checked yet:
 - Session slice: daemon and CLI tests proving `message.append`/`plato -c` hydrate prior messages from SQLite.
 - `shell.exec` slice: containment/cwd/env/output-cap tests, approval tests, yolo-boundary tests, and replay proof.
 - Product proof: real-provider scratch run showing first command, continued command, replay, grant, and deny paths.
+- Learning proof, when admitted later: a scratch session where `plato reflect` proposes evidence-backed learnings, the user approves one, corrects one, forgets one, and subsequent behavior changes are visible.
 
 ## Risks
 - Session semantics can sprawl if identity, hydration, concurrency, and token-budget rules are not decided first.
@@ -149,6 +182,7 @@ Not checked yet:
 - Remote approvals are a security product in their own right; deferring them is intentional.
 - Streaming may matter for product feel, but it should not displace sessions and command safety.
 - Comparable research can turn into architecture copying; keep it question-led and timeboxed.
+- Visible learning can become creepy or manipulative if it is hidden, overconfident, or hard to correct.
 
 ## Open Questions
 - Should the last workspace session be selected by latest successful run, latest session record, or an explicit session pointer?
@@ -156,6 +190,8 @@ Not checked yet:
 - Should `plato tui` spawn/connect to the daemon, or remain a wrapper over separately started binaries for the MVP?
 - What exact environment variables are safe to pass to `shell.exec`?
 - Does the first gateway target need pairing, local-only callback URLs, or daemon socket brokering?
+- Should approved learnings be scoped per user, per workspace, or both?
+- What level of evidence is enough before proposing a behavior-changing learning?
 
 ## Candidate Handoff Notes
 - Next bounded implementation after this design is accepted: config/defaults slice.
