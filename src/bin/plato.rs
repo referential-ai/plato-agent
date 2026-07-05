@@ -30,8 +30,8 @@ const EMBEDDED_DAEMON_POLL: Duration = Duration::from_millis(50);
 #[command(name = "plato")]
 #[command(about = "Plato Agent CLI")]
 struct Cli {
-    #[arg(long, global = true, default_value = "plato.toml")]
-    config: PathBuf,
+    #[arg(long, global = true, value_name = "FILE")]
+    config: Option<PathBuf>,
 
     #[arg(long, value_name = "FILE")]
     events: Option<PathBuf>,
@@ -89,30 +89,8 @@ fn run() -> plato_agent::AppResult<()> {
     }
     match cli.command {
         Some(Command::Replay { run, file }) => {
-            let db_path = sqlite_path(cli.db, &workspace_root)?;
-            match (db_path, file) {
-                (Some(path), None) => {
-                    ensure_workspace_unlocked(&workspace_root)?;
-                    println!("{}", replay_sqlite(&path, run.as_deref())?);
-                }
-                (None, Some(file)) => {
-                    if run.is_some() {
-                        return Err(AppError::Config("replay --run requires --db".into()));
-                    }
-                    println!("{}", replay_file(&file)?);
-                }
-                (Some(_), Some(_)) => {
-                    return Err(AppError::Config(
-                        "replay accepts either --db or a JSONL file, not both".into(),
-                    ));
-                }
-                (None, None) => {
-                    return Err(AppError::Config(
-                        "replay requires a JSONL file or --db".into(),
-                    ));
-                }
-            }
-            Ok(())
+            let ledger = replay_ledger(cli.db, file, &workspace_root)?;
+            write_replay_output(&mut io::stdout(), ledger, run.as_deref(), &workspace_root)
         }
         None => {
             let question = cli.question.join(" ");
@@ -141,7 +119,7 @@ fn run_tui_mode(cli: Cli, workspace_root: PathBuf) -> plato_agent::AppResult<()>
 fn tui_options_from_cli(cli: &Cli, workspace_root: &Path) -> plato_agent::AppResult<TuiOptions> {
     validate_tui_cli(cli)?;
     let mut options = TuiOptions::new(workspace_root.to_path_buf());
-    options.config = Some(cli.config.clone());
+    options.config = cli.config.clone();
     Ok(options)
 }
 
@@ -257,31 +235,48 @@ fn run_ledger(
     db: Option<Option<PathBuf>>,
     workspace_root: &Path,
 ) -> plato_agent::AppResult<RunLedger> {
-    let db_path = sqlite_path(db, workspace_root)?;
-    if db_path.is_some() && events.is_some() {
+    if db.is_some() && events.is_some() {
         return Err(AppError::Config(
             "--events and --db are mutually exclusive".into(),
         ));
     }
-    match db_path {
-        Some(path) => {
+    match events {
+        Some(path) => Ok(RunLedger::Jsonl(path)),
+        None => {
+            let path = sqlite_path(db, workspace_root)?;
             ensure_workspace_unlocked(workspace_root)?;
             Ok(RunLedger::Sqlite(path))
         }
-        None => Ok(RunLedger::Jsonl(
-            events.unwrap_or_else(|| PathBuf::from("events.jsonl")),
-        )),
     }
 }
 
 fn sqlite_path(
     db: Option<Option<PathBuf>>,
     workspace_root: &Path,
-) -> plato_agent::AppResult<Option<PathBuf>> {
+) -> plato_agent::AppResult<PathBuf> {
     match db {
-        None => Ok(None),
-        Some(Some(path)) => Ok(Some(resolve_cli_path(path, workspace_root))),
-        Some(None) => Ok(Some(default_sqlite_path(workspace_root)?)),
+        None | Some(None) => default_sqlite_path(workspace_root),
+        Some(Some(path)) => Ok(resolve_cli_path(path, workspace_root)),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReplayLedger {
+    Jsonl(PathBuf),
+    Sqlite(PathBuf),
+}
+
+fn replay_ledger(
+    db: Option<Option<PathBuf>>,
+    file: Option<PathBuf>,
+    workspace_root: &Path,
+) -> plato_agent::AppResult<ReplayLedger> {
+    match (db, file) {
+        (Some(_), Some(_)) => Err(AppError::Config(
+            "replay accepts either --db or a JSONL file, not both".into(),
+        )),
+        (None, Some(file)) => Ok(ReplayLedger::Jsonl(file)),
+        (db, None) => sqlite_path(db, workspace_root).map(ReplayLedger::Sqlite),
     }
 }
 
@@ -302,6 +297,27 @@ fn write_run_success_output(
     writeln!(stdout, "{}", outcome.final_answer)?;
     if let RunLedger::Sqlite(path) = ledger {
         write_sqlite_replay_hint(stderr, &outcome.run_id, path)?;
+    }
+    Ok(())
+}
+
+fn write_replay_output(
+    stdout: &mut impl Write,
+    ledger: ReplayLedger,
+    run: Option<&str>,
+    workspace_root: &Path,
+) -> plato_agent::AppResult<()> {
+    match ledger {
+        ReplayLedger::Sqlite(path) => {
+            ensure_workspace_unlocked(workspace_root)?;
+            writeln!(stdout, "{}", replay_sqlite(&path, run)?)?;
+        }
+        ReplayLedger::Jsonl(file) => {
+            if run.is_some() {
+                return Err(AppError::Config("replay --run requires --db".into()));
+            }
+            writeln!(stdout, "{}", replay_file(&file)?)?;
+        }
     }
     Ok(())
 }
@@ -419,11 +435,23 @@ mod tests {
 
         let path = sqlite_path(Some(Some(PathBuf::from("agent.db"))), dir.path()).unwrap();
 
-        assert_eq!(path, Some(dir.path().join("agent.db")));
+        assert_eq!(path, dir.path().join("agent.db"));
     }
 
     #[test]
-    fn sqlite_run_fails_closed_when_daemon_lock_exists() {
+    fn default_run_uses_default_sqlite_path() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        let ledger = run_ledger(None, None, workspace.path()).unwrap();
+
+        assert_eq!(
+            ledger,
+            RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap())
+        );
+    }
+
+    #[test]
+    fn default_sqlite_run_fails_closed_when_daemon_lock_exists() {
         let workspace = tempfile::tempdir().unwrap();
         let socket = workspace.path().join("agent.sock");
         let _lock = plato_agent::daemon::lock::WorkspaceLock::acquire_for_workspace(
@@ -432,12 +460,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = run_ledger(
-            None,
-            Some(Some(PathBuf::from("agent.db"))),
-            workspace.path(),
-        )
-        .unwrap_err();
+        let error = run_ledger(None, None, workspace.path()).unwrap_err();
 
         assert!(matches!(error, AppError::DaemonLockHeld { .. }));
     }
@@ -456,5 +479,45 @@ mod tests {
             run_ledger(Some(PathBuf::from("events.jsonl")), None, workspace.path()).unwrap();
 
         assert_eq!(ledger, RunLedger::Jsonl(PathBuf::from("events.jsonl")));
+    }
+
+    #[test]
+    fn bare_replay_uses_default_sqlite_path() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        let ledger = replay_ledger(None, None, workspace.path()).unwrap();
+
+        assert_eq!(
+            ledger,
+            ReplayLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap())
+        );
+    }
+
+    #[test]
+    fn replay_file_stays_explicit_jsonl() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        let ledger =
+            replay_ledger(None, Some(PathBuf::from("events.jsonl")), workspace.path()).unwrap();
+
+        assert_eq!(ledger, ReplayLedger::Jsonl(PathBuf::from("events.jsonl")));
+    }
+
+    #[test]
+    fn default_sqlite_replay_fails_closed_when_daemon_lock_exists() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket = workspace.path().join("agent.sock");
+        let _lock = plato_agent::daemon::lock::WorkspaceLock::acquire_for_workspace(
+            workspace.path(),
+            &socket,
+        )
+        .unwrap();
+        let ledger = ReplayLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap());
+        let mut stdout = Vec::new();
+
+        let error = write_replay_output(&mut stdout, ledger, None, workspace.path()).unwrap_err();
+
+        assert!(matches!(error, AppError::DaemonLockHeld { .. }));
+        assert!(stdout.is_empty());
     }
 }

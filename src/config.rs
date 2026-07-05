@@ -3,14 +3,20 @@ use crate::{
     tool_catalog::{default_enabled_tools, is_known_tool},
 };
 use serde::Deserialize;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
-const DEFAULT_MODEL: &str = "gpt-5.5";
+const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
+const DEFAULT_OPENROUTER_MODEL: &str = "~openai/gpt-latest";
 const DEFAULT_TOKEN_BUDGET: u32 = 4_000;
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 1_024;
+const DEFAULT_MAX_TURNS: u32 = 8;
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+const PLATO_CONFIG_ENV: &str = "PLATO_CONFIG";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -41,6 +47,7 @@ pub enum ProviderKind {
 pub struct LimitsConfig {
     pub token_budget: u32,
     pub max_output_tokens: u32,
+    pub max_turns: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +80,7 @@ struct RawProviderConfig {
 struct RawLimitsConfig {
     token_budget: Option<u32>,
     max_output_tokens: Option<u32>,
+    max_turns: Option<u32>,
 }
 
 #[derive(Default, Debug, Deserialize)]
@@ -82,11 +90,14 @@ struct RawToolsConfig {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> AppResult<Self> {
-        if !path.exists() {
+    pub fn load(workspace_root: &Path, explicit_path: Option<&Path>) -> AppResult<Self> {
+        let Some(path) = resolve_config_path(workspace_root, explicit_path)? else {
             return Ok(Self::default());
-        }
+        };
+        Self::load_file(&path)
+    }
 
+    fn load_file(path: &Path) -> AppResult<Self> {
         let raw = fs::read_to_string(path)?;
         let raw: RawConfig = toml::from_str(&raw)?;
         Self::from_raw(raw)
@@ -110,13 +121,17 @@ impl Config {
                 "limits.max_output_tokens must be positive".into(),
             ));
         }
+        let max_turns = limits.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
+        if max_turns == 0 {
+            return Err(AppError::Config("limits.max_turns must be positive".into()));
+        }
         let timeout_ms = provider.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         if timeout_ms == 0 {
             return Err(AppError::Config(
                 "provider.timeout_ms must be positive".into(),
             ));
         }
-        let kind = provider.kind.unwrap_or(ProviderKind::OpenAi);
+        let kind = provider.kind.unwrap_or(ProviderKind::OpenRouter);
 
         let enabled = tools.enabled.unwrap_or_else(default_enabled_tools);
         if enabled.is_empty() {
@@ -147,6 +162,7 @@ impl Config {
             limits: LimitsConfig {
                 token_budget,
                 max_output_tokens,
+                max_turns,
             },
             tools: ToolsConfig { enabled },
         })
@@ -157,10 +173,10 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             provider: ProviderConfig {
-                kind: ProviderKind::OpenAi,
-                model: DEFAULT_MODEL.into(),
-                api_key_env: "OPENAI_API_KEY".into(),
-                base_url: OPENAI_BASE_URL.into(),
+                kind: ProviderKind::OpenRouter,
+                model: DEFAULT_OPENROUTER_MODEL.into(),
+                api_key_env: "OPENROUTER_API_KEY".into(),
+                base_url: OPENROUTER_BASE_URL.into(),
                 timeout_ms: DEFAULT_TIMEOUT_MS,
                 http_referer: None,
                 app_title: None,
@@ -168,6 +184,7 @@ impl Default for Config {
             limits: LimitsConfig {
                 token_budget: DEFAULT_TOKEN_BUDGET,
                 max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+                max_turns: DEFAULT_MAX_TURNS,
             },
             tools: ToolsConfig {
                 enabled: default_enabled_tools(),
@@ -178,8 +195,8 @@ impl Default for Config {
 
 fn default_model(kind: &ProviderKind) -> &'static str {
     match kind {
-        ProviderKind::OpenAi => DEFAULT_MODEL,
-        ProviderKind::OpenRouter => "~openai/gpt-latest",
+        ProviderKind::OpenAi => DEFAULT_OPENAI_MODEL,
+        ProviderKind::OpenRouter => DEFAULT_OPENROUTER_MODEL,
     }
 }
 
@@ -197,6 +214,76 @@ fn default_base_url(kind: &ProviderKind) -> &'static str {
     }
 }
 
+pub fn resolve_config_path(
+    workspace_root: &Path,
+    explicit_path: Option<&Path>,
+) -> AppResult<Option<PathBuf>> {
+    resolve_config_path_with(
+        workspace_root,
+        explicit_path.map(Path::to_path_buf),
+        std::env::var_os(PLATO_CONFIG_ENV).map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn resolve_config_path_with(
+    workspace_root: &Path,
+    explicit_path: Option<PathBuf>,
+    env_path: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> AppResult<Option<PathBuf>> {
+    if let Some(path) = explicit_path {
+        return resolve_explicit_config_path(workspace_root, path, home.as_deref()).map(Some);
+    }
+    if let Some(path) = env_path {
+        return resolve_explicit_config_path(workspace_root, path, home.as_deref()).map(Some);
+    }
+
+    let workspace_config = workspace_root.join("plato.toml");
+    if workspace_config.exists() {
+        return Ok(Some(workspace_config));
+    }
+
+    if let Some(home) = home {
+        let user_config = home.join(".config").join("plato").join("config.toml");
+        if user_config.exists() {
+            return Ok(Some(user_config));
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_explicit_config_path(
+    workspace_root: &Path,
+    path: PathBuf,
+    home: Option<&Path>,
+) -> AppResult<PathBuf> {
+    let path = expand_leading_tilde(path, home)?;
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(workspace_root.join(path))
+    }
+}
+
+fn expand_leading_tilde(path: PathBuf, home: Option<&Path>) -> AppResult<PathBuf> {
+    let Some(raw) = path.to_str() else {
+        return Ok(path);
+    };
+    if raw == "~" {
+        return home
+            .map(Path::to_path_buf)
+            .ok_or_else(|| AppError::Config("HOME is required for ~ expansion".into()));
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        let home =
+            home.ok_or_else(|| AppError::Config("HOME is required for ~ expansion".into()))?;
+        return Ok(home.join(rest));
+    }
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,8 +292,11 @@ mod tests {
     fn default_config_has_the_bootstrap_tools() {
         let config = Config::default();
 
-        assert_eq!(config.provider.api_key_env, "OPENAI_API_KEY");
-        assert_eq!(config.provider.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.provider.kind, ProviderKind::OpenRouter);
+        assert_eq!(config.provider.model, "~openai/gpt-latest");
+        assert_eq!(config.provider.api_key_env, "OPENROUTER_API_KEY");
+        assert_eq!(config.provider.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(config.limits.max_turns, 8);
         assert_eq!(
             config.tools.enabled,
             vec!["file.read", "file.list", "file.write", "file.edit"]
@@ -220,6 +310,7 @@ mod tests {
             limits: Some(RawLimitsConfig {
                 token_budget: Some(0),
                 max_output_tokens: None,
+                max_turns: None,
             }),
             tools: None,
         };
@@ -234,6 +325,7 @@ mod tests {
             limits: Some(RawLimitsConfig {
                 token_budget: None,
                 max_output_tokens: Some(0),
+                max_turns: None,
             }),
             tools: None,
         };
@@ -260,6 +352,36 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_max_turns() {
+        let raw = RawConfig {
+            provider: None,
+            limits: Some(RawLimitsConfig {
+                token_budget: None,
+                max_output_tokens: None,
+                max_turns: Some(0),
+            }),
+            tools: None,
+        };
+
+        assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
+    }
+
+    #[test]
+    fn parses_configured_max_turns() {
+        let raw = RawConfig {
+            provider: None,
+            limits: Some(RawLimitsConfig {
+                token_budget: None,
+                max_output_tokens: None,
+                max_turns: Some(3),
+            }),
+            tools: None,
+        };
+
+        assert_eq!(Config::from_raw(raw).unwrap().limits.max_turns, 3);
+    }
+
+    #[test]
     fn openrouter_defaults_to_openrouter_endpoint_and_key() {
         let raw = RawConfig {
             provider: Some(RawProviderConfig {
@@ -280,5 +402,121 @@ mod tests {
         assert_eq!(config.provider.model, "~openai/gpt-latest");
         assert_eq!(config.provider.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(config.provider.base_url, "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn explicit_config_path_wins_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("explicit.toml");
+        std::fs::write(dir.path().join("plato.toml"), "").unwrap();
+
+        let path = resolve_config_path_with(
+            dir.path(),
+            Some(explicit.clone()),
+            Some(PathBuf::from("env.toml")),
+            Some(home.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(path, Some(explicit));
+    }
+
+    #[test]
+    fn plato_config_env_is_second_resolution_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("env.toml");
+        std::fs::write(dir.path().join("plato.toml"), "").unwrap();
+
+        let path = resolve_config_path_with(
+            dir.path(),
+            None,
+            Some(env_path.clone()),
+            Some(home.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(path, Some(env_path));
+    }
+
+    #[test]
+    fn workspace_plato_toml_is_third_resolution_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let workspace_config = dir.path().join("plato.toml");
+        std::fs::write(&workspace_config, "").unwrap();
+
+        let path =
+            resolve_config_path_with(dir.path(), None, None, Some(home.path().to_path_buf()))
+                .unwrap();
+
+        assert_eq!(path, Some(workspace_config));
+    }
+
+    #[test]
+    fn user_config_is_fourth_resolution_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let user_config = home
+            .path()
+            .join(".config")
+            .join("plato")
+            .join("config.toml");
+        std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        std::fs::write(&user_config, "").unwrap();
+
+        let path =
+            resolve_config_path_with(dir.path(), None, None, Some(home.path().to_path_buf()))
+                .unwrap();
+
+        assert_eq!(path, Some(user_config));
+    }
+
+    #[test]
+    fn missing_config_paths_resolve_to_built_in_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        let path =
+            resolve_config_path_with(dir.path(), None, None, Some(home.path().to_path_buf()))
+                .unwrap();
+
+        assert_eq!(path, None);
+    }
+
+    #[test]
+    fn expands_leading_tilde_for_explicit_config_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        let path = resolve_config_path_with(
+            workspace.path(),
+            Some(PathBuf::from("~/plato.toml")),
+            None,
+            Some(home.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(path, Some(home.path().join("plato.toml")));
+    }
+
+    #[test]
+    fn relative_explicit_config_paths_resolve_against_workspace_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        let path = resolve_config_path_with(
+            workspace.path(),
+            Some(PathBuf::from("config/plato.toml")),
+            None,
+            Some(home.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            path,
+            Some(workspace.path().join("config").join("plato.toml"))
+        );
     }
 }

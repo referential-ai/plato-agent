@@ -10,7 +10,6 @@ use crate::{
             TranscriptReadResult, decode_request,
         },
         runtime::{DaemonRuntime, RunRecord, approval_handler},
-        server::DaemonPaths,
     },
     new_run_id, replay_sqlite, run_question,
     tools::ApprovalOutcome,
@@ -203,7 +202,7 @@ fn start_run(
     spawn_event_collector(record.clone(), event_receiver);
     let options = RunOptions {
         question,
-        config_path: resolve_config_path(&runtime.paths, config_path),
+        config_path: config_path.map(PathBuf::from),
         ledger: RunLedger::Sqlite(runtime.paths.ledger_path.clone()),
         workspace_root: runtime.paths.workspace_root.clone(),
         approval_mode: ApprovalMode::external("daemon", approval_handler(record.clone())),
@@ -452,20 +451,6 @@ fn decode_params<T: serde::de::DeserializeOwned>(
             ERROR_MALFORMED_REQUEST,
             format!("{method} params are required"),
         ))),
-    }
-}
-
-fn resolve_config_path(paths: &DaemonPaths, config_path: Option<String>) -> PathBuf {
-    match config_path {
-        Some(path) => {
-            let path = PathBuf::from(path);
-            if path.is_absolute() {
-                path
-            } else {
-                paths.workspace_root.join(path)
-            }
-        }
-        None => paths.workspace_root.join("plato.toml"),
     }
 }
 
