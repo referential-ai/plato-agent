@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(config.provider.base_url, "https://api.openai.com/v1");
         assert_eq!(
             config.tools.enabled,
-            vec!["file.read", "file.list", "file.write"]
+            vec!["file.read", "file.list", "file.write", "file.edit"]
         );
     }
 

@@ -156,14 +156,7 @@ pub(super) fn approval_handler(
     record: Arc<RunRecord>,
 ) -> impl Fn(ApprovalRequest) -> AppResult<ApprovalOutcome> + Send + Sync + 'static {
     move |request| {
-        record.push_event(json!({
-            "kind": "approval_requested",
-            "run_id": request.run_id,
-            "tool_call_id": request.call_id,
-            "tool_name": request.tool_name,
-            "effect": request.effect,
-            "reason": request.reason,
-        }));
+        record.push_event(approval_requested_event(&request));
         let call_id = request.call_id.to_string();
         let mut approvals = record.approvals.lock().expect("approvals lock poisoned");
         approvals.insert(call_id.clone(), PendingApproval::new());
@@ -185,5 +178,55 @@ pub(super) fn approval_handler(
                 .wait(approvals)
                 .expect("approval condvar lock poisoned");
         }
+    }
+}
+
+fn approval_requested_event(request: &ApprovalRequest) -> Value {
+    let mut event = json!({
+        "kind": "approval_requested",
+        "run_id": &request.run_id,
+        "tool_call_id": &request.call_id,
+        "tool_name": &request.tool_name,
+        "effect": &request.effect,
+        "reason": &request.reason,
+    });
+    if let Some(diff_preview) = &request.diff_preview {
+        event["diff_preview"] = json!(diff_preview);
+    }
+    event
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use platonic_core::{EffectClass, RunId, ToolCallId};
+
+    #[test]
+    fn approval_requested_event_carries_diff_preview_when_present() {
+        let event = approval_requested_event(&ApprovalRequest {
+            run_id: RunId::new("run_1").unwrap(),
+            call_id: ToolCallId::new("call_1").unwrap(),
+            tool_name: "file.edit".into(),
+            effect: EffectClass::WorkspaceWrite,
+            reason: "file.edit requires approval".into(),
+            diff_preview: Some("--- a/note.txt\n+++ b/note.txt\n".into()),
+        });
+
+        assert_eq!(event["kind"], "approval_requested");
+        assert_eq!(event["diff_preview"], "--- a/note.txt\n+++ b/note.txt\n");
+    }
+
+    #[test]
+    fn approval_requested_event_omits_diff_preview_when_absent() {
+        let event = approval_requested_event(&ApprovalRequest {
+            run_id: RunId::new("run_1").unwrap(),
+            call_id: ToolCallId::new("call_1").unwrap(),
+            tool_name: "file.write".into(),
+            effect: EffectClass::WorkspaceWrite,
+            reason: "file.write requires approval".into(),
+            diff_preview: None,
+        });
+
+        assert!(event.get("diff_preview").is_none());
     }
 }

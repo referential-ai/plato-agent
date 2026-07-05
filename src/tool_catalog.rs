@@ -5,10 +5,12 @@ use serde_json::{Value, json};
 pub const FILE_READ: &str = "file.read";
 pub const FILE_LIST: &str = "file.list";
 pub const FILE_WRITE: &str = "file.write";
+pub const FILE_EDIT: &str = "file.edit";
 
 const PROVIDER_FILE_READ: &str = "file_read";
 const PROVIDER_FILE_LIST: &str = "file_list";
 const PROVIDER_FILE_WRITE: &str = "file_write";
+const PROVIDER_FILE_EDIT: &str = "file_edit";
 
 const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
@@ -30,6 +32,13 @@ const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
         provider_name: PROVIDER_FILE_WRITE,
         effect: EffectClass::WorkspaceWrite,
         description: "Write UTF-8 text to a relative path inside the current workspace after approval.",
+        input_schema: ToolInputSchema::Write,
+    },
+    ToolDefinition {
+        internal_name: FILE_EDIT,
+        provider_name: PROVIDER_FILE_EDIT,
+        effect: EffectClass::WorkspaceWrite,
+        description: "Replace a workspace file with full proposed UTF-8 content after approval.",
         input_schema: ToolInputSchema::Write,
     },
 ];
@@ -163,7 +172,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bootstrap_catalog_is_exactly_file_read_file_list_and_file_write() {
+    fn bootstrap_catalog_is_exactly_file_read_file_list_file_write_and_file_edit() {
         let actual = bootstrap_tools()
             .iter()
             .map(|tool| (tool.internal_name, tool.effect.clone()))
@@ -175,6 +184,7 @@ mod tests {
                 (FILE_READ, EffectClass::ReadOnly),
                 (FILE_LIST, EffectClass::ReadOnly),
                 (FILE_WRITE, EffectClass::WorkspaceWrite),
+                (FILE_EDIT, EffectClass::WorkspaceWrite),
             ]
         );
         assert!(
@@ -194,11 +204,17 @@ mod tests {
 
     #[test]
     fn emits_provider_tool_specs_from_catalog() {
-        let specs = tool_specs(&[FILE_READ.into(), FILE_LIST.into(), FILE_WRITE.into()]);
+        let specs = tool_specs(&[
+            FILE_READ.into(),
+            FILE_LIST.into(),
+            FILE_WRITE.into(),
+            FILE_EDIT.into(),
+        ]);
 
-        assert_eq!(specs.len(), 3);
+        assert_eq!(specs.len(), 4);
         assert_eq!(specs[0].name, PROVIDER_FILE_READ);
         assert_eq!(specs[1].name, PROVIDER_FILE_LIST);
         assert_eq!(specs[2].name, PROVIDER_FILE_WRITE);
+        assert_eq!(specs[3].name, PROVIDER_FILE_EDIT);
     }
 }
