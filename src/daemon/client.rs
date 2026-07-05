@@ -1,9 +1,10 @@
 use crate::{
     AppError, AppResult,
     daemon::protocol::{
-        Envelope, EnvelopeKind, EventsStreamParams, EventsStreamResult, HelloParams, HelloResult,
-        MessageAppendParams, PROTOCOL_VERSION, RunStartParams, RunStartResult, SessionSummary,
-        SessionsListResult, TranscriptReadParams, TranscriptReadResult,
+        ApprovalDecideParams, CommandAcceptedResult, Envelope, EnvelopeKind, EventsStreamParams,
+        EventsStreamResult, HelloParams, HelloResult, MessageAppendParams, PROTOCOL_VERSION,
+        RunCancelParams, RunStartParams, RunStartResult, SessionSummary, SessionsListResult,
+        TranscriptReadParams, TranscriptReadResult,
     },
     paths,
 };
@@ -104,6 +105,48 @@ impl DaemonClient {
                 run_id: run_id.into(),
                 from_offset: Some(from_offset),
                 limit: Some(limit),
+            },
+        )
+    }
+
+    pub fn approval_grant(
+        &mut self,
+        run_id: &str,
+        tool_call_id: &str,
+    ) -> AppResult<CommandAcceptedResult> {
+        self.request(
+            "approval.decide",
+            ApprovalDecideParams {
+                run_id: run_id.into(),
+                tool_call_id: tool_call_id.into(),
+                decision: "grant".into(),
+                reason: None,
+            },
+        )
+    }
+
+    pub fn approval_deny(
+        &mut self,
+        run_id: &str,
+        tool_call_id: &str,
+        reason: String,
+    ) -> AppResult<CommandAcceptedResult> {
+        self.request(
+            "approval.decide",
+            ApprovalDecideParams {
+                run_id: run_id.into(),
+                tool_call_id: tool_call_id.into(),
+                decision: "deny".into(),
+                reason: Some(reason),
+            },
+        )
+    }
+
+    pub fn run_cancel(&mut self, run_id: &str) -> AppResult<CommandAcceptedResult> {
+        self.request(
+            "run.cancel",
+            RunCancelParams {
+                run_id: run_id.into(),
             },
         )
     }
@@ -375,6 +418,69 @@ mod tests {
         assert_eq!(run.run_id, "run_1");
         assert_eq!(events.next_offset, 3);
         assert_eq!(events.events.len(), 1);
+    }
+
+    #[test]
+    fn client_sends_approval_decisions_and_cancel_requests() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let grant = read_request(&mut reader);
+            assert_eq!(grant.method.as_deref(), Some("approval.decide"));
+            assert_eq!(grant.params.as_ref().unwrap()["run_id"], "run_1");
+            assert_eq!(grant.params.as_ref().unwrap()["tool_call_id"], "call_1");
+            assert_eq!(grant.params.as_ref().unwrap()["decision"], "grant");
+            assert!(grant.params.as_ref().unwrap()["reason"].is_null());
+            write_response(
+                &mut writer,
+                grant.id,
+                "approval.decide",
+                json!({"run_id": "run_1", "status": "running"}),
+            );
+
+            let deny = read_request(&mut reader);
+            assert_eq!(deny.method.as_deref(), Some("approval.decide"));
+            assert_eq!(deny.params.as_ref().unwrap()["run_id"], "run_2");
+            assert_eq!(deny.params.as_ref().unwrap()["tool_call_id"], "call_2");
+            assert_eq!(deny.params.as_ref().unwrap()["decision"], "deny");
+            assert_eq!(
+                deny.params.as_ref().unwrap()["reason"],
+                "denied by plato-tui"
+            );
+            write_response(
+                &mut writer,
+                deny.id,
+                "approval.decide",
+                json!({"run_id": "run_2", "status": "running"}),
+            );
+
+            let cancel = read_request(&mut reader);
+            assert_eq!(cancel.method.as_deref(), Some("run.cancel"));
+            assert_eq!(cancel.params.as_ref().unwrap()["run_id"], "run_3");
+            write_response(
+                &mut writer,
+                cancel.id,
+                "run.cancel",
+                json!({"run_id": "run_3", "status": "cancel_requested"}),
+            );
+        });
+
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        let granted = client.approval_grant("run_1", "call_1").unwrap();
+        let denied = client
+            .approval_deny("run_2", "call_2", "denied by plato-tui".into())
+            .unwrap();
+        let canceled = client.run_cancel("run_3").unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(granted.status, "running");
+        assert_eq!(denied.status, "running");
+        assert_eq!(canceled.status, "cancel_requested");
     }
 
     fn read_request(reader: &mut BufReader<UnixStream>) -> Envelope {

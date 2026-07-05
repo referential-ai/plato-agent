@@ -130,6 +130,31 @@ with socket.socket(socket.AF_UNIX) as sock:
 PY
 ```
 
+## TUI
+
+`plato-tui` is a terminal client for a manually started `plato-agentd`. It does
+not spawn, supervise, restart, or stop the daemon, and it does not call
+providers, execute tools, or write SQLite directly.
+
+```bash
+cargo run --bin plato-agentd -- --workspace "$PWD"
+cargo run --bin plato-tui -- --workspace "$PWD"
+```
+
+Use `--socket <path>` when connecting to a non-default socket, `--config <path>`
+to pass a config file to daemon-started runs, and `--run <run_id>` to open a
+specific transcript.
+
+Keys:
+
+- `Enter`: submit the composer to the daemon (`run.start`, then `message.append`
+  while a run is active).
+- `g` / `d`: grant or deny the focused approval request.
+- `Ctrl-C`: request `run.cancel` for the active run; a second `Ctrl-C` exits the
+  TUI. Exiting the TUI does not stop the daemon.
+- `r`: reconnect and reload daemon state.
+- `q` or `Esc`: exit the TUI.
+
 ## Commands
 
 ```bash
@@ -140,6 +165,7 @@ cargo run --bin plato -- --db "read README.md and summarize it"
 cargo run --bin plato -- --db=/tmp/plato-agent.db "read README.md and summarize it"
 cargo run --bin plato -- replay --db
 cargo run --bin plato -- replay --db=/tmp/plato-agent.db --run run_123
+cargo run --bin plato-tui -- --workspace "$PWD"
 ```
 
 ## Dogfood Recipe
