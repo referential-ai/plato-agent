@@ -7,11 +7,12 @@ use crossterm::{
 use plato_agent::{
     AppResult,
     daemon::client::{DaemonClient, DaemonConnectionConfig},
-    daemon::protocol::{EventsStreamResult, RunStartResult},
+    daemon::protocol::{CommandAcceptedResult, EventsStreamResult, RunStartResult},
     tui::{TranscriptState, TranscriptView, TuiState, render, render_snapshot},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
+    collections::HashMap,
     io::{self, Stdout},
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
@@ -27,19 +28,27 @@ const MAX_LIVE_EVENT_LINES: usize = 80;
 #[command(name = "plato-tui")]
 #[command(about = "Plato Agent terminal client")]
 struct Cli {
-    #[arg(long, default_value = ".")]
+    #[arg(long, default_value = ".", help = "Workspace served by plato-agentd")]
     workspace: PathBuf,
 
-    #[arg(long, value_name = "PATH")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Unix socket path printed by plato-agentd"
+    )]
     socket: Option<PathBuf>,
 
-    #[arg(long, value_name = "RUN_ID")]
+    #[arg(
+        long,
+        value_name = "RUN_ID",
+        help = "Initial transcript run to display"
+    )]
     run: Option<String>,
 
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", help = "Config path passed to daemon runs")]
     config: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, help = "Render the current TUI state once and exit")]
     snapshot: bool,
 }
 
@@ -76,7 +85,11 @@ fn run() -> AppResult<()> {
         {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if !request_cancel(&commands, &mut state) {
+                        break;
+                    }
+                }
                 KeyCode::Char('r') => {
                     state.status_message = Some("reconnecting".into());
                     send_command(
@@ -87,16 +100,25 @@ fn run() -> AppResult<()> {
                         &mut state,
                     );
                 }
-                KeyCode::Enter => {
+                KeyCode::Char('g') if state.approval.is_some() => {
+                    decide_approval(&commands, &mut state, ApprovalAction::Grant)
+                }
+                KeyCode::Char('d') if state.approval.is_some() => {
+                    decide_approval(&commands, &mut state, ApprovalAction::Deny)
+                }
+                KeyCode::Enter if state.approval.is_none() => {
                     submit_composer(&commands, &mut state, &runtime, config_path.clone())
                 }
-                KeyCode::Backspace => {
+                KeyCode::Backspace if state.approval.is_none() => {
                     state.composer.pop();
                 }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('u')
+                    if state.approval.is_none()
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     state.composer.clear();
                 }
-                KeyCode::Char(ch) => state.composer.push(ch),
+                KeyCode::Char(ch) if state.approval.is_none() => state.composer.push(ch),
                 _ => {}
             }
         }
@@ -162,6 +184,7 @@ struct UiRuntime {
     poll_in_flight: bool,
     polling: bool,
     last_poll: Instant,
+    tool_inputs: HashMap<String, String>,
 }
 
 impl UiRuntime {
@@ -175,6 +198,7 @@ impl UiRuntime {
                 .as_ref()
                 .is_some_and(|run| run.status == "running"),
             last_poll: Instant::now(),
+            tool_inputs: HashMap::new(),
         }
     }
 
@@ -187,6 +211,7 @@ impl UiRuntime {
         self.next_offset = 0;
         self.poll_in_flight = false;
         self.last_poll = Instant::now();
+        self.tool_inputs.clear();
     }
 }
 
@@ -207,6 +232,18 @@ enum ClientCommand {
         run_id: String,
         from_offset: u64,
     },
+    ApprovalGrant {
+        run_id: String,
+        tool_call_id: String,
+    },
+    ApprovalDeny {
+        run_id: String,
+        tool_call_id: String,
+        reason: String,
+    },
+    RunCancel {
+        run_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -215,6 +252,8 @@ enum ClientEvent {
     RunStarted(RunStartResult),
     MessageAppended(RunStartResult),
     EventsPolled(EventsStreamResult),
+    ApprovalDecided(CommandAcceptedResult),
+    RunCanceled(CommandAcceptedResult),
     Failed {
         context: &'static str,
         error: String,
@@ -263,6 +302,31 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             client.events_stream(&run_id, from_offset, EVENT_LIMIT)
         })
         .map_or_else(failed_event("events.stream"), ClientEvent::EventsPolled),
+        ClientCommand::ApprovalGrant {
+            run_id,
+            tool_call_id,
+        } => with_client(config, |client| {
+            client.approval_grant(&run_id, &tool_call_id)
+        })
+        .map_or_else(
+            failed_event("approval.decide"),
+            ClientEvent::ApprovalDecided,
+        ),
+        ClientCommand::ApprovalDeny {
+            run_id,
+            tool_call_id,
+            reason,
+        } => with_client(config, |client| {
+            client.approval_deny(&run_id, &tool_call_id, reason)
+        })
+        .map_or_else(
+            failed_event("approval.decide"),
+            ClientEvent::ApprovalDecided,
+        ),
+        ClientCommand::RunCancel { run_id } => {
+            with_client(config, |client| client.run_cancel(&run_id))
+                .map_or_else(failed_event("run.cancel"), ClientEvent::RunCanceled)
+        }
     }
 }
 
@@ -303,6 +367,25 @@ fn drain_client_events(
             ClientEvent::EventsPolled(result) => {
                 apply_events_result(state, runtime, commands, result)
             }
+            ClientEvent::ApprovalDecided(result) => {
+                state.status_message =
+                    Some(format!("approval decision sent for {}", result.run_id));
+                state.approval = None;
+                state.active_run = Some(plato_agent::tui::ActiveRunView {
+                    run_id: result.run_id,
+                    status: result.status,
+                });
+            }
+            ClientEvent::RunCanceled(result) => {
+                state.status_message = Some(format!("cancel requested for {}", result.run_id));
+                state.cancel_requested = true;
+                state.approval = None;
+                state.active_run = Some(plato_agent::tui::ActiveRunView {
+                    run_id: result.run_id.clone(),
+                    status: result.status,
+                });
+                push_live_event(state, None, format!("cancel requested: {}", result.run_id));
+            }
             ClientEvent::Failed { context, error } => {
                 runtime.poll_in_flight = false;
                 if context == "events.stream" && error.starts_with("lagged:") {
@@ -319,6 +402,14 @@ fn drain_client_events(
                 } else if context == "events.stream" && error.starts_with("overload:") {
                     state.stream_warning = Some(error);
                 } else {
+                    if is_connection_error(&error) {
+                        state.connection = plato_agent::tui::ConnectionState::Disconnected {
+                            error: error.clone(),
+                        };
+                    }
+                    if context == "run.cancel" {
+                        state.cancel_requested = false;
+                    }
                     state.status_message = Some(format!("{context} failed: {error}"));
                 }
             }
@@ -337,6 +428,11 @@ fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
     if loaded.live_events.is_empty() {
         loaded.live_events = state.live_events.clone();
     }
+    if loaded.active_run.as_ref().map(|run| &run.run_id)
+        == state.active_run.as_ref().map(|run| &run.run_id)
+    {
+        loaded.cancel_requested = state.cancel_requested;
+    }
     *state = loaded;
 }
 
@@ -350,6 +446,8 @@ fn apply_run_response(
     let status = result.status.clone();
     state.status_message = Some(format!("{message}: {run_id}"));
     state.stream_warning = None;
+    state.cancel_requested = false;
+    state.approval = None;
     state.active_run = Some(plato_agent::tui::ActiveRunView {
         run_id: run_id.clone(),
         status: status.clone(),
@@ -360,6 +458,7 @@ fn apply_run_response(
     runtime.poll_in_flight = false;
     runtime.polling = status == "running";
     runtime.last_poll = Instant::now() - ACTIVE_POLL_INTERVAL;
+    runtime.tool_inputs.clear();
 }
 
 fn apply_events_result(
@@ -377,6 +476,21 @@ fn apply_events_result(
         status: result.status.clone(),
     });
     for event in result.events {
+        if let Some((call_id, input_preview)) =
+            plato_agent::tui::tool_input_preview_from_event(&event)
+        {
+            runtime.tool_inputs.insert(call_id, input_preview);
+        }
+        if let Some(approval) = plato_agent::tui::approval_from_event(
+            &event,
+            event
+                .get("event")
+                .and_then(|event| event.get("tool_call_id"))
+                .and_then(|call_id| call_id.as_str())
+                .and_then(|call_id| runtime.tool_inputs.get(call_id).cloned()),
+        ) {
+            state.approval = Some(approval);
+        }
         let line = plato_agent::tui::live_event_line(&event);
         push_live_event(state, line.offset, line.text);
     }
@@ -413,6 +527,62 @@ fn maybe_poll_events(runtime: &mut UiRuntime, commands: &Sender<ClientCommand>) 
     } else {
         runtime.polling = false;
     }
+}
+
+enum ApprovalAction {
+    Grant,
+    Deny,
+}
+
+fn decide_approval(commands: &Sender<ClientCommand>, state: &mut TuiState, action: ApprovalAction) {
+    let Some(approval) = state.approval.clone() else {
+        return;
+    };
+    let command = match action {
+        ApprovalAction::Grant => ClientCommand::ApprovalGrant {
+            run_id: approval.run_id.clone(),
+            tool_call_id: approval.tool_call_id.clone(),
+        },
+        ApprovalAction::Deny => ClientCommand::ApprovalDeny {
+            run_id: approval.run_id.clone(),
+            tool_call_id: approval.tool_call_id.clone(),
+            reason: "denied by plato-tui".into(),
+        },
+    };
+    state.status_message = Some(match action {
+        ApprovalAction::Grant => format!("grant sent for {}", approval.tool_call_id),
+        ApprovalAction::Deny => format!("deny sent for {}", approval.tool_call_id),
+    });
+    state.approval = None;
+    send_command(commands, command, state);
+}
+
+fn request_cancel(commands: &Sender<ClientCommand>, state: &mut TuiState) -> bool {
+    let Some(active) = state.active_run.clone() else {
+        return false;
+    };
+    if active.status != "running" || state.cancel_requested {
+        return false;
+    }
+    state.cancel_requested = true;
+    state.status_message = Some(format!("cancel requested for {}", active.run_id));
+    send_command(
+        commands,
+        ClientCommand::RunCancel {
+            run_id: active.run_id,
+        },
+        state,
+    );
+    true
+}
+
+fn is_connection_error(error: &str) -> bool {
+    error.contains("Connection refused")
+        || error.contains("No such file")
+        || error.contains("connection closed")
+        || error.contains("unsupported_version")
+        || error.contains("workspace_mismatch")
+        || error.contains("DaemonLockHeld")
 }
 
 fn submit_composer(
@@ -523,6 +693,7 @@ mod tests {
             poll_in_flight: false,
             polling: true,
             last_poll: Instant::now(),
+            tool_inputs: HashMap::new(),
         };
 
         submit_composer(&sender, &mut state, &runtime, None);
@@ -549,6 +720,7 @@ mod tests {
             poll_in_flight: true,
             polling: true,
             last_poll: Instant::now(),
+            tool_inputs: HashMap::new(),
         };
         let result = EventsStreamResult {
             run_id: "run_1".into(),
@@ -577,6 +749,77 @@ mod tests {
             ClientCommand::Load { run_id } => assert_eq!(run_id.as_deref(), Some("run_1")),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn approval_decisions_send_daemon_commands() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.approval = Some(plato_agent::tui::ApprovalModalView {
+            run_id: "run_1".into(),
+            tool_call_id: "call_1".into(),
+            tool_name: "file.write".into(),
+            effect: "WorkspaceWrite".into(),
+            reason: "requires approval".into(),
+            input_preview: "{}".into(),
+        });
+
+        decide_approval(&sender, &mut state, ApprovalAction::Grant);
+
+        assert!(state.approval.is_none());
+        match receiver.try_recv().unwrap() {
+            ClientCommand::ApprovalGrant {
+                run_id,
+                tool_call_id,
+            } => {
+                assert_eq!(run_id, "run_1");
+                assert_eq!(tool_call_id, "call_1");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        state.approval = Some(plato_agent::tui::ApprovalModalView {
+            run_id: "run_2".into(),
+            tool_call_id: "call_2".into(),
+            tool_name: "file.write".into(),
+            effect: "WorkspaceWrite".into(),
+            reason: "requires approval".into(),
+            input_preview: "{}".into(),
+        });
+
+        decide_approval(&sender, &mut state, ApprovalAction::Deny);
+
+        match receiver.try_recv().unwrap() {
+            ClientCommand::ApprovalDeny {
+                run_id,
+                tool_call_id,
+                reason,
+            } => {
+                assert_eq!(run_id, "run_2");
+                assert_eq!(tool_call_id, "call_2");
+                assert_eq!(reason, "denied by plato-tui");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_cancel_requests_daemon_and_second_cancel_quits() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.active_run = Some(plato_agent::tui::ActiveRunView {
+            run_id: "run_1".into(),
+            status: "running".into(),
+        });
+
+        assert!(request_cancel(&sender, &mut state));
+        assert!(state.cancel_requested);
+        match receiver.try_recv().unwrap() {
+            ClientCommand::RunCancel { run_id } => assert_eq!(run_id, "run_1"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        assert!(!request_cancel(&sender, &mut state));
     }
 
     fn test_state() -> TuiState {

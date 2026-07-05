@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use serde_json::Value;
 
@@ -21,6 +21,8 @@ pub struct TuiState {
     pub composer: String,
     pub status_message: Option<String>,
     pub stream_warning: Option<String>,
+    pub approval: Option<ApprovalModalView>,
+    pub cancel_requested: bool,
 }
 
 impl TuiState {
@@ -46,6 +48,8 @@ impl TuiState {
             composer: String::new(),
             status_message: None,
             stream_warning: None,
+            approval: None,
+            cancel_requested: false,
         }
     }
 
@@ -61,6 +65,8 @@ impl TuiState {
             composer: String::new(),
             status_message: None,
             stream_warning: None,
+            approval: None,
+            cancel_requested: false,
         }
     }
 }
@@ -120,6 +126,60 @@ impl LiveEventLine {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalModalView {
+    pub run_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub effect: String,
+    pub reason: String,
+    pub input_preview: String,
+}
+
+pub fn approval_from_event(
+    value: &Value,
+    input_preview: Option<String>,
+) -> Option<ApprovalModalView> {
+    let event = value.get("event").unwrap_or(value);
+    if event.get("kind").and_then(Value::as_str) != Some("approval_requested") {
+        return None;
+    }
+    Some(ApprovalModalView {
+        run_id: event.get("run_id")?.as_str()?.into(),
+        tool_call_id: event.get("tool_call_id")?.as_str()?.into(),
+        tool_name: event.get("tool_name")?.as_str()?.into(),
+        effect: event
+            .get("effect")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown effect")
+            .into(),
+        reason: event
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("approval required")
+            .into(),
+        input_preview: input_preview.unwrap_or_else(|| "input preview unavailable".into()),
+    })
+}
+
+pub fn tool_input_preview_from_event(value: &Value) -> Option<(String, String)> {
+    let event = value.get("event").unwrap_or(value);
+    if event.get("kind").and_then(Value::as_str) != Some("ledger")
+        || event.pointer("/record/event/event").and_then(Value::as_str)
+            != Some("tool_call_proposed")
+    {
+        return None;
+    }
+    let call_id = event
+        .pointer("/record/event/call/id")?
+        .as_str()?
+        .to_string();
+    let input = event.pointer("/record/event/call/input")?;
+    let preview =
+        serde_json::to_string_pretty(input).unwrap_or_else(|_| "input preview unavailable".into());
+    Some((call_id, truncate_preview(preview, 1200)))
+}
+
 pub fn live_event_line(value: &Value) -> LiveEventLine {
     let offset = value.get("offset").and_then(Value::as_u64);
     let event = value.get("event").unwrap_or(value);
@@ -169,6 +229,9 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     render_body(frame, body, state);
     render_live_events(frame, events, state);
     render_footer(frame, footer, state);
+    if let Some(approval) = &state.approval {
+        render_approval_modal(frame, frame.area(), approval);
+    }
 }
 
 pub fn render_snapshot(state: &TuiState, width: u16, height: u16) -> std::io::Result<String> {
@@ -320,11 +383,75 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(composer),
-            Line::from("Enter submits. r reconnects. q exits. Slice 2: approvals/cancel pending."),
+            Line::from(
+                "Enter submits. g grants approval. d denies. Ctrl-C cancels active run; second quits.",
+            ),
         ])
         .block(Block::default().borders(Borders::ALL).title("Composer")),
         area,
     );
+}
+
+fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalModalView) {
+    let area = centered_rect(74, 64, area);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("run ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(approval.run_id.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("call ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(approval.tool_call_id.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("tool ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!("{} ({})", approval.tool_name, approval.effect)),
+        ]),
+        Line::from(vec![
+            Span::styled("reason ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(approval.reason.clone()),
+        ]),
+        Line::from(""),
+        Line::from("input preview:"),
+        Line::from(approval.input_preview.clone()),
+        Line::from(""),
+        Line::from("g grant    d deny    Ctrl-C cancel run    q quit TUI"),
+    ];
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Approval"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn truncate_preview(mut preview: String, max_chars: usize) -> String {
+    if preview.chars().count() <= max_chars {
+        return preview;
+    }
+    preview = preview.chars().take(max_chars).collect();
+    preview.push_str("\n... truncated");
+    preview
 }
 
 fn vertical(area: Rect) -> [Rect; 4] {
@@ -424,7 +551,7 @@ mod tests {
 
         assert!(output.contains("daemon unavailable"));
         assert!(output.contains("cargo run --bin plato-agentd"));
-        assert!(output.contains("approvals/cancel pending"));
+        assert!(output.contains("Ctrl-C cancels"));
     }
 
     #[test]
@@ -513,6 +640,81 @@ mod tests {
             ledger,
             LiveEventLine::new(Some(5), "tool proposed file.read")
         );
+    }
+
+    #[test]
+    fn extracts_tool_input_preview_and_approval_modal_from_events() {
+        let proposed = serde_json::json!({
+            "offset": 3,
+            "event": {
+                "kind": "ledger",
+                "record": {
+                    "event": {
+                        "event": "tool_call_proposed",
+                        "call": {
+                            "id": "call_1",
+                            "tool": "file.write",
+                            "effect": "WorkspaceWrite",
+                            "input": {
+                                "path": "scratch.txt",
+                                "content": "hello"
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let approval = serde_json::json!({
+            "offset": 4,
+            "event": {
+                "kind": "approval_requested",
+                "run_id": "run_1",
+                "tool_call_id": "call_1",
+                "tool_name": "file.write",
+                "effect": "WorkspaceWrite",
+                "reason": "file.write requires approval"
+            }
+        });
+        let (call_id, input_preview) = tool_input_preview_from_event(&proposed).unwrap();
+        let modal = approval_from_event(&approval, Some(input_preview)).unwrap();
+
+        assert_eq!(call_id, "call_1");
+        assert_eq!(modal.run_id, "run_1");
+        assert!(modal.input_preview.contains("scratch.txt"));
+        assert!(modal.input_preview.contains("hello"));
+    }
+
+    #[test]
+    fn renders_approval_modal() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+        state.approval = Some(ApprovalModalView {
+            run_id: "run_1".into(),
+            tool_call_id: "call_1".into(),
+            tool_name: "file.write".into(),
+            effect: "WorkspaceWrite".into(),
+            reason: "file.write requires approval".into(),
+            input_preview: r#"{"path":"scratch.txt"}"#.into(),
+        });
+
+        let output = render_to_text(&state);
+
+        assert!(output.contains("Approval"));
+        assert!(output.contains("file.write"));
+        assert!(output.contains("WorkspaceWrite"));
+        assert!(output.contains("scratch.txt"));
+        assert!(output.contains("g grant"));
+        assert!(output.contains("d deny"));
     }
 
     fn render_to_text(state: &TuiState) -> String {
