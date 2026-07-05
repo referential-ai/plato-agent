@@ -56,9 +56,18 @@ plato replay --db                # replays the latest run
 
 Explicit paths need the equals form: `--db=/tmp/run.db`.
 
-## 4. The full experience: daemon + TUI
+## 4. The full experience: TUI
 
-Two terminals, same workspace:
+One terminal, same workspace:
+
+```bash
+plato --tui --config plato.toml
+```
+
+This attaches to the workspace daemon if one is already running. Otherwise it
+starts an embedded daemon for this TUI session.
+
+Manual two-terminal mode still works:
 
 ```bash
 plato-agentd --workspace "$PWD"                       # terminal A
@@ -75,7 +84,7 @@ plato-tui --workspace "$PWD" --config plato.toml      # terminal B
 | Ctrl-U | clear the composer |
 
 Ctrl-C on the daemon shuts down cleanly (socket and lock removed).
-Quitting the TUI never stops the daemon.
+Quitting a manually attached TUI never stops the daemon.
 
 ## 5. Run the test suite (no API key needed)
 
