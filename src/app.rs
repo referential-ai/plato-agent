@@ -18,6 +18,7 @@ use platonic_core::{
 use serde_json::Value;
 use std::{
     fmt,
+    io::{self, Write},
     path::PathBuf,
     sync::{
         Arc,
@@ -35,7 +36,8 @@ pub struct RunOptions {
     pub approval_mode: ApprovalMode,
     pub run_id: Option<RunId>,
     pub session: Option<RunSession>,
-    pub event_sender: Option<Sender<RecordedEvent>>,
+    pub event_sender: Option<Sender<RunEvent>>,
+    pub stream_to_stderr: bool,
     pub cancel: Option<Arc<AtomicBool>>,
 }
 
@@ -61,6 +63,21 @@ impl RunSession {
 pub struct RunOutcome {
     pub run_id: RunId,
     pub final_answer: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RunEvent {
+    Ledger(RecordedEvent),
+    AssistantDelta(AssistantDeltaEvent),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssistantDeltaEvent {
+    pub run_id: RunId,
+    pub turn_id: TurnId,
+    pub step: u32,
+    pub delta_index: u64,
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -345,7 +362,39 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             },
         )?;
 
-        let response = match client.send(&request) {
+        let mut emitted_delta_count = 0_u64;
+        let mut wrote_stderr_delta = false;
+        let response_result = if stream_enabled(&options) {
+            let delta_run_id = run_id.clone();
+            let delta_turn_id = turn_id.clone();
+            client.send_streaming(&request, |text| {
+                if text.is_empty() {
+                    return Ok(());
+                }
+                let delta = AssistantDeltaEvent {
+                    run_id: delta_run_id.clone(),
+                    turn_id: delta_turn_id.clone(),
+                    step: turn_index,
+                    delta_index: emitted_delta_count,
+                    text: text.into(),
+                };
+                emitted_delta_count += 1;
+                emit_assistant_delta(&options, delta);
+                if options.stream_to_stderr {
+                    eprint!("{text}");
+                    io::stderr().flush()?;
+                    wrote_stderr_delta = true;
+                }
+                Ok(())
+            })
+        } else {
+            client.send(&request)
+        };
+        if wrote_stderr_delta {
+            eprintln!();
+        }
+
+        let response = match response_result {
             Ok(response) => response,
             Err(error) => {
                 let reason = error.to_string();
@@ -462,7 +511,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             ));
         }
 
-        if !response.text().trim().is_empty() {
+        if emitted_delta_count == 0 && !response.text().trim().is_empty() {
             eprintln!("{}", response.text());
         }
 
@@ -685,9 +734,19 @@ fn record_event(
 ) -> AppResult<RecordedEvent> {
     let record = recorder.record(event)?;
     if let Some(sender) = &options.event_sender {
-        let _ = sender.send(record.clone());
+        let _ = sender.send(RunEvent::Ledger(record.clone()));
     }
     Ok(record)
+}
+
+fn stream_enabled(options: &RunOptions) -> bool {
+    options.stream_to_stderr || options.event_sender.is_some()
+}
+
+fn emit_assistant_delta(options: &RunOptions, delta: AssistantDeltaEvent) {
+    if let Some(sender) = &options.event_sender {
+        let _ = sender.send(RunEvent::AssistantDelta(delta));
+    }
 }
 
 fn record_context_built(
@@ -917,7 +976,12 @@ mod tests {
     use super::*;
     use platonic_core::{EffectClass, RunPhase, RunReadback};
     use serde_json::json;
-    use std::path::Path;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        path::Path,
+        thread,
+    };
 
     #[test]
     fn yolo_auto_grants_required_approval() {
@@ -1184,6 +1248,94 @@ mod tests {
         assert!(replay.contains("final_phase: Failed"));
     }
 
+    #[test]
+    fn assistant_deltas_are_live_only_not_jsonl_ledger() {
+        let server = spawn_streaming_provider(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{}"
+timeout_ms = 5000
+
+[limits]
+token_budget = 4000
+max_output_tokens = 32
+max_turns = 1
+
+[tools]
+enabled = ["file.read"]
+"#,
+                server.base_url
+            ),
+        )
+        .unwrap();
+        let ledger_path = dir.path().join("events.jsonl");
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+
+        let outcome = run_question(RunOptions {
+            question: "say hello".into(),
+            config_path: Some(config_path),
+            ledger: RunLedger::Jsonl(ledger_path.clone()),
+            workspace_root: dir.path().to_path_buf(),
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(RunId::new("run_stream_jsonl").unwrap()),
+            session: None,
+            event_sender: Some(event_sender),
+            stream_to_stderr: false,
+            cancel: None,
+        })
+        .unwrap();
+        let _ = server.handle.join().unwrap();
+
+        assert_eq!(outcome.final_answer, "Hello");
+        let live_events = event_receiver.try_iter().collect::<Vec<_>>();
+        let deltas = live_events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::AssistantDelta(delta) => Some(delta.text.clone()),
+                RunEvent::Ledger(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, vec!["Hel", "lo"]);
+
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        assert!(
+            !serde_json::to_string(&records)
+                .unwrap()
+                .contains("assistant_delta")
+        );
+        let assistant_messages = records
+            .iter()
+            .filter_map(|record| match &record.event {
+                HarnessEvent::ModelResponded { output, .. } => Some(output.content.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_messages, vec!["Hello"]);
+
+        let replay = crate::replay::replay_file(&ledger_path).unwrap();
+        assert_eq!(
+            replay
+                .lines()
+                .filter(|line| line.contains("assistant:"))
+                .count(),
+            1
+        );
+        assert!(replay.contains("assistant: Hello"));
+    }
+
     fn write_over_budget_config(path: &Path) {
         std::fs::write(
             path,
@@ -1219,8 +1371,66 @@ enabled = ["file.read"]
             run_id: Some(RunId::new(run_id).unwrap()),
             session: None,
             event_sender: None,
+            stream_to_stderr: false,
             cancel: None,
         }
+    }
+
+    struct StreamingProvider {
+        base_url: String,
+        handle: thread::JoinHandle<String>,
+    }
+
+    fn spawn_streaming_provider(response_body: &'static str) -> StreamingProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+        StreamingProvider { base_url, handle }
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0, "client closed before headers");
+            bytes.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = find_header_end(&bytes) {
+                break header_end;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length:")
+                    .or_else(|| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0, "client closed before body");
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn find_header_end(bytes: &[u8]) -> Option<usize> {
+        bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
     }
 
     fn assert_context_budget_error(error: &AppError) {

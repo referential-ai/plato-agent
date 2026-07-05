@@ -6,7 +6,11 @@ use crate::{
 use platonic_core::ModelUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    io::{BufRead, BufReader},
+    time::Duration,
+};
 
 pub struct OpenAiCompatibleClient {
     api_key: String,
@@ -50,18 +54,38 @@ impl OpenAiCompatibleClient {
 
     pub fn send(&self, request: &ModelRequest) -> AppResult<ModelResponse> {
         let body = ChatCompletionRequest::from_model_request(request, self.token_limit_field)?;
+        self.send_body(body)
+    }
+
+    pub fn send_streaming(
+        &self,
+        request: &ModelRequest,
+        mut on_delta: impl FnMut(&str) -> AppResult<()>,
+    ) -> AppResult<ModelResponse> {
+        let mut body = ChatCompletionRequest::from_model_request(request, self.token_limit_field)?;
+        body.stream = Some(true);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
-        let mut call = agent
-            .post(&url)
-            .set("authorization", &format!("Bearer {}", self.api_key))
-            .set("content-type", "application/json");
-        if let Some(http_referer) = &self.http_referer {
-            call = call.set("HTTP-Referer", http_referer);
+        let call = self.authorized_post(&agent, &url);
+
+        match call.send_json(body) {
+            Ok(response) => {
+                parse_chat_completion_stream(BufReader::new(response.into_reader()), &mut on_delta)
+            }
+            Err(ureq::Error::Status(status, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                Err(AppError::Provider(format!(
+                    "provider returned http {status}: {body}"
+                )))
+            }
+            Err(error) => Err(AppError::Provider(error.to_string())),
         }
-        if let Some(app_title) = &self.app_title {
-            call = call.set("X-OpenRouter-Title", app_title);
-        }
+    }
+
+    fn send_body(&self, body: ChatCompletionRequest) -> AppResult<ModelResponse> {
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
+        let call = self.authorized_post(&agent, &url);
 
         match call.send_json(body) {
             Ok(response) => response
@@ -76,6 +100,20 @@ impl OpenAiCompatibleClient {
             }
             Err(error) => Err(AppError::Provider(error.to_string())),
         }
+    }
+
+    fn authorized_post(&self, agent: &ureq::Agent, url: &str) -> ureq::Request {
+        let mut call = agent
+            .post(url)
+            .set("authorization", &format!("Bearer {}", self.api_key))
+            .set("content-type", "application/json");
+        if let Some(http_referer) = &self.http_referer {
+            call = call.set("HTTP-Referer", http_referer);
+        }
+        if let Some(app_title) = &self.app_title {
+            call = call.set("X-OpenRouter-Title", app_title);
+        }
+        call
     }
 }
 
@@ -92,6 +130,8 @@ struct ChatCompletionRequest {
     tools: Vec<ChatTool>,
     tool_choice: &'static str,
     parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -162,6 +202,42 @@ struct ChatCompletionResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ChatCompletionChunk {
+    #[serde(default)]
+    choices: Vec<ChatChunkChoice>,
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChunkChoice {
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    delta: ChatDelta,
+    finish_reason: Option<ChatFinishReason>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChatDelta {
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ChatToolCallDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    function: Option<ChatFunctionCallDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatFunctionCallDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ChatChoice {
     finish_reason: ChatFinishReason,
     message: ChatResponseMessage,
@@ -211,6 +287,7 @@ impl ChatCompletionRequest {
             tools: request.tools.iter().map(ChatTool::from_tool_spec).collect(),
             tool_choice: "auto",
             parallel_tool_calls: false,
+            stream: None,
             max_tokens: matches!(token_limit_field, TokenLimitField::MaxTokens)
                 .then_some(request.max_output_tokens),
             max_completion_tokens: matches!(
@@ -220,6 +297,169 @@ impl ChatCompletionRequest {
             .then_some(request.max_output_tokens),
         })
     }
+}
+
+#[derive(Default)]
+struct StreamingAssembler {
+    text: String,
+    tool_calls: BTreeMap<usize, StreamingToolCall>,
+    finish_reason: Option<ChatFinishReason>,
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Default)]
+struct StreamingToolCall {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+impl StreamingAssembler {
+    fn apply_chunk(
+        &mut self,
+        chunk: ChatCompletionChunk,
+        on_delta: &mut impl FnMut(&str) -> AppResult<()>,
+    ) -> AppResult<()> {
+        if let Some(usage) = chunk.usage {
+            self.usage = Some(usage);
+        }
+        for choice in chunk.choices {
+            if choice.index != 0 {
+                continue;
+            }
+            if let Some(text) = choice.delta.content.filter(|text| !text.is_empty()) {
+                on_delta(&text)?;
+                self.text.push_str(&text);
+            }
+            for tool_call in choice.delta.tool_calls {
+                let entry = self.tool_calls.entry(tool_call.index).or_default();
+                if let Some(id) = tool_call.id.filter(|id| !id.is_empty()) {
+                    entry.id = Some(id);
+                }
+                if let Some(function) = tool_call.function {
+                    if let Some(name) = function.name {
+                        entry.name.push_str(&name);
+                    }
+                    if let Some(arguments) = function.arguments {
+                        entry.arguments.push_str(&arguments);
+                    }
+                }
+            }
+            if let Some(reason) = choice.finish_reason {
+                self.finish_reason = Some(reason);
+            }
+        }
+        Ok(())
+    }
+
+    fn into_model_response(self) -> AppResult<ModelResponse> {
+        let mut content = Vec::new();
+        if !self.text.is_empty() {
+            content.push(ModelBlock::Text { text: self.text });
+        }
+        for (_, call) in self.tool_calls {
+            let id = call.id.ok_or_else(|| {
+                AppError::Provider("provider stream returned tool call without id".into())
+            })?;
+            let tool_name = internal_name_for_provider(&call.name).ok_or_else(|| {
+                AppError::Provider(format!("provider returned unknown tool {}", call.name))
+            })?;
+            let input = serde_json::from_str(&call.arguments).map_err(|error| {
+                AppError::Provider(format!(
+                    "provider returned invalid JSON for {}: {error}",
+                    call.name
+                ))
+            })?;
+            content.push(ModelBlock::ToolUse {
+                id,
+                name: tool_name.into(),
+                input,
+            });
+        }
+        let finish_reason = self.finish_reason.ok_or_else(|| {
+            AppError::Provider("provider stream ended without finish_reason".into())
+        })?;
+        let stop = match finish_reason {
+            ChatFinishReason::Stop => ModelStop::EndTurn,
+            ChatFinishReason::ToolCalls | ChatFinishReason::FunctionCall => ModelStop::ToolUse,
+            ChatFinishReason::Length => ModelStop::MaxOutput,
+            ChatFinishReason::ContentFilter => ModelStop::ContentFilter,
+        };
+        let usage = self.usage.unwrap_or(ChatUsage {
+            prompt_tokens: Some(0),
+            completion_tokens: Some(0),
+        });
+
+        Ok(ModelResponse {
+            content,
+            stop,
+            usage: ModelUsage {
+                input_tokens: usage.prompt_tokens.unwrap_or(0),
+                output_tokens: usage.completion_tokens.unwrap_or(0),
+            },
+        })
+    }
+}
+
+fn parse_chat_completion_stream(
+    reader: impl BufRead,
+    on_delta: &mut impl FnMut(&str) -> AppResult<()>,
+) -> AppResult<ModelResponse> {
+    let mut assembler = StreamingAssembler::default();
+    let mut event_data = String::new();
+    let mut saw_done = false;
+    for line in reader.lines() {
+        let line = line?;
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            if !event_data.is_empty() {
+                if process_stream_data(&event_data, &mut assembler, on_delta)? {
+                    saw_done = true;
+                    break;
+                }
+                event_data.clear();
+            }
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            if !event_data.is_empty() {
+                event_data.push('\n');
+            }
+            event_data.push_str(data.trim_start());
+        }
+    }
+    if !event_data.is_empty() && !saw_done {
+        saw_done = process_stream_data(&event_data, &mut assembler, on_delta)?;
+    }
+    if !saw_done {
+        return Err(AppError::Provider(
+            "provider stream ended before [DONE]".into(),
+        ));
+    }
+    assembler.into_model_response()
+}
+
+fn process_stream_data(
+    data: &str,
+    assembler: &mut StreamingAssembler,
+    on_delta: &mut impl FnMut(&str) -> AppResult<()>,
+) -> AppResult<bool> {
+    if data.trim() == "[DONE]" {
+        return Ok(true);
+    }
+    let value: Value = serde_json::from_str(data).map_err(|error| {
+        AppError::Provider(format!("provider returned invalid SSE JSON: {error}"))
+    })?;
+    if let Some(error) = value.get("error") {
+        return Err(AppError::Provider(format!(
+            "provider stream error: {error}"
+        )));
+    }
+    let chunk = serde_json::from_value::<ChatCompletionChunk>(value).map_err(|error| {
+        AppError::Provider(format!("provider returned invalid SSE chunk: {error}"))
+    })?;
+    assembler.apply_chunk(chunk, on_delta)?;
+    Ok(false)
 }
 
 impl ChatMessage {
@@ -366,6 +606,7 @@ fn text_from_blocks(blocks: &[ModelBlock]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Cursor;
 
     #[test]
     fn maps_openai_tool_calls_to_internal_tool_names() {
@@ -484,5 +725,57 @@ mod tests {
         assert!(matches!(chat.role, ChatRole::Assistant));
         assert_eq!(chat.content, Some("Reading".into()));
         assert_eq!(chat.tool_calls.unwrap()[0].function.name, "file_read");
+    }
+
+    #[test]
+    fn streaming_text_assembles_final_response_and_emits_deltas() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut deltas = Vec::new();
+
+        let response = parse_chat_completion_stream(Cursor::new(raw), &mut |delta| {
+            deltas.push(delta.to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(deltas, vec!["Hel", "lo"]);
+        assert_eq!(response.text(), "Hello");
+        assert_eq!(response.stop, ModelStop::EndTurn);
+        assert_eq!(response.usage.input_tokens, 4);
+        assert_eq!(response.usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn streaming_tool_calls_assemble_without_text_deltas() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"file_read\",\"arguments\":\"{\\\"path\\\":\\\"README\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\".md\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut deltas = Vec::new();
+
+        let response = parse_chat_completion_stream(Cursor::new(raw), &mut |delta| {
+            deltas.push(delta.to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(deltas.is_empty());
+        assert_eq!(response.stop, ModelStop::ToolUse);
+        assert_eq!(
+            response.tool_uses(),
+            vec![(
+                "call_1".into(),
+                "file.read".into(),
+                json!({"path": "README.md"})
+            )]
+        );
     }
 }
