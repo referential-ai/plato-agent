@@ -10,6 +10,7 @@ pub struct ApprovalModalView {
     pub effect: String,
     pub reason: String,
     pub input_preview: String,
+    pub diff_preview: Option<String>,
 }
 
 pub fn approval_from_event(
@@ -35,6 +36,11 @@ pub fn approval_from_event(
             .unwrap_or("approval required")
             .into(),
         input_preview: input_preview.unwrap_or_else(|| "input preview unavailable".into()),
+        diff_preview: event
+            .get("diff_preview")
+            .and_then(Value::as_str)
+            .filter(|diff| !diff.is_empty())
+            .map(str::to_owned),
     })
 }
 
@@ -187,5 +193,26 @@ mod tests {
         assert_eq!(modal.run_id, "run_1");
         assert!(modal.input_preview.contains("scratch.txt"));
         assert!(modal.input_preview.contains("hello"));
+        assert_eq!(modal.diff_preview, None);
+    }
+
+    #[test]
+    fn approval_modal_prefers_diff_preview_when_present() {
+        let approval = serde_json::json!({
+            "offset": 4,
+            "event": {
+                "kind": "approval_requested",
+                "run_id": "run_1",
+                "tool_call_id": "call_1",
+                "tool_name": "file.edit",
+                "effect": "WorkspaceWrite",
+                "reason": "file.edit requires approval",
+                "diff_preview": "--- a/note.txt\n+++ b/note.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+            }
+        });
+        let modal = approval_from_event(&approval, Some(r#"{"path":"note.txt"}"#.into())).unwrap();
+
+        assert!(modal.input_preview.contains("note.txt"));
+        assert!(modal.diff_preview.as_ref().unwrap().contains("-old"));
     }
 }

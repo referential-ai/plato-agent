@@ -180,7 +180,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
 fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalModalView) {
     let area = centered_rect(74, 64, area);
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("run ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(approval.run_id.clone()),
@@ -198,11 +198,18 @@ fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalM
             Span::raw(approval.reason.clone()),
         ]),
         Line::from(""),
-        Line::from("input preview:"),
-        Line::from(approval.input_preview.clone()),
+    ];
+    if let Some(diff_preview) = &approval.diff_preview {
+        lines.push(Line::from("diff preview:"));
+        lines.extend(diff_preview.lines().map(|line| Line::from(line.to_owned())));
+    } else {
+        lines.push(Line::from("input preview:"));
+        lines.push(Line::from(approval.input_preview.clone()));
+    }
+    lines.extend([
         Line::from(""),
         Line::from("g grant    d deny    Ctrl-C cancel run    q quit TUI"),
-    ];
+    ]);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
@@ -410,6 +417,7 @@ mod tests {
             effect: "WorkspaceWrite".into(),
             reason: "file.write requires approval".into(),
             input_preview: r#"{"path":"scratch.txt"}"#.into(),
+            diff_preview: None,
         });
 
         let output = render_to_text(&state);
@@ -420,6 +428,39 @@ mod tests {
         assert!(output.contains("scratch.txt"));
         assert!(output.contains("g grant"));
         assert!(output.contains("d deny"));
+    }
+
+    #[test]
+    fn renders_approval_modal_diff_preview_when_present() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+        state.approval = Some(ApprovalModalView {
+            run_id: "run_1".into(),
+            tool_call_id: "call_1".into(),
+            tool_name: "file.edit".into(),
+            effect: "WorkspaceWrite".into(),
+            reason: "file.edit requires approval".into(),
+            input_preview: r#"{"path":"scratch.txt"}"#.into(),
+            diff_preview: Some("--- a/scratch.txt\n+++ b/scratch.txt\n-old\n+new\n".into()),
+        });
+
+        let output = render_to_text(&state);
+
+        assert!(output.contains("diff preview"));
+        assert!(output.contains("--- a/scratch.txt"));
+        assert!(output.contains("-old"));
+        assert!(output.contains("+new"));
+        assert!(!output.contains("input preview:"));
     }
 
     fn render_to_text(state: &TuiState) -> String {

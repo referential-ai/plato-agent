@@ -945,6 +945,7 @@ mod tests {
             effect: "WorkspaceWrite".into(),
             reason: "requires approval".into(),
             input_preview: "{}".into(),
+            diff_preview: None,
         });
 
         decide_approval(&sender, &mut state, ApprovalAction::Grant);
@@ -968,6 +969,7 @@ mod tests {
             effect: "WorkspaceWrite".into(),
             reason: "requires approval".into(),
             input_preview: "{}".into(),
+            diff_preview: None,
         });
 
         decide_approval(&sender, &mut state, ApprovalAction::Deny);
