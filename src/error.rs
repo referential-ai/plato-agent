@@ -34,6 +34,15 @@ pub enum AppError {
     #[error("run not found in sqlite ledger: {0}")]
     RunNotFound(String),
 
+    #[error("sqlite ledger has no sessions")]
+    NoSqliteSessions,
+
+    #[error("session not found in sqlite ledger: {0}")]
+    SessionNotFound(String),
+
+    #[error("session already has an active run: {session_id} ({run_id})")]
+    SessionActive { session_id: String, run_id: String },
+
     #[error("question is empty")]
     EmptyQuestion,
 

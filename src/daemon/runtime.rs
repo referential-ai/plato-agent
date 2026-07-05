@@ -84,9 +84,9 @@ impl PendingApproval {
 }
 
 impl RunRecord {
-    pub(super) fn new(run_id: String, ledger_path: PathBuf) -> Self {
+    pub(super) fn new(run_id: String, session_id: String, ledger_path: PathBuf) -> Self {
         Self {
-            session_id: run_id.clone(),
+            session_id,
             run_id,
             ledger_path,
             cancel: Arc::new(AtomicBool::new(false)),

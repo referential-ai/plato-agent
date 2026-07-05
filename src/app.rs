@@ -1,10 +1,10 @@
 use crate::{
     AppError, AppResult,
     config::{Config, ProviderKind},
-    ledger::EventRecorder,
-    model::{ModelMessage, ModelRequest, ModelResponse, ModelStop, system_prompt},
+    ledger::{EventRecorder, SessionTurn, SqliteLedger},
+    model::{ModelBlock, ModelMessage, ModelRequest, ModelResponse, ModelStop, system_prompt},
     provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
-    tool_catalog::{effect_for_tool, tool_specs},
+    tool_catalog::{ToolSpec, effect_for_tool, tool_specs},
     tools::{ApprovalOutcome, approval_diff_preview, ask_for_approval, execute_tool},
 };
 use platonic_core::{
@@ -31,8 +31,27 @@ pub struct RunOptions {
     pub workspace_root: PathBuf,
     pub approval_mode: ApprovalMode,
     pub run_id: Option<RunId>,
+    pub session: Option<RunSession>,
     pub event_sender: Option<Sender<RecordedEvent>>,
     pub cancel: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunSession {
+    Fresh { session_id: String },
+    Continue { session_id: String },
+}
+
+impl RunSession {
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::Fresh { session_id } | Self::Continue { session_id } => session_id,
+        }
+    }
+
+    fn create_session(&self) -> bool {
+        matches!(self, Self::Fresh { .. })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,6 +153,114 @@ impl ApprovalMode {
     }
 }
 
+const SESSION_TRUNCATION_MARKER: &str = "[older session turns omitted to fit the context budget]";
+
+struct ActiveSessionRun {
+    ledger: SqliteLedger,
+    run_id: RunId,
+    closed: bool,
+}
+
+impl ActiveSessionRun {
+    fn begin(
+        ledger_path: &std::path::Path,
+        session: &RunSession,
+        run_id: &RunId,
+        question: &str,
+        config: &Config,
+        tools: &[ToolSpec],
+    ) -> AppResult<(Self, Vec<ModelMessage>)> {
+        let mut ledger = SqliteLedger::open_or_create(ledger_path)?;
+        let turns = ledger.begin_session_run(
+            session.session_id(),
+            run_id,
+            question,
+            session.create_session(),
+        )?;
+        let messages = hydrated_messages(&turns, question, config, tools)?;
+        Ok((
+            Self {
+                ledger,
+                run_id: run_id.clone(),
+                closed: false,
+            },
+            messages,
+        ))
+    }
+
+    fn finish(&mut self, final_answer: &str) -> AppResult<()> {
+        self.ledger.finish_session_run(&self.run_id, final_answer)?;
+        self.closed = true;
+        Ok(())
+    }
+
+    fn fail(&mut self, error: &str, canceled: bool) -> AppResult<()> {
+        self.ledger
+            .fail_session_run(&self.run_id, error, canceled)?;
+        self.closed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ActiveSessionRun {
+    fn drop(&mut self) {
+        if !self.closed {
+            let _ = self.ledger.fail_session_run(
+                &self.run_id,
+                "run ended before session status was closed",
+                false,
+            );
+        }
+    }
+}
+
+fn hydrated_messages(
+    turns: &[SessionTurn],
+    question: &str,
+    config: &Config,
+    tools: &[ToolSpec],
+) -> AppResult<Vec<ModelMessage>> {
+    let mut first_turn = 0;
+    let mut truncated = false;
+    loop {
+        let messages = session_messages_from(&turns[first_turn..], question, truncated);
+        if estimated_context_tokens(&messages, tools)? <= config.limits.token_budget
+            || first_turn == turns.len()
+        {
+            return Ok(messages);
+        }
+        first_turn += 1;
+        truncated = true;
+    }
+}
+
+fn session_messages_from(
+    turns: &[SessionTurn],
+    question: &str,
+    truncated: bool,
+) -> Vec<ModelMessage> {
+    let mut messages = Vec::new();
+    if truncated {
+        messages.push(ModelMessage::user_text(SESSION_TRUNCATION_MARKER));
+    }
+    for turn in turns {
+        messages.push(ModelMessage::user_text(turn.question.clone()));
+        messages.push(ModelMessage::assistant_blocks(vec![ModelBlock::Text {
+            text: turn.final_answer.clone(),
+        }]));
+    }
+    messages.push(ModelMessage::user_text(question.to_string()));
+    messages
+}
+
+fn estimated_context_tokens(messages: &[ModelMessage], tools: &[ToolSpec]) -> AppResult<u32> {
+    let messages = serde_json::to_string(messages)?;
+    let tools = serde_json::to_string(tools)?;
+    Ok(estimate_tokens(system_prompt())
+        .saturating_add(estimate_tokens(&messages))
+        .saturating_add(estimate_tokens(&tools)))
+}
+
 pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
     if options.question.trim().is_empty() {
         return Err(AppError::EmptyQuestion);
@@ -149,6 +276,27 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         config.provider.app_title.clone(),
         token_limit_field(&config.provider.kind),
     )?;
+    let tools = tool_specs(&config.tools.enabled);
+    let (mut session_run, mut messages) = match (&options.ledger, &options.session) {
+        (RunLedger::Sqlite(path), Some(session)) => {
+            let (session_run, messages) = ActiveSessionRun::begin(
+                path,
+                session,
+                &run_id,
+                &options.question,
+                &config,
+                &tools,
+            )?;
+            (Some(session_run), messages)
+        }
+        (RunLedger::Jsonl(_), Some(_)) => {
+            return Err(AppError::Config("sessions require a SQLite ledger".into()));
+        }
+        (_, None) => (
+            None,
+            vec![ModelMessage::user_text(options.question.clone())],
+        ),
+    };
     let mut recorder = match &options.ledger {
         RunLedger::Jsonl(path) => EventRecorder::create_jsonl(path)?,
         RunLedger::Sqlite(path) => EventRecorder::create_sqlite(path, &run_id)?,
@@ -165,9 +313,6 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             agent_id,
         },
     )?;
-
-    let mut messages = vec![ModelMessage::user_text(options.question.clone())];
-    let tools = tool_specs(&config.tools.enabled);
 
     for turn_index in 0..config.limits.max_turns {
         let turn_id = TurnId::new(format!("turn_{}", turn_index + 1))?;
@@ -195,14 +340,18 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         let response = match client.send(&request) {
             Ok(response) => response,
             Err(error) => {
+                let reason = error.to_string();
                 record_event(
                     &mut recorder,
                     &options,
                     HarnessEvent::RunFailed {
                         run_id,
-                        reason: error.to_string(),
+                        reason: reason.clone(),
                     },
                 )?;
+                if let Some(session_run) = &mut session_run {
+                    session_run.fail(&reason, false)?;
+                }
                 return Err(error);
             }
         };
@@ -232,6 +381,9 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     &options,
                     HarnessEvent::RunFailed { run_id, reason },
                 )?;
+                if let Some(session_run) = &mut session_run {
+                    session_run.fail("model reached max output tokens", false)?;
+                }
                 return Err(AppError::RunFailed(
                     "model reached max output tokens".into(),
                 ));
@@ -243,6 +395,9 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     &options,
                     HarnessEvent::RunFailed { run_id, reason },
                 )?;
+                if let Some(session_run) = &mut session_run {
+                    session_run.fail("model response was stopped by content filter", false)?;
+                }
                 return Err(AppError::RunFailed(
                     "model response was stopped by content filter".into(),
                 ));
@@ -259,6 +414,9 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &options,
                 HarnessEvent::RunFailed { run_id, reason },
             )?;
+            if let Some(session_run) = &mut session_run {
+                session_run.fail("provider reported tool use without tool calls", false)?;
+            }
             return Err(AppError::RunFailed(
                 "provider reported tool use without tool calls".into(),
             ));
@@ -272,6 +430,9 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     run_id: run_id.clone(),
                 },
             )?;
+            if let Some(session_run) = &mut session_run {
+                session_run.finish(&final_answer)?;
+            }
             return Ok(RunOutcome {
                 run_id,
                 final_answer,
@@ -285,6 +446,9 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &options,
                 HarnessEvent::RunFailed { run_id, reason },
             )?;
+            if let Some(session_run) = &mut session_run {
+                session_run.fail("model requested multiple tools in one response", false)?;
+            }
             return Err(AppError::RunFailed(
                 "model requested multiple tools in one response".into(),
             ));
@@ -472,18 +636,19 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         ));
     }
 
+    let reason = format!("exceeded maximum turn count of {}", config.limits.max_turns);
     record_event(
         &mut recorder,
         &options,
         HarnessEvent::RunFailed {
             run_id,
-            reason: format!("exceeded maximum turn count of {}", config.limits.max_turns),
+            reason: reason.clone(),
         },
     )?;
-    Err(AppError::RunFailed(format!(
-        "exceeded maximum turn count of {}",
-        config.limits.max_turns
-    )))
+    if let Some(session_run) = &mut session_run {
+        session_run.fail(&reason, false)?;
+    }
+    Err(AppError::RunFailed(reason))
 }
 
 #[derive(Debug)]
@@ -702,6 +867,14 @@ pub fn new_run_id() -> AppResult<RunId> {
     ))?)
 }
 
+pub fn new_session_id() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("session_{}_{}", millis, std::process::id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,6 +997,48 @@ mod tests {
     }
 
     #[test]
+    fn session_hydration_includes_prior_turns_and_current_question() {
+        let config = Config::default();
+        let tools = tool_specs(&config.tools.enabled);
+        let turns = vec![SessionTurn {
+            question: "first question".into(),
+            final_answer: "first answer".into(),
+        }];
+
+        let messages = hydrated_messages(&turns, "second question", &config, &tools).unwrap();
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(text(&messages[0]), "first question");
+        assert_eq!(text(&messages[1]), "first answer");
+        assert_eq!(text(&messages[2]), "second question");
+    }
+
+    #[test]
+    fn session_hydration_drops_oldest_turns_with_marker() {
+        let mut config = Config::default();
+        config.limits.token_budget = 1_000;
+        let tools = tool_specs(&config.tools.enabled);
+        let turns = vec![
+            SessionTurn {
+                question: "old question ".repeat(400),
+                final_answer: "old answer ".repeat(400),
+            },
+            SessionTurn {
+                question: "recent question".into(),
+                final_answer: "recent answer".into(),
+            },
+        ];
+
+        let messages = hydrated_messages(&turns, "current question", &config, &tools).unwrap();
+        let serialized = serde_json::to_string(&messages).unwrap();
+
+        assert!(serialized.contains(SESSION_TRUNCATION_MARKER));
+        assert!(!serialized.contains("old question"));
+        assert!(serialized.contains("recent question"));
+        assert!(serialized.contains("current question"));
+    }
+
+    #[test]
     fn jsonl_context_budget_abort_records_terminal_run_failed() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("plato.toml");
@@ -896,11 +1111,12 @@ enabled = ["file.read"]
     ) -> RunOptions {
         RunOptions {
             question: "hello".into(),
-            config_path: config_path.to_path_buf(),
+            config_path: Some(config_path.to_path_buf()),
             ledger,
             workspace_root,
             approval_mode: ApprovalMode::Deny { actor: "test" },
             run_id: Some(RunId::new(run_id).unwrap()),
+            session: None,
             event_sender: None,
             cancel: None,
         }
@@ -931,6 +1147,13 @@ enabled = ["file.read"]
                 assert!(reason.contains("budget 1"));
             }
             phase => panic!("expected failed final phase, got {phase:?}"),
+        }
+    }
+
+    fn text(message: &ModelMessage) -> &str {
+        match &message.content[0] {
+            ModelBlock::Text { text } => text,
+            block => panic!("expected text block, got {block:?}"),
         }
     }
 }

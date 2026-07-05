@@ -34,11 +34,13 @@ enabled = ["file.read", "file.list", "file.write"]
 
 ```bash
 plato "list the files here and summarize what this project is"
-plato replay        # audit the latest default SQLite run
+plato -c "name the most important file from that summary"
+plato replay        # audit the latest default SQLite session
 ```
 
 The answer prints to stdout; the complete run ledger lands in the default XDG
-SQLite store for the workspace. Use `--events <file>` when you want JSONL.
+SQLite store for the workspace. `-c` continues the latest workspace session.
+Use `--events <file>` when you want JSONL.
 
 ## 2. Test the approval boundary
 
@@ -58,7 +60,8 @@ Nothing escapes the workspace: `../`, absolute paths, and symlinks out are refus
 ```bash
 plato "read Cargo.toml and name the package"
 # stderr prints: run_id / ledger_path / the exact replay command
-plato replay                # replays the latest run
+plato -c "what did I ask you to inspect?"
+plato replay                # replays the latest session
 ```
 
 Explicit SQLite paths need the equals form: `--db=/tmp/run.db`. If the
@@ -85,7 +88,7 @@ plato-tui --workspace "$PWD" --config plato.toml      # terminal B
 
 | Key | Does |
 | --- | --- |
-| type + Enter | start a run, or queue the next turn while one is active |
+| type + Enter | start a run when idle |
 | `g` / `d` | grant / deny in the approval modal |
 | Ctrl-C | first press cancels the active run; second quits the TUI |
 | `r` | reconnect (only when the header shows daemon unavailable) |
@@ -112,3 +115,4 @@ cargo fmt --check
 | provider api key env is not set | re-export `OPENROUTER_API_KEY` in this shell |
 | ledger already exists | JSONL ledgers never overwrite — pass a fresh `--events` name |
 | run stops after 8 turns | runs are bounded by `limits.max_turns`; ask tighter or configure a different limit |
+| `plato -c` says no previous session | run `plato "..."` once in this workspace first |

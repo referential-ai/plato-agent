@@ -11,6 +11,11 @@ use std::{
 
 pub const LEDGER_VERSION: u32 = 1;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const SQLITE_SCHEMA_VERSION: u32 = 2;
+const RUN_STATUS_RUNNING: &str = "running";
+const RUN_STATUS_FINISHED: &str = "finished";
+const RUN_STATUS_FAILED: &str = "failed";
+const RUN_STATUS_CANCELED: &str = "canceled";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +113,24 @@ pub struct SqliteLedger {
     connection: Connection,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionTurn {
+    pub question: String,
+    pub final_answer: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionRunRecords {
+    pub run_id: String,
+    pub records: Vec<RecordedEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionRecords {
+    pub session_id: String,
+    pub runs: Vec<SessionRunRecords>,
+}
+
 impl SqliteLedger {
     pub fn open_or_create(path: &Path) -> AppResult<Self> {
         if path.as_os_str().is_empty() {
@@ -201,6 +224,181 @@ impl SqliteLedger {
         Ok((run_id, records))
     }
 
+    pub fn latest_session_id(&self) -> AppResult<String> {
+        self.connection
+            .query_row(
+                "SELECT session_id
+                 FROM sessions
+                 ORDER BY updated_at_ms DESC, session_id DESC
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(AppError::NoSqliteSessions)
+    }
+
+    pub fn session_turns(&self, session_id: &str) -> AppResult<Vec<SessionTurn>> {
+        if !self.session_exists(session_id)? {
+            return Err(AppError::SessionNotFound(session_id.into()));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT question, final_answer
+             FROM session_runs
+             WHERE session_id = ?1 AND status = ?2 AND final_answer IS NOT NULL
+             ORDER BY session_index ASC",
+        )?;
+        Ok(statement
+            .query_map(params![session_id, RUN_STATUS_FINISHED], |row| {
+                Ok(SessionTurn {
+                    question: row.get(0)?,
+                    final_answer: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn begin_session_run(
+        &mut self,
+        session_id: &str,
+        run_id: &RunId,
+        question: &str,
+        create_session: bool,
+    ) -> AppResult<Vec<SessionTurn>> {
+        let now = sqlite_i64(now_ms(), "occurred_at_ms")?;
+        let transaction = self.connection.transaction()?;
+        let exists = session_exists_in(&transaction, session_id)?;
+        if !exists && !create_session {
+            return Err(AppError::SessionNotFound(session_id.into()));
+        }
+        if let Some(active_run_id) = active_run_in(&transaction, session_id)? {
+            return Err(AppError::SessionActive {
+                session_id: session_id.into(),
+                run_id: active_run_id,
+            });
+        }
+        if !exists {
+            transaction.execute(
+                "INSERT INTO sessions (session_id, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![session_id, now, now],
+            )?;
+        }
+        let session_index: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(session_index) + 1, 0)
+             FROM session_runs
+             WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO session_runs
+               (session_id, run_id, session_index, question, final_answer, status, error, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7)",
+            params![
+                session_id,
+                run_id.to_string(),
+                session_index,
+                question,
+                RUN_STATUS_RUNNING,
+                now,
+                now
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE sessions SET updated_at_ms = ?2 WHERE session_id = ?1",
+            params![session_id, now],
+        )?;
+        transaction.commit()?;
+        self.session_turns(session_id)
+    }
+
+    pub fn finish_session_run(&mut self, run_id: &RunId, final_answer: &str) -> AppResult<()> {
+        self.update_session_run(run_id, RUN_STATUS_FINISHED, Some(final_answer), None)
+    }
+
+    pub fn fail_session_run(
+        &mut self,
+        run_id: &RunId,
+        error: &str,
+        canceled: bool,
+    ) -> AppResult<()> {
+        let status = if canceled {
+            RUN_STATUS_CANCELED
+        } else {
+            RUN_STATUS_FAILED
+        };
+        self.update_session_run(run_id, status, None, Some(error))
+    }
+
+    pub fn read_session(&self, session_id: &str) -> AppResult<SessionRecords> {
+        if !self.session_exists(session_id)? {
+            return Err(AppError::SessionNotFound(session_id.into()));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT run_id
+             FROM session_runs
+             WHERE session_id = ?1
+             ORDER BY session_index ASC",
+        )?;
+        let run_ids = statement
+            .query_map(params![session_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let runs = run_ids
+            .into_iter()
+            .map(|run_id| {
+                Ok(SessionRunRecords {
+                    records: self.read_run(&run_id)?,
+                    run_id,
+                })
+            })
+            .collect::<AppResult<Vec<_>>>()?;
+        Ok(SessionRecords {
+            session_id: session_id.into(),
+            runs,
+        })
+    }
+
+    pub fn read_latest_session(&self) -> AppResult<SessionRecords> {
+        let session_id = self.latest_session_id()?;
+        self.read_session(&session_id)
+    }
+
+    fn session_exists(&self, session_id: &str) -> AppResult<bool> {
+        session_exists_in(&self.connection, session_id)
+    }
+
+    fn update_session_run(
+        &mut self,
+        run_id: &RunId,
+        status: &str,
+        final_answer: Option<&str>,
+        error: Option<&str>,
+    ) -> AppResult<()> {
+        let now = sqlite_i64(now_ms(), "occurred_at_ms")?;
+        let transaction = self.connection.transaction()?;
+        let updated = transaction.execute(
+            "UPDATE session_runs
+             SET status = ?2, final_answer = ?3, error = ?4, updated_at_ms = ?5
+             WHERE run_id = ?1",
+            params![run_id.to_string(), status, final_answer, error, now],
+        )?;
+        if updated == 0 {
+            return Err(AppError::RunNotFound(run_id.to_string()));
+        }
+        let session_id: String = transaction.query_row(
+            "SELECT session_id FROM session_runs WHERE run_id = ?1",
+            params![run_id.to_string()],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "UPDATE sessions SET updated_at_ms = ?2 WHERE session_id = ?1",
+            params![session_id, now],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn user_version(&self) -> AppResult<u32> {
         let version: u32 = self
@@ -252,6 +450,31 @@ fn row_u64(row: &rusqlite::Row<'_>, index: usize, field: &str) -> rusqlite::Resu
     })
 }
 
+fn session_exists_in(connection: &Connection, session_id: &str) -> AppResult<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM sessions WHERE session_id = ?1 LIMIT 1",
+            params![session_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn active_run_in(connection: &Connection, session_id: &str) -> AppResult<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT run_id
+             FROM session_runs
+             WHERE session_id = ?1 AND status = ?2
+             ORDER BY session_index ASC
+             LIMIT 1",
+            params![session_id, RUN_STATUS_RUNNING],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
 fn configure_sqlite_connection(connection: &Connection) -> AppResult<()> {
     connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
     Ok(())
@@ -272,17 +495,54 @@ fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
                   event_json TEXT NOT NULL,
                   PRIMARY KEY (run_id, seq)
                 );
-                PRAGMA user_version = 1;
                 "#,
             )?;
+            create_session_tables(&transaction)?;
+            transaction.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
             transaction.commit()?;
             Ok(())
         }
-        1 => Ok(()),
+        1 => {
+            let transaction = connection.transaction()?;
+            create_session_tables(&transaction)?;
+            transaction.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
+            transaction.commit()?;
+            Ok(())
+        }
+        SQLITE_SCHEMA_VERSION => Ok(()),
         _ => Err(AppError::Config(format!(
             "unsupported sqlite schema version: {version}"
         ))),
     }
+}
+
+fn create_session_tables(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS sessions (
+          session_id TEXT PRIMARY KEY,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS session_runs (
+          session_id TEXT NOT NULL,
+          run_id TEXT PRIMARY KEY,
+          session_index INTEGER NOT NULL,
+          question TEXT NOT NULL,
+          final_answer TEXT,
+          status TEXT NOT NULL,
+          error TEXT,
+          created_at_ms INTEGER NOT NULL,
+          updated_at_ms INTEGER NOT NULL,
+          UNIQUE(session_id, session_index)
+        );
+
+        CREATE INDEX IF NOT EXISTS session_runs_session_index
+          ON session_runs(session_id, session_index);
+        "#,
+    )?;
+    Ok(())
 }
 
 fn next_record(state: &mut RunState, event: HarnessEvent) -> AppResult<RecordedEvent> {
@@ -324,6 +584,18 @@ pub fn read_sqlite_records(path: &Path, run_id: Option<&str>) -> AppResult<Vec<R
         Some(run_id) => ledger.read_run(run_id),
         None => ledger.read_latest_run().map(|(_, records)| records),
     }
+}
+
+pub fn latest_sqlite_session_id(path: &Path) -> AppResult<String> {
+    SqliteLedger::open_or_create(path)?.latest_session_id()
+}
+
+pub fn read_latest_sqlite_session(path: &Path) -> AppResult<SessionRecords> {
+    SqliteLedger::open_readonly(path)?.read_latest_session()
+}
+
+pub fn read_sqlite_session(path: &Path, session_id: &str) -> AppResult<SessionRecords> {
+    SqliteLedger::open_readonly(path)?.read_session(session_id)
 }
 
 fn now_ms() -> u64 {
@@ -389,7 +661,7 @@ mod tests {
         let path = dir.path().join("events.db");
         let ledger = SqliteLedger::open_or_create(&path).unwrap();
 
-        assert_eq!(ledger.user_version().unwrap(), 1);
+        assert_eq!(ledger.user_version().unwrap(), SQLITE_SCHEMA_VERSION);
     }
 
     #[test]
@@ -426,6 +698,61 @@ mod tests {
 
         assert_eq!(run_id, "run_new");
         assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn sqlite_sessions_track_finished_turns_and_latest_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let run_id = RunId::new("run_1").unwrap();
+
+        let turns = ledger
+            .begin_session_run("session_1", &run_id, "hello", true)
+            .unwrap();
+        assert!(turns.is_empty());
+        ledger.finish_session_run(&run_id, "hi").unwrap();
+
+        assert_eq!(ledger.latest_session_id().unwrap(), "session_1");
+        assert_eq!(
+            ledger.session_turns("session_1").unwrap(),
+            vec![SessionTurn {
+                question: "hello".into(),
+                final_answer: "hi".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn sqlite_session_begin_rejects_active_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+
+        ledger
+            .begin_session_run(
+                "session_1",
+                &RunId::new("run_active").unwrap(),
+                "hello",
+                true,
+            )
+            .unwrap();
+        let error = ledger
+            .begin_session_run(
+                "session_1",
+                &RunId::new("run_next").unwrap(),
+                "again",
+                false,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::SessionActive {
+                session_id,
+                run_id
+            } if session_id == "session_1" && run_id == "run_active"
+        ));
     }
 
     #[test]

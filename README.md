@@ -7,9 +7,10 @@ Plato Agent is the first application shell built on `platonic-core`.
 The bootstrap surface is intentionally small:
 
 - `plato "question"` runs one bounded CLI invocation and writes the run ledger to the default XDG SQLite path.
+- `plato -c "follow-up"` continues the latest workspace session from the SQLite ledger.
 - `plato --events <file> "question"` writes an explicit JSONL ledger.
 - `plato replay <file>` validates and prints a deterministic JSONL readback without network calls or tool execution.
-- `plato replay [--run <id>]` replays the default SQLite ledger; omitted `--run` selects the latest run.
+- `plato replay [--run <id>]` replays the default SQLite ledger; omitted `--run` selects the latest session.
 - `plato replay --db[=<path>] [--run <id>]` replays an explicit SQLite ledger.
 
 ## Configuration
@@ -57,11 +58,13 @@ as external side effects or secret access, or bypass workspace path checks.
 ## SQLite Ledgers
 
 - Bare `plato "..."` writes to the default XDG state path.
+- `plato -c "..."` continues the latest session from that store.
 - `--db` also writes to the default XDG state path.
 - `--db=<path>` writes to that SQLite file; relative paths resolve against the current workspace.
 - Use `=` for explicit paths because `--db` also has a bare default form.
 - Successful `--db` runs print `run_id`, `ledger_path`, and a replay command to stderr. Stdout remains only the final answer.
-- `plato replay` without arguments replays the latest run from the default XDG SQLite ledger.
+- `plato replay` without arguments replays the latest session from the default XDG SQLite ledger.
+- `plato replay --run <id>` replays a single run.
 - `--events <file>` is the explicit JSONL export/debug path.
 - If the workspace daemon lock is held, SQLite CLI run/replay paths fail closed instead of competing with the daemon-owned store.
 
@@ -168,8 +171,8 @@ specific transcript.
 
 Keys:
 
-- `Enter`: submit the composer to the daemon (`run.start`, then `message.append`
-  while a run is active).
+- `Enter`: submit the composer to the daemon. A session can have only one
+  active run.
 - `g` / `d`: grant or deny the focused approval request.
 - `Ctrl-C`: request `run.cancel` for the active run; a second `Ctrl-C` exits the
   TUI. Exiting the TUI does not stop the daemon.
@@ -180,6 +183,7 @@ Keys:
 
 ```bash
 cargo run --bin plato -- "read README.md and summarize it"
+cargo run --bin plato -- -c "what did you just summarize?"
 cargo run --bin plato -- --yolo "write local-proof.txt with hello from Plato"
 cargo run --bin plato -- replay
 cargo run --bin plato -- replay events.jsonl

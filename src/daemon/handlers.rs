@@ -1,5 +1,5 @@
 use crate::{
-    ApprovalMode, RunLedger, RunOptions,
+    ApprovalMode, RunLedger, RunOptions, RunSession,
     daemon::{
         protocol::{
             ApprovalDecideParams, CommandAcceptedResult, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
@@ -11,7 +11,7 @@ use crate::{
         },
         runtime::{DaemonRuntime, RunRecord, approval_handler},
     },
-    new_run_id, replay_sqlite, run_question,
+    new_run_id, new_session_id, replay_sqlite, replay_sqlite_session, run_question,
     tools::ApprovalOutcome,
 };
 use platonic_core::RecordedEvent;
@@ -148,6 +148,9 @@ fn handle_run_start(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
         request.id,
         "run.start",
         params.question,
+        RunSession::Fresh {
+            session_id: new_session_id(),
+        },
         params.config_path,
         params.wait,
     )
@@ -158,11 +161,26 @@ fn handle_message_append(runtime: &DaemonRuntime, request: Envelope) -> Envelope
         Ok(params) => params,
         Err(error) => return *error,
     };
+    let session_id = match params.session_id {
+        Some(session_id) => session_id,
+        None => match latest_session_id(runtime) {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                return Envelope::error(
+                    request.id,
+                    Some("message.append".into()),
+                    ERROR_NOT_FOUND,
+                    error,
+                );
+            }
+        },
+    };
     start_run(
         runtime,
         request.id,
         "message.append",
         params.message,
+        RunSession::Continue { session_id },
         params.config_path,
         params.wait,
     )
@@ -173,9 +191,19 @@ fn start_run(
     request_id: Option<String>,
     method: &'static str,
     question: String,
+    session: RunSession,
     config_path: Option<String>,
     wait: Option<bool>,
 ) -> Envelope {
+    let session_id = session.session_id().to_string();
+    if let Some(active_run_id) = active_run_id(runtime, &session_id) {
+        return Envelope::error(
+            request_id,
+            Some(method.into()),
+            ERROR_OVERLOAD,
+            format!("session already has an active run: {session_id} ({active_run_id})"),
+        );
+    }
     let run_id = match new_run_id() {
         Ok(run_id) => run_id,
         Err(error) => {
@@ -190,6 +218,7 @@ fn start_run(
     let run_id_string = run_id.to_string();
     let record = Arc::new(RunRecord::new(
         run_id_string.clone(),
+        session_id,
         runtime.paths.ledger_path.clone(),
     ));
     runtime
@@ -207,6 +236,7 @@ fn start_run(
         workspace_root: runtime.paths.workspace_root.clone(),
         approval_mode: ApprovalMode::external("daemon", approval_handler(record.clone())),
         run_id: Some(run_id),
+        session: Some(session),
         event_sender: Some(event_sender),
         cancel: Some(record.cancel.clone()),
     };
@@ -405,23 +435,33 @@ fn handle_transcript_read(runtime: &DaemonRuntime, request: Envelope) -> Envelop
         Ok(params) => params,
         Err(error) => return *error,
     };
-    let run_id = match params.run_id.or(params.session_id) {
-        Some(run_id) => run_id,
-        None => {
-            return Envelope::error(
-                request.id,
-                Some("transcript.read".into()),
-                ERROR_MALFORMED_REQUEST,
-                "run_id or session_id is required",
-            );
-        }
+    let (transcript_id, transcript) = if let Some(run_id) = params.run_id {
+        (
+            run_id.clone(),
+            replay_sqlite(&runtime.paths.ledger_path, Some(&run_id)),
+        )
+    } else if let Some(session_id) = params.session_id {
+        (
+            session_id.clone(),
+            replay_sqlite_session(&runtime.paths.ledger_path, &session_id),
+        )
+    } else {
+        return Envelope::error(
+            request.id,
+            Some("transcript.read".into()),
+            ERROR_MALFORMED_REQUEST,
+            "run_id or session_id is required",
+        );
     };
-    match replay_sqlite(&runtime.paths.ledger_path, Some(&run_id)) {
+    match transcript {
         Ok(transcript) => Envelope::response(
             request.id,
             Some("transcript.read".into()),
-            to_value(TranscriptReadResult { run_id, transcript })
-                .expect("transcript.read result serializes"),
+            to_value(TranscriptReadResult {
+                run_id: transcript_id,
+                transcript,
+            })
+            .expect("transcript.read result serializes"),
         ),
         Err(error) => Envelope::error(
             request.id,
@@ -430,6 +470,29 @@ fn handle_transcript_read(runtime: &DaemonRuntime, request: Envelope) -> Envelop
             error.to_string(),
         ),
     }
+}
+
+fn latest_session_id(runtime: &DaemonRuntime) -> Result<String, String> {
+    crate::ledger::latest_sqlite_session_id(&runtime.paths.ledger_path).map_err(|error| match error
+    {
+        crate::AppError::NoSqliteSessions | crate::AppError::NoSqliteRuns => {
+            "no previous session exists".into()
+        }
+        error => error.to_string(),
+    })
+}
+
+fn active_run_id(runtime: &DaemonRuntime, session_id: &str) -> Option<String> {
+    runtime
+        .runs
+        .lock()
+        .expect("runs lock poisoned")
+        .values()
+        .find(|record| {
+            record.session_id == session_id
+                && record.status().state == crate::daemon::runtime::RunStateName::Running
+        })
+        .map(|record| record.run_id.clone())
 }
 
 fn decode_params<T: serde::de::DeserializeOwned>(
