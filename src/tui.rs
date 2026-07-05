@@ -384,7 +384,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Paragraph::new(vec![
             Line::from(composer),
             Line::from(
-                "Enter submits. g grants approval. d denies. Ctrl-C cancels active run; second quits.",
+                "Type text. Enter submits. r reconnects if disconnected. q exits empty composer. Ctrl-C cancels.",
             ),
         ])
         .block(Block::default().borders(Borders::ALL).title("Composer")),
@@ -551,6 +551,8 @@ mod tests {
 
         assert!(output.contains("daemon unavailable"));
         assert!(output.contains("cargo run --bin plato-agentd"));
+        assert!(output.contains("r reconnects if disconnected"));
+        assert!(output.contains("q exits empty composer"));
         assert!(output.contains("Ctrl-C cancels"));
     }
 
