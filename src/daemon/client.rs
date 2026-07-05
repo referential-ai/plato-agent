@@ -1,7 +1,8 @@
 use crate::{
     AppError, AppResult,
     daemon::protocol::{
-        Envelope, EnvelopeKind, HelloParams, HelloResult, PROTOCOL_VERSION, SessionSummary,
+        Envelope, EnvelopeKind, EventsStreamParams, EventsStreamResult, HelloParams, HelloResult,
+        MessageAppendParams, PROTOCOL_VERSION, RunStartParams, RunStartResult, SessionSummary,
         SessionsListResult, TranscriptReadParams, TranscriptReadResult,
     },
     paths,
@@ -54,6 +55,55 @@ impl DaemonClient {
             TranscriptReadParams {
                 run_id: Some(run_id.into()),
                 session_id: None,
+            },
+        )
+    }
+
+    pub fn run_start(
+        &mut self,
+        question: String,
+        config_path: Option<String>,
+        wait: bool,
+    ) -> AppResult<RunStartResult> {
+        self.request(
+            "run.start",
+            RunStartParams {
+                question,
+                config_path,
+                wait: Some(wait),
+            },
+        )
+    }
+
+    pub fn message_append(
+        &mut self,
+        message: String,
+        config_path: Option<String>,
+        wait: bool,
+    ) -> AppResult<RunStartResult> {
+        self.request(
+            "message.append",
+            MessageAppendParams {
+                message,
+                session_id: None,
+                config_path,
+                wait: Some(wait),
+            },
+        )
+    }
+
+    pub fn events_stream(
+        &mut self,
+        run_id: &str,
+        from_offset: u64,
+        limit: usize,
+    ) -> AppResult<EventsStreamResult> {
+        self.request(
+            "events.stream",
+            EventsStreamParams {
+                run_id: run_id.into(),
+                from_offset: Some(from_offset),
+                limit: Some(limit),
             },
         )
     }
@@ -261,6 +311,70 @@ mod tests {
         handle.join().unwrap();
 
         assert!(error.to_string().contains("not_found: missing"));
+    }
+
+    #[test]
+    fn client_sends_run_start_and_events_stream_requests() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let run_start = read_request(&mut reader);
+            assert_eq!(run_start.method.as_deref(), Some("run.start"));
+            assert_eq!(
+                run_start.params.as_ref().unwrap()["question"],
+                "summarize this"
+            );
+            assert_eq!(run_start.params.as_ref().unwrap()["wait"], false);
+            write_response(
+                &mut writer,
+                run_start.id,
+                "run.start",
+                json!({
+                    "run_id": "run_1",
+                    "session_id": "run_1",
+                    "ledger_path": "/tmp/agent.db",
+                    "status": "running",
+                    "final_answer": null
+                }),
+            );
+
+            let events = read_request(&mut reader);
+            assert_eq!(events.method.as_deref(), Some("events.stream"));
+            assert_eq!(events.params.as_ref().unwrap()["run_id"], "run_1");
+            assert_eq!(events.params.as_ref().unwrap()["from_offset"], 2);
+            assert_eq!(events.params.as_ref().unwrap()["limit"], 16);
+            write_response(
+                &mut writer,
+                events.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 2,
+                    "next_offset": 3,
+                    "status": "running",
+                    "events": [{
+                        "offset": 2,
+                        "event": {"kind": "test"}
+                    }]
+                }),
+            );
+        });
+
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        let run = client
+            .run_start("summarize this".into(), Some("plato.toml".into()), false)
+            .unwrap();
+        let events = client.events_stream(&run.run_id, 2, 16).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(run.run_id, "run_1");
+        assert_eq!(events.next_offset, 3);
+        assert_eq!(events.events.len(), 1);
     }
 
     fn read_request(reader: &mut BufReader<UnixStream>) -> Envelope {
