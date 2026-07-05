@@ -2,6 +2,8 @@
 
 Plato Agent is the first application shell built on `platonic-core`.
 
+**New here? Start with [docs/QUICKSTART.md](docs/QUICKSTART.md) — build, run, and test in five minutes.**
+
 The bootstrap surface is intentionally small:
 
 - `plato "question"` runs one bounded CLI invocation and writes `events.jsonl`.
