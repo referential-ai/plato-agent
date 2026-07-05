@@ -7,6 +7,7 @@ pub mod error;
 pub mod ledger;
 pub mod model;
 pub mod paths;
+pub mod provider;
 pub mod replay;
 pub mod tool_catalog;
 pub mod tools;

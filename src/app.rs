@@ -2,10 +2,8 @@ use crate::{
     AppError, AppResult,
     config::{Config, ProviderKind},
     ledger::EventRecorder,
-    model::{
-        ModelMessage, ModelRequest, ModelResponse, ModelStop, OpenAiCompatibleClient,
-        TokenLimitField, system_prompt,
-    },
+    model::{ModelMessage, ModelRequest, ModelResponse, ModelStop, system_prompt},
+    provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
     tool_catalog::{effect_for_tool, tool_specs},
     tools::{ApprovalOutcome, ask_for_approval, execute_tool},
 };
