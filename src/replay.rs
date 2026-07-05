@@ -101,7 +101,12 @@ fn format_session_readback(session: &ledger::SessionRecords) -> AppResult<String
 mod tests {
     use super::*;
     use crate::ledger::SqliteLedger;
-    use platonic_core::{AgentId, HarnessEvent, RunId};
+    use platonic_core::{
+        ActorId, AgentId, ContextPack, EffectClass, HarnessEvent, Message, MessageRole, ModelName,
+        ModelUsage, PolicyDecision, ResultVisibility, RunId, ToolCall, ToolCallId, ToolName,
+        ToolProposal, ToolResult, TurnId,
+    };
+    use serde_json::json;
 
     #[test]
     fn sqlite_replay_without_run_reads_latest_session() {
@@ -174,6 +179,190 @@ mod tests {
         assert!(replay.contains("run_id: run_1"));
         assert!(replay.contains("run_id: run_2"));
         assert_eq!(replay.matches("final_phase: Failed").count(), 2);
+    }
+
+    #[test]
+    fn replay_shows_shell_exec_success_path() {
+        let run_id = RunId::new("run_1").unwrap();
+        let call_id = ToolCallId::new("call_1").unwrap();
+        let mut records = shell_tool_prefix(&run_id, &call_id);
+        records.extend([
+            record(
+                5,
+                HarnessEvent::PolicyEvaluated {
+                    run_id: run_id.clone(),
+                    call_id: call_id.clone(),
+                    decision: PolicyDecision::RequireApproval {
+                        reason: "shell.exec requires explicit local approval".into(),
+                    },
+                },
+            ),
+            record(
+                6,
+                HarnessEvent::ApprovalGranted {
+                    run_id: run_id.clone(),
+                    call_id: call_id.clone(),
+                    actor_id: ActorId::new("stdin").unwrap(),
+                },
+            ),
+            record(
+                7,
+                HarnessEvent::ToolStarted {
+                    run_id: run_id.clone(),
+                    call_id: call_id.clone(),
+                },
+            ),
+            record(
+                8,
+                HarnessEvent::ToolFinished {
+                    run_id: run_id.clone(),
+                    result: ToolResult {
+                        call_id: call_id.clone(),
+                        summary: "shell.exec exited 0 in 1ms".into(),
+                        data: json!({"exit_code": 0}),
+                        artifacts: vec![],
+                        visibility: ResultVisibility::Both,
+                    },
+                },
+            ),
+            record(9, HarnessEvent::RunFinished { run_id }),
+        ]);
+        let readback = RunReadback::from_events(&records).unwrap();
+
+        let replay = format_readback(&readback);
+
+        assert!(replay.contains("tool_call shell.exec"));
+        assert!(replay.contains("approval_granted call_1 by stdin"));
+        assert!(replay.contains("tool_result call_1: shell.exec exited 0"));
+        assert!(replay.contains("final_phase: Finished"));
+    }
+
+    #[test]
+    fn replay_shows_shell_exec_failure_path() {
+        let run_id = RunId::new("run_1").unwrap();
+        let call_id = ToolCallId::new("call_1").unwrap();
+        let mut records = shell_tool_prefix(&run_id, &call_id);
+        records.extend([
+            record(
+                5,
+                HarnessEvent::PolicyEvaluated {
+                    run_id: run_id.clone(),
+                    call_id: call_id.clone(),
+                    decision: PolicyDecision::RequireApproval {
+                        reason: "shell.exec requires explicit local approval".into(),
+                    },
+                },
+            ),
+            record(
+                6,
+                HarnessEvent::ApprovalGranted {
+                    run_id: run_id.clone(),
+                    call_id: call_id.clone(),
+                    actor_id: ActorId::new("stdin").unwrap(),
+                },
+            ),
+            record(
+                7,
+                HarnessEvent::ToolStarted {
+                    run_id: run_id.clone(),
+                    call_id: call_id.clone(),
+                },
+            ),
+            record(
+                8,
+                HarnessEvent::ToolFailed {
+                    run_id: run_id.clone(),
+                    call_id,
+                    reason: "shell.exec timed out after 1s".into(),
+                },
+            ),
+            record(
+                9,
+                HarnessEvent::RunFailed {
+                    run_id,
+                    reason: "shell.exec timed out after 1s".into(),
+                },
+            ),
+        ]);
+        let readback = RunReadback::from_events(&records).unwrap();
+
+        let replay = format_readback(&readback);
+
+        assert!(replay.contains("tool_failed call_1: shell.exec timed out after 1s"));
+        assert!(replay.contains("final_phase: Failed"));
+    }
+
+    fn shell_call(call_id: ToolCallId) -> ToolCall {
+        ToolCall {
+            id: call_id,
+            tool: ToolName::new("shell.exec").unwrap(),
+            effect: EffectClass::ExternalSideEffect,
+            input: json!({"command": "cargo test"}),
+        }
+    }
+
+    fn shell_tool_prefix(
+        run_id: &RunId,
+        call_id: &ToolCallId,
+    ) -> Vec<platonic_core::RecordedEvent> {
+        let turn_id = TurnId::new("turn_1").unwrap();
+        vec![
+            record(
+                0,
+                HarnessEvent::RunStarted {
+                    run_id: run_id.clone(),
+                    agent_id: AgentId::new("plato").unwrap(),
+                },
+            ),
+            record(
+                1,
+                HarnessEvent::ContextBuilt {
+                    run_id: run_id.clone(),
+                    turn_id: turn_id.clone(),
+                    context: ContextPack {
+                        token_budget: 4000,
+                        fragments: vec![],
+                    },
+                },
+            ),
+            record(
+                2,
+                HarnessEvent::ModelRequested {
+                    run_id: run_id.clone(),
+                    turn_id: turn_id.clone(),
+                    step: 0,
+                    model: ModelName::new("test-model").unwrap(),
+                },
+            ),
+            record(
+                3,
+                HarnessEvent::ModelResponded {
+                    run_id: run_id.clone(),
+                    turn_id: turn_id.clone(),
+                    step: 0,
+                    output: Message {
+                        role: MessageRole::Assistant,
+                        content: String::new(),
+                    },
+                    proposed_calls: vec![ToolProposal {
+                        tool: ToolName::new("shell.exec").unwrap(),
+                        input: json!({"command": "cargo test"}),
+                    }],
+                    usage: ModelUsage {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                    },
+                },
+            ),
+            record(
+                4,
+                HarnessEvent::ToolCallProposed {
+                    run_id: run_id.clone(),
+                    turn_id,
+                    call: shell_call(call_id.clone()),
+                },
+            ),
+        ]
     }
 
     fn record(seq: u64, event: HarnessEvent) -> platonic_core::RecordedEvent {

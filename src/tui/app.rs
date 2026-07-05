@@ -902,6 +902,7 @@ mod tests {
             effect: "WorkspaceWrite".into(),
             reason: "requires approval".into(),
             input_preview: "{}".into(),
+            approval_preview: None,
             diff_preview: None,
         });
 
@@ -926,6 +927,7 @@ mod tests {
             effect: "WorkspaceWrite".into(),
             reason: "requires approval".into(),
             input_preview: "{}".into(),
+            approval_preview: None,
             diff_preview: None,
         });
 

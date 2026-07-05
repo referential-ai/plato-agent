@@ -1,20 +1,45 @@
-use crate::tool_catalog::{FILE_EDIT, FILE_LIST, FILE_READ, FILE_WRITE};
+use crate::tool_catalog::{FILE_EDIT, FILE_LIST, FILE_READ, FILE_WRITE, SHELL_EXEC};
 use crate::{AppError, AppResult};
 use platonic_core::{ResultVisibility, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs,
-    io::{self, ErrorKind, Write},
+    env, fs,
+    io::{self, ErrorKind, Read, Write},
     path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 const MAX_READ_BYTES: usize = 64 * 1024;
 const MAX_LIST_ENTRIES: usize = 200;
 const MAX_LIST_DATA_BYTES: usize = 32 * 1024;
+const SHELL_OUTPUT_BYTES: usize = 32 * 1024;
+const SHELL_OUTPUT_TRUNCATED_MARKER: &str = "\n... output truncated";
+const SHELL_DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+const SHELL_MAX_TIMEOUT_SECONDS: u64 = 600;
 const APPROVAL_PREVIEW_CHARS: usize = 1_000;
 const DIFF_PREVIEW_CHARS: usize = 16 * 1024;
 const DIFF_TRUNCATED_MARKER: &str = "... diff truncated";
+const SHELL_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "COLORTERM",
+    "NO_COLOR",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,10 +60,34 @@ struct FileContentInput {
     content: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShellExecInput {
+    command: String,
+    timeout_seconds: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApprovalOutcome {
     Granted,
     Denied { reason: String },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ToolExecutionContext<'a> {
+    pub workspace_root: &'a Path,
+    pub provider_api_key_env: Option<&'a str>,
+    pub cancel: Option<&'a AtomicBool>,
+}
+
+impl<'a> ToolExecutionContext<'a> {
+    pub fn new(workspace_root: &'a Path) -> Self {
+        Self {
+            workspace_root,
+            provider_api_key_env: None,
+            cancel: None,
+        }
+    }
 }
 
 pub fn execute_tool(
@@ -47,17 +96,36 @@ pub fn execute_tool(
     tool_name: &str,
     input: Value,
 ) -> AppResult<ToolResult> {
+    execute_tool_with_context(
+        ToolExecutionContext::new(workspace_root),
+        call_id,
+        tool_name,
+        input,
+    )
+}
+
+pub fn execute_tool_with_context(
+    context: ToolExecutionContext<'_>,
+    call_id: platonic_core::ToolCallId,
+    tool_name: &str,
+    input: Value,
+) -> AppResult<ToolResult> {
     match tool_name {
-        FILE_READ => read_file(workspace_root, call_id, input),
-        FILE_LIST => list_directory(workspace_root, call_id, input),
-        FILE_WRITE => write_file(workspace_root, call_id, input),
-        FILE_EDIT => edit_file(workspace_root, call_id, input),
+        FILE_READ => read_file(context.workspace_root, call_id, input),
+        FILE_LIST => list_directory(context.workspace_root, call_id, input),
+        FILE_WRITE => write_file(context.workspace_root, call_id, input),
+        FILE_EDIT => edit_file(context.workspace_root, call_id, input),
+        SHELL_EXEC => shell_exec(context, call_id, input),
         _ => Err(AppError::Tool(format!("unknown tool: {tool_name}"))),
     }
 }
 
-pub fn ask_for_approval(tool_name: &str, input: &Value) -> AppResult<ApprovalOutcome> {
-    eprint!("{}", approval_prompt(tool_name, input));
+pub fn ask_for_approval(
+    tool_name: &str,
+    input: &Value,
+    approval_preview: Option<&str>,
+) -> AppResult<ApprovalOutcome> {
+    eprint!("{}", approval_prompt(tool_name, input, approval_preview));
     io::stderr().flush()?;
 
     let mut line = String::new();
@@ -94,6 +162,30 @@ pub fn approval_diff_preview(
         &current,
         &input.content,
         DIFF_PREVIEW_CHARS,
+    ))
+}
+
+pub fn approval_command_preview(
+    workspace_root: &Path,
+    tool_name: &str,
+    input: &Value,
+    provider_api_key_env: Option<&str>,
+) -> Option<String> {
+    if tool_name != SHELL_EXEC {
+        return None;
+    }
+
+    let input: ShellExecInput = serde_json::from_value(input.clone()).ok()?;
+    let timeout_seconds = normalize_timeout_seconds(input.timeout_seconds);
+    let cwd = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let provider = provider_api_key_env.unwrap_or("configured provider key");
+    Some(format!(
+        "command: {}\ncwd: {}\ntimeout: {}s\neffect: ExternalSideEffect\nenv: scrubbed allowlist; credential-like names and {provider} removed",
+        input.command,
+        cwd.display(),
+        timeout_seconds
     ))
 }
 
@@ -223,6 +315,168 @@ fn edit_file(
     })
 }
 
+fn shell_exec(
+    context: ToolExecutionContext<'_>,
+    call_id: platonic_core::ToolCallId,
+    input: Value,
+) -> AppResult<ToolResult> {
+    let input: ShellExecInput = serde_json::from_value(input)?;
+    if input.command.trim().is_empty() {
+        return Err(AppError::Tool("shell.exec command is empty".into()));
+    }
+    let timeout_seconds = normalize_timeout_seconds(input.timeout_seconds);
+    let cwd = context.workspace_root.canonicalize()?;
+    let env = shell_child_env(context.provider_api_key_env);
+    let started = Instant::now();
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&input.command)
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::Tool("shell.exec stdout pipe unavailable".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::Tool("shell.exec stderr pipe unavailable".into()))?;
+    let stdout_reader = thread::spawn(move || read_capped_output(stdout, SHELL_OUTPUT_BYTES));
+    let stderr_reader = thread::spawn(move || read_capped_output(stderr, SHELL_OUTPUT_BYTES));
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let mut timed_out = false;
+    let mut canceled = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if context
+            .cancel
+            .is_some_and(|cancel| cancel.load(Ordering::SeqCst))
+        {
+            canceled = true;
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = join_output_reader(stdout_reader)?;
+    let stderr = join_output_reader(stderr_reader)?;
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    if timed_out {
+        return Err(AppError::Tool(format!(
+            "shell.exec timed out after {timeout_seconds}s"
+        )));
+    }
+    if canceled {
+        return Err(AppError::Tool("shell.exec canceled".into()));
+    }
+
+    let exit_code = status.code();
+    let exit_label = exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "signal".into());
+    Ok(ToolResult {
+        call_id,
+        summary: format!("shell.exec exited {exit_label} in {duration_ms}ms"),
+        data: json!({
+            "command": input.command,
+            "cwd": cwd.to_string_lossy(),
+            "exit_code": exit_code,
+            "timed_out": false,
+            "duration_ms": duration_ms,
+            "stdout": stdout.text,
+            "stderr": stderr.text,
+            "stdout_truncated": stdout.truncated,
+            "stderr_truncated": stderr.truncated
+        }),
+        artifacts: vec![],
+        visibility: ResultVisibility::Both,
+    })
+}
+
+fn normalize_timeout_seconds(timeout_seconds: Option<u64>) -> u64 {
+    timeout_seconds
+        .unwrap_or(SHELL_DEFAULT_TIMEOUT_SECONDS)
+        .clamp(1, SHELL_MAX_TIMEOUT_SECONDS)
+}
+
+fn shell_child_env(provider_api_key_env: Option<&str>) -> Vec<(String, String)> {
+    shell_child_env_from(env::vars(), provider_api_key_env)
+}
+
+fn shell_child_env_from(
+    vars: impl IntoIterator<Item = (String, String)>,
+    provider_api_key_env: Option<&str>,
+) -> Vec<(String, String)> {
+    vars.into_iter()
+        .filter(|(name, _)| SHELL_ENV_ALLOWLIST.contains(&name.as_str()))
+        .filter(|(name, _)| !is_credential_env_name(name))
+        .filter(|(name, _)| provider_api_key_env != Some(name.as_str()))
+        .collect()
+}
+
+fn is_credential_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH"]
+        .iter()
+        .any(|needle| upper.contains(needle))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CappedOutput {
+    text: String,
+    truncated: bool,
+}
+
+fn read_capped_output(mut reader: impl Read, max_bytes: usize) -> io::Result<CappedOutput> {
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        if remaining == 0 {
+            truncated = true;
+            continue;
+        }
+        let take = remaining.min(read);
+        bytes.extend_from_slice(&buffer[..take]);
+        if take < read {
+            truncated = true;
+        }
+    }
+
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str(SHELL_OUTPUT_TRUNCATED_MARKER);
+    }
+    Ok(CappedOutput { text, truncated })
+}
+
+fn join_output_reader(
+    reader: thread::JoinHandle<io::Result<CappedOutput>>,
+) -> AppResult<CappedOutput> {
+    reader
+        .join()
+        .map_err(|_| AppError::Tool("shell.exec output reader panicked".into()))?
+        .map_err(AppError::from)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct ListEntry {
     name: String,
@@ -307,7 +561,7 @@ fn truncate_utf8(content: &str, max_bytes: usize) -> &str {
     &content[..boundary]
 }
 
-fn approval_preview(input: &Value) -> String {
+fn approval_preview_json(input: &Value) -> String {
     let input = input.to_string();
     if input.chars().count() <= APPROVAL_PREVIEW_CHARS {
         return input;
@@ -320,8 +574,12 @@ fn approval_preview(input: &Value) -> String {
     format!("{truncated}...(truncated)")
 }
 
-fn approval_prompt(tool_name: &str, input: &Value) -> String {
-    let preview = approval_preview(input);
+fn approval_prompt(tool_name: &str, input: &Value, approval_preview: Option<&str>) -> String {
+    if let Some(approval_preview) = approval_preview {
+        return format!("Approve {tool_name}?\n{approval_preview}\n[y/N] ");
+    }
+
+    let preview = approval_preview_json(input);
     format!("Approve {tool_name} {preview}? [y/N] ")
 }
 
@@ -824,10 +1082,185 @@ mod tests {
 
     #[test]
     fn stdin_approval_prompt_keeps_json_preview_for_file_edit() {
-        let prompt = approval_prompt(FILE_EDIT, &json!({"path": "note.txt", "content": "new\n"}));
+        let prompt = approval_prompt(
+            FILE_EDIT,
+            &json!({"path": "note.txt", "content": "new\n"}),
+            None,
+        );
 
         assert!(prompt.contains(r#""path":"note.txt""#));
         assert!(prompt.contains(r#""content":"new\n""#));
         assert!(!prompt.contains("--- a/note.txt"));
+    }
+
+    #[test]
+    fn shell_approval_preview_includes_command_cwd_timeout_effect_and_env_posture() {
+        let dir = tempfile::tempdir().unwrap();
+        let preview = approval_command_preview(
+            dir.path(),
+            SHELL_EXEC,
+            &json!({"command": "cargo test", "timeout_seconds": 700}),
+            Some("OPENROUTER_API_KEY"),
+        )
+        .unwrap();
+
+        assert!(preview.contains("command: cargo test"));
+        assert!(preview.contains(&format!(
+            "cwd: {}",
+            dir.path().canonicalize().unwrap().display()
+        )));
+        assert!(preview.contains("timeout: 600s"));
+        assert!(preview.contains("effect: ExternalSideEffect"));
+        assert!(preview.contains("env: scrubbed allowlist"));
+        assert!(preview.contains("OPENROUTER_API_KEY removed"));
+    }
+
+    #[test]
+    fn shell_timeout_defaults_and_clamps() {
+        assert_eq!(normalize_timeout_seconds(None), 120);
+        assert_eq!(normalize_timeout_seconds(Some(0)), 1);
+        assert_eq!(normalize_timeout_seconds(Some(10)), 10);
+        assert_eq!(normalize_timeout_seconds(Some(700)), 600);
+    }
+
+    #[test]
+    fn shell_env_keeps_only_allowlisted_non_credentials() {
+        let env = shell_child_env_from(
+            vec![
+                ("PATH".into(), "/bin".into()),
+                ("HOME".into(), "/home/user".into()),
+                ("OPENROUTER_API_KEY".into(), "secret".into()),
+                ("CARGO_AUTH_TOKEN".into(), "secret".into()),
+                ("HTTP_PROXY".into(), "http://proxy".into()),
+                ("RUSTUP_HOME".into(), "/rustup".into()),
+            ],
+            Some("OPENROUTER_API_KEY"),
+        );
+
+        assert_eq!(
+            env,
+            vec![
+                ("PATH".into(), "/bin".into()),
+                ("HOME".into(), "/home/user".into()),
+                ("RUSTUP_HOME".into(), "/rustup".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn capped_output_marks_truncation() {
+        let output = read_capped_output(io::Cursor::new(b"abcdef".to_vec()), 3).unwrap();
+
+        assert_eq!(output.text, format!("abc{SHELL_OUTPUT_TRUNCATED_MARKER}"));
+        assert!(output.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_runs_from_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            SHELL_EXEC,
+            json!({"command": "pwd"}),
+        )
+        .unwrap();
+
+        assert_eq!(result.data["exit_code"], 0);
+        let cwd = dir.path().canonicalize().unwrap();
+        assert_eq!(result.data["cwd"].as_str().unwrap(), cwd.to_string_lossy());
+        assert_eq!(
+            result.data["stdout"].as_str().unwrap().trim(),
+            cwd.to_string_lossy()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_records_nonzero_exit_as_finished_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            SHELL_EXEC,
+            json!({"command": "printf fail >&2; exit 7"}),
+        )
+        .unwrap();
+
+        assert_eq!(result.data["exit_code"], 7);
+        assert_eq!(result.data["stderr"], "fail");
+        assert_eq!(result.data["timed_out"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_caps_stdout_and_stderr_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            SHELL_EXEC,
+            json!({"command": "yes out | head -c 33000; yes err | head -c 33000 >&2"}),
+        )
+        .unwrap();
+
+        assert!(result.data["stdout"].as_str().unwrap().len() > SHELL_OUTPUT_BYTES);
+        assert!(result.data["stderr"].as_str().unwrap().len() > SHELL_OUTPUT_BYTES);
+        assert!(
+            result.data["stdout"]
+                .as_str()
+                .unwrap()
+                .contains(SHELL_OUTPUT_TRUNCATED_MARKER)
+        );
+        assert!(
+            result.data["stderr"]
+                .as_str()
+                .unwrap()
+                .contains(SHELL_OUTPUT_TRUNCATED_MARKER)
+        );
+        assert_eq!(result.data["stdout_truncated"], true);
+        assert_eq!(result.data["stderr_truncated"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            SHELL_EXEC,
+            json!({"command": "sleep 2", "timeout_seconds": 1}),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AppError::Tool(message) if message == "shell.exec timed out after 1s"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_observes_cancel_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let err = execute_tool_with_context(
+            ToolExecutionContext {
+                workspace_root: dir.path(),
+                provider_api_key_env: None,
+                cancel: Some(&cancel),
+            },
+            ToolCallId::new("call_1").unwrap(),
+            SHELL_EXEC,
+            json!({"command": "sleep 5"}),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AppError::Tool(message) if message == "shell.exec canceled"
+        ));
     }
 }

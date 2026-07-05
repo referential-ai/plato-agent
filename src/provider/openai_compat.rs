@@ -415,7 +415,7 @@ mod tests {
                         "id": "call_1",
                         "type": "function",
                         "function": {
-                            "name": "shell_exec",
+                            "name": "shell_delete",
                             "arguments": "{\"command\":\"pwd\"}"
                         }
                     }]
@@ -428,7 +428,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            AppError::Provider(message) if message == "provider returned unknown tool shell_exec"
+            AppError::Provider(message) if message == "provider returned unknown tool shell_delete"
         ));
     }
 

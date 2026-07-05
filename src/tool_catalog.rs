@@ -6,11 +6,13 @@ pub const FILE_READ: &str = "file.read";
 pub const FILE_LIST: &str = "file.list";
 pub const FILE_WRITE: &str = "file.write";
 pub const FILE_EDIT: &str = "file.edit";
+pub const SHELL_EXEC: &str = "shell.exec";
 
 const PROVIDER_FILE_READ: &str = "file_read";
 const PROVIDER_FILE_LIST: &str = "file_list";
 const PROVIDER_FILE_WRITE: &str = "file_write";
 const PROVIDER_FILE_EDIT: &str = "file_edit";
+const PROVIDER_SHELL_EXEC: &str = "shell_exec";
 
 const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
@@ -41,6 +43,13 @@ const BOOTSTRAP_TOOLS: &[ToolDefinition] = &[
         description: "Replace a workspace file with full proposed UTF-8 content after approval.",
         input_schema: ToolInputSchema::Write,
     },
+    ToolDefinition {
+        internal_name: SHELL_EXEC,
+        provider_name: PROVIDER_SHELL_EXEC,
+        effect: EffectClass::ExternalSideEffect,
+        description: "Run one approved shell command from the workspace root with a scrubbed environment.",
+        input_schema: ToolInputSchema::ShellExec,
+    },
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,6 +66,7 @@ enum ToolInputSchema {
     Read,
     List,
     Write,
+    ShellExec,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -163,6 +173,23 @@ impl ToolInputSchema {
                 "required": ["path", "content"],
                 "additionalProperties": false
             }),
+            Self::ShellExec => json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to run from the workspace root."
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Optional timeout in seconds. Defaults to 120 and is capped at 600.",
+                        "minimum": 1,
+                        "maximum": 600
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
         }
     }
 }
@@ -172,7 +199,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bootstrap_catalog_is_exactly_file_read_file_list_file_write_and_file_edit() {
+    fn bootstrap_catalog_includes_file_tools_and_shell_exec() {
         let actual = bootstrap_tools()
             .iter()
             .map(|tool| (tool.internal_name, tool.effect.clone()))
@@ -185,6 +212,7 @@ mod tests {
                 (FILE_LIST, EffectClass::ReadOnly),
                 (FILE_WRITE, EffectClass::WorkspaceWrite),
                 (FILE_EDIT, EffectClass::WorkspaceWrite),
+                (SHELL_EXEC, EffectClass::ExternalSideEffect),
             ]
         );
         assert!(
@@ -197,7 +225,7 @@ mod tests {
     #[test]
     fn unknown_tool_effect_fails_closed() {
         assert_eq!(
-            effect_for_tool("shell.exec"),
+            effect_for_tool("shell.delete"),
             EffectClass::ExternalSideEffect
         );
     }
@@ -209,12 +237,34 @@ mod tests {
             FILE_LIST.into(),
             FILE_WRITE.into(),
             FILE_EDIT.into(),
+            SHELL_EXEC.into(),
         ]);
 
-        assert_eq!(specs.len(), 4);
+        assert_eq!(specs.len(), 5);
         assert_eq!(specs[0].name, PROVIDER_FILE_READ);
         assert_eq!(specs[1].name, PROVIDER_FILE_LIST);
         assert_eq!(specs[2].name, PROVIDER_FILE_WRITE);
         assert_eq!(specs[3].name, PROVIDER_FILE_EDIT);
+        assert_eq!(specs[4].name, PROVIDER_SHELL_EXEC);
+        assert_eq!(
+            specs[4].input_schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to run from the workspace root."
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Optional timeout in seconds. Defaults to 120 and is capped at 600.",
+                        "minimum": 1,
+                        "maximum": 600
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            })
+        );
     }
 }

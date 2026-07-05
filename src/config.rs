@@ -299,7 +299,13 @@ mod tests {
         assert_eq!(config.limits.max_turns, 8);
         assert_eq!(
             config.tools.enabled,
-            vec!["file.read", "file.list", "file.write", "file.edit"]
+            vec![
+                "file.read",
+                "file.list",
+                "file.write",
+                "file.edit",
+                "shell.exec"
+            ]
         );
     }
 
@@ -339,7 +345,7 @@ mod tests {
             provider: None,
             limits: None,
             tools: Some(RawToolsConfig {
-                enabled: Some(vec!["shell.exec".into()]),
+                enabled: Some(vec!["shell.delete".into()]),
             }),
         };
 
@@ -347,7 +353,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            AppError::Config(message) if message == "unknown tool in tools.enabled: shell.exec"
+            AppError::Config(message) if message == "unknown tool in tools.enabled: shell.delete"
         ));
     }
 
