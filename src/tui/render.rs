@@ -198,6 +198,8 @@ fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalM
             Span::raw(approval.reason.clone()),
         ]),
         Line::from(""),
+        Line::from("g grant    d deny    Ctrl-C cancel run    q quit TUI"),
+        Line::from(""),
     ];
     if let Some(diff_preview) = &approval.diff_preview {
         lines.push(Line::from("diff preview:"));
@@ -206,10 +208,6 @@ fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalM
         lines.push(Line::from("input preview:"));
         lines.push(Line::from(approval.input_preview.clone()));
     }
-    lines.extend([
-        Line::from(""),
-        Line::from("g grant    d deny    Ctrl-C cancel run    q quit TUI"),
-    ]);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
@@ -461,6 +459,41 @@ mod tests {
         assert!(output.contains("-old"));
         assert!(output.contains("+new"));
         assert!(!output.contains("input preview:"));
+    }
+
+    #[test]
+    fn renders_approval_modal_controls_with_long_diff_preview() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+        let body = (0..40)
+            .map(|line| format!("-old-{line}\n+new-{line}\n"))
+            .collect::<String>();
+        state.approval = Some(ApprovalModalView {
+            run_id: "run_1".into(),
+            tool_call_id: "call_1".into(),
+            tool_name: "file.edit".into(),
+            effect: "WorkspaceWrite".into(),
+            reason: "file.edit requires approval".into(),
+            input_preview: r#"{"path":"scratch.txt"}"#.into(),
+            diff_preview: Some(format!("--- a/scratch.txt\n+++ b/scratch.txt\n{body}")),
+        });
+
+        let output = render_to_text(&state);
+
+        assert!(output.contains("g grant"));
+        assert!(output.contains("d deny"));
+        assert!(output.contains("diff preview"));
+        assert!(output.contains("--- a/scratch.txt"));
     }
 
     fn render_to_text(state: &TuiState) -> String {
