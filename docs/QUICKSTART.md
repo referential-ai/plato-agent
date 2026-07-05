@@ -1,0 +1,96 @@
+# Quickstart — run and test Plato
+
+Everything below is copy-pasteable. Companion docs: [`../README.md`](../README.md) (full reference), [`ARCHITECTURE.md`](ARCHITECTURE.md) (topology and law).
+
+## 0. One-time setup
+
+```bash
+cd ~/projects/platonic-workspace/plato-agent
+cargo build --locked                      # builds plato, plato-agentd, plato-tui
+export OPENROUTER_API_KEY="$(cat /path/to/your/openrouter-key)"
+export PATH="$PWD/target/debug:$PATH"     # so the binaries just work in this shell
+```
+
+Create `plato.toml` in the directory you want the agent to work in — that
+directory becomes its workspace and it cannot read or write outside it:
+
+```toml
+[provider]
+kind = "open_router"
+model = "~openai/gpt-latest"
+api_key_env = "OPENROUTER_API_KEY"
+
+[tools]
+enabled = ["file.read", "file.list", "file.write"]
+```
+
+## 1. First run (60-second smoke test)
+
+```bash
+plato "list the files here and summarize what this project is"
+plato replay events.jsonl        # audit exactly what it did
+```
+
+The answer prints to stdout; the complete run ledger lands in `events.jsonl`.
+
+## 2. Test the approval boundary
+
+```bash
+plato --events w1.jsonl "write hello.txt containing: hi from plato"
+# -> Approve file.write {...}? [y/N]   press Enter -> denied (default no)
+
+plato --yolo --events w2.jsonl "write hello.txt containing: hi from plato"
+# -> auto-approved; the ledger records actor "yolo"
+```
+
+Reads and listings never prompt. Writes always prompt unless `--yolo`.
+Nothing escapes the workspace: `../`, absolute paths, and symlinks out are refused.
+
+## 3. Durable runs (SQLite)
+
+```bash
+plato --db "read Cargo.toml and name the package"
+# stderr prints: run_id / ledger_path / the exact replay command
+plato replay --db                # replays the latest run
+```
+
+Explicit paths need the equals form: `--db=/tmp/run.db`.
+
+## 4. The full experience: daemon + TUI
+
+Two terminals, same workspace:
+
+```bash
+plato-agentd --workspace "$PWD"                       # terminal A
+plato-tui --workspace "$PWD" --config plato.toml      # terminal B
+```
+
+| Key | Does |
+| --- | --- |
+| type + Enter | start a run, or queue the next turn while one is active |
+| `g` / `d` | grant / deny in the approval modal |
+| Ctrl-C | first press cancels the active run; second quits the TUI |
+| `r` | reconnect (only when the header shows daemon unavailable) |
+| `q` / Esc | quit (`q` only with an empty composer, so it is typeable in words) |
+| Ctrl-U | clear the composer |
+
+Ctrl-C on the daemon shuts down cleanly (socket and lock removed).
+Quitting the TUI never stops the daemon.
+
+## 5. Run the test suite (no API key needed)
+
+```bash
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo fmt --check
+```
+
+## 6. Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| daemon lock held | a daemon is running or died hard: check the pid inside `agent.lock`; if dead, delete `agent.lock` and `agent.sock` |
+| `--db /path` ignored | use the equals form: `--db=/path` |
+| provider api key env is not set | re-export `OPENROUTER_API_KEY` in this shell |
+| ledger already exists | JSONL ledgers never overwrite — pass a fresh `--events` name |
+| run stops after 8 turns | by design: runs are bounded; ask a tighter question or start a new run |
