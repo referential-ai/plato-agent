@@ -1,6 +1,6 @@
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -82,48 +82,84 @@ fn run() -> AppResult<()> {
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
+            && !handle_key_press(
+                key,
+                &mut state,
+                &runtime,
+                &commands,
+                cli.run.clone(),
+                config_path.clone(),
+            )
         {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if !request_cancel(&commands, &mut state) {
-                        break;
-                    }
-                }
-                KeyCode::Char('r') => {
-                    state.status_message = Some("reconnecting".into());
-                    send_command(
-                        &commands,
-                        ClientCommand::Load {
-                            run_id: cli.run.clone(),
-                        },
-                        &mut state,
-                    );
-                }
-                KeyCode::Char('g') if state.approval.is_some() => {
-                    decide_approval(&commands, &mut state, ApprovalAction::Grant)
-                }
-                KeyCode::Char('d') if state.approval.is_some() => {
-                    decide_approval(&commands, &mut state, ApprovalAction::Deny)
-                }
-                KeyCode::Enter if state.approval.is_none() => {
-                    submit_composer(&commands, &mut state, &runtime, config_path.clone())
-                }
-                KeyCode::Backspace if state.approval.is_none() => {
-                    state.composer.pop();
-                }
-                KeyCode::Char('u')
-                    if state.approval.is_none()
-                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    state.composer.clear();
-                }
-                KeyCode::Char(ch) if state.approval.is_none() => state.composer.push(ch),
-                _ => {}
-            }
+            break;
         }
     }
     Ok(())
+}
+
+fn handle_key_press(
+    key: KeyEvent,
+    state: &mut TuiState,
+    runtime: &UiRuntime,
+    commands: &Sender<ClientCommand>,
+    initial_run_id: Option<String>,
+    config_path: Option<String>,
+) -> bool {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return request_cancel(commands, state);
+    }
+
+    if state.approval.is_some() {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Char('g') => decide_approval(commands, state, ApprovalAction::Grant),
+            KeyCode::Char('d') => decide_approval(commands, state, ApprovalAction::Deny),
+            _ => {}
+        }
+        return true;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+        state.composer.clear();
+        return true;
+    }
+
+    match key.code {
+        KeyCode::Esc => false,
+        KeyCode::Char('q') if state.composer.is_empty() => false,
+        KeyCode::Char('r') if is_disconnected(state) => {
+            reconnect(commands, state, initial_run_id);
+            true
+        }
+        KeyCode::Enter => {
+            submit_composer(commands, state, runtime, config_path);
+            true
+        }
+        KeyCode::Backspace => {
+            state.composer.pop();
+            true
+        }
+        KeyCode::Char(ch)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            state.composer.push(ch);
+            true
+        }
+        _ => true,
+    }
+}
+
+fn reconnect(commands: &Sender<ClientCommand>, state: &mut TuiState, run_id: Option<String>) {
+    state.status_message = Some("reconnecting".into());
+    send_command(commands, ClientCommand::Load { run_id }, state);
+}
+
+fn is_disconnected(state: &TuiState) -> bool {
+    matches!(
+        state.connection,
+        plato_agent::tui::ConnectionState::Disconnected { .. }
+    )
 }
 
 fn load_state(config: &DaemonConnectionConfig, run_id: Option<&str>) -> TuiState {
@@ -403,6 +439,7 @@ fn drain_client_events(
                     state.stream_warning = Some(error);
                 } else {
                     if is_connection_error(&error) {
+                        runtime.polling = false;
                         state.connection = plato_agent::tui::ConnectionState::Disconnected {
                             error: error.clone(),
                         };
@@ -479,7 +516,14 @@ fn apply_events_result(
         if let Some((call_id, input_preview)) =
             plato_agent::tui::tool_input_preview_from_event(&event)
         {
-            runtime.tool_inputs.insert(call_id, input_preview);
+            runtime
+                .tool_inputs
+                .insert(call_id.clone(), input_preview.clone());
+            if let Some(approval) = state.approval.as_mut()
+                && approval.tool_call_id == call_id
+            {
+                approval.input_preview = input_preview;
+            }
         }
         if let Some(approval) = plato_agent::tui::approval_from_event(
             &event,
@@ -711,6 +755,52 @@ mod tests {
     }
 
     #[test]
+    fn printable_r_is_composer_text_when_connected() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state);
+
+        for ch in "read write current target/current".chars() {
+            assert!(handle_key_press(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+                &mut state,
+                &runtime,
+                &sender,
+                None,
+                None,
+            ));
+        }
+
+        assert_eq!(state.composer, "read write current target/current");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn r_reconnects_from_disconnected_state() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.connection = plato_agent::tui::ConnectionState::Disconnected {
+            error: "connection closed".into(),
+        };
+        let runtime = UiRuntime::from_state(&state);
+
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+            Some("run_1".into()),
+            None,
+        ));
+
+        assert_eq!(state.status_message.as_deref(), Some("reconnecting"));
+        match receiver.try_recv().unwrap() {
+            ClientCommand::Load { run_id } => assert_eq!(run_id.as_deref(), Some("run_1")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn events_result_updates_live_state_and_requests_reload_on_finish() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
@@ -749,6 +839,99 @@ mod tests {
             ClientCommand::Load { run_id } => assert_eq!(run_id.as_deref(), Some("run_1")),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn stream_connection_failure_enters_disconnected_and_stops_polling() {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.active_run = Some(plato_agent::tui::ActiveRunView {
+            run_id: "run_1".into(),
+            status: "running".into(),
+        });
+        let mut runtime = UiRuntime {
+            active_run_id: Some("run_1".into()),
+            next_offset: 7,
+            poll_in_flight: true,
+            polling: true,
+            last_poll: Instant::now() - ACTIVE_POLL_INTERVAL,
+            tool_inputs: HashMap::new(),
+        };
+        event_sender
+            .send(ClientEvent::Failed {
+                context: "events.stream",
+                error: "io error: Connection refused (os error 111)".into(),
+            })
+            .unwrap();
+
+        drain_client_events(&mut state, &mut runtime, &event_receiver, &command_sender);
+        maybe_poll_events(&mut runtime, &command_sender);
+
+        assert!(!runtime.polling);
+        assert!(!runtime.poll_in_flight);
+        assert!(is_disconnected(&state));
+        assert!(command_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn approval_preview_updates_when_tool_input_arrives_after_request() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut state = test_state();
+        let mut runtime = UiRuntime {
+            active_run_id: Some("run_1".into()),
+            next_offset: 0,
+            poll_in_flight: true,
+            polling: true,
+            last_poll: Instant::now(),
+            tool_inputs: HashMap::new(),
+        };
+        let result = EventsStreamResult {
+            run_id: "run_1".into(),
+            from_offset: 0,
+            next_offset: 2,
+            status: "running".into(),
+            events: vec![
+                json!({
+                    "offset": 1,
+                    "event": {
+                        "kind": "approval_requested",
+                        "run_id": "run_1",
+                        "tool_call_id": "call_1",
+                        "tool_name": "file.write",
+                        "effect": "WorkspaceWrite",
+                        "reason": "file.write requires approval"
+                    }
+                }),
+                json!({
+                    "offset": 2,
+                    "event": {
+                        "kind": "ledger",
+                        "record": {
+                            "event": {
+                                "event": "tool_call_proposed",
+                                "call": {
+                                    "id": "call_1",
+                                    "tool": "file.write",
+                                    "effect": "WorkspaceWrite",
+                                    "input": {
+                                        "path": "scratch/tui-preview.txt",
+                                        "content": "preview body"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+            ],
+        };
+
+        apply_events_result(&mut state, &mut runtime, &sender, result);
+
+        let approval = state.approval.as_ref().expect("approval modal");
+        assert_eq!(approval.tool_call_id, "call_1");
+        assert!(approval.input_preview.contains("scratch/tui-preview.txt"));
+        assert!(approval.input_preview.contains("preview body"));
     }
 
     #[test]
