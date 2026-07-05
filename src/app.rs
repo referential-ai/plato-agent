@@ -5,7 +5,7 @@ use crate::{
     model::{ModelMessage, ModelRequest, ModelResponse, ModelStop, system_prompt},
     provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
     tool_catalog::{effect_for_tool, tool_specs},
-    tools::{ApprovalOutcome, ask_for_approval, execute_tool},
+    tools::{ApprovalOutcome, approval_diff_preview, ask_for_approval, execute_tool},
 };
 use platonic_core::{
     ActorId, AgentId, ContextFragment, ContextLane, ContextPack, EffectClass, HarnessEvent,
@@ -99,6 +99,7 @@ pub struct ApprovalRequest {
     pub tool_name: String,
     pub effect: EffectClass,
     pub reason: String,
+    pub diff_preview: Option<String>,
 }
 
 impl ApprovalMode {
@@ -383,6 +384,11 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                         tool_name: call.tool.to_string(),
                         effect: call.effect.clone(),
                         reason: reason.clone(),
+                        diff_preview: approval_diff_preview(
+                            &options.workspace_root,
+                            call.tool.as_str(),
+                            &call.input,
+                        ),
                     };
                     match (handler.decide)(request)? {
                         ApprovalOutcome::Granted => {
@@ -773,6 +779,21 @@ mod tests {
 
         assert!(matches!(
             evaluate_policy(&["file.write".into()], &call),
+            PolicyDecision::RequireApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn enabled_file_edit_requires_approval() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            tool: ToolName::new("file.edit").unwrap(),
+            effect: EffectClass::WorkspaceWrite,
+            input: json!({"path": "out.txt", "content": "hello"}),
+        };
+
+        assert!(matches!(
+            evaluate_policy(&["file.edit".into()], &call),
             PolicyDecision::RequireApproval { .. }
         ));
     }
