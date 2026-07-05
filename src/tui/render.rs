@@ -1,4 +1,3 @@
-use crate::daemon::protocol::{HelloResult, SessionSummary, TranscriptReadResult};
 use ratatui::{
     Frame, Terminal,
     backend::TestBackend,
@@ -7,221 +6,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
-use serde_json::Value;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TuiState {
-    pub workspace_root: String,
-    pub socket_path: String,
-    pub connection: ConnectionState,
-    pub sessions: Vec<SessionSummary>,
-    pub transcript: TranscriptState,
-    pub active_run: Option<ActiveRunView>,
-    pub live_events: Vec<LiveEventLine>,
-    pub composer: String,
-    pub status_message: Option<String>,
-    pub stream_warning: Option<String>,
-    pub approval: Option<ApprovalModalView>,
-    pub cancel_requested: bool,
-}
-
-impl TuiState {
-    pub fn connected(
-        workspace_root: String,
-        socket_path: String,
-        hello: HelloResult,
-        sessions: Vec<SessionSummary>,
-        transcript: TranscriptState,
-    ) -> Self {
-        Self {
-            workspace_root,
-            socket_path,
-            connection: ConnectionState::Connected {
-                workspace_id: hello.workspace_id,
-                daemon_version: hello.daemon_version,
-                ledger_path: hello.ledger_path,
-            },
-            sessions,
-            transcript,
-            active_run: None,
-            live_events: Vec::new(),
-            composer: String::new(),
-            status_message: None,
-            stream_warning: None,
-            approval: None,
-            cancel_requested: false,
-        }
-    }
-
-    pub fn disconnected(workspace_root: String, socket_path: String, error: String) -> Self {
-        Self {
-            workspace_root,
-            socket_path,
-            connection: ConnectionState::Disconnected { error },
-            sessions: Vec::new(),
-            transcript: TranscriptState::None,
-            active_run: None,
-            live_events: Vec::new(),
-            composer: String::new(),
-            status_message: None,
-            stream_warning: None,
-            approval: None,
-            cancel_requested: false,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ConnectionState {
-    Connected {
-        workspace_id: String,
-        daemon_version: String,
-        ledger_path: String,
-    },
-    Disconnected {
-        error: String,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TranscriptView {
-    pub run_id: String,
-    pub content: String,
-}
-
-impl From<TranscriptReadResult> for TranscriptView {
-    fn from(transcript: TranscriptReadResult) -> Self {
-        Self {
-            run_id: transcript.run_id,
-            content: transcript.transcript,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TranscriptState {
-    None,
-    Loaded(TranscriptView),
-    Unavailable { run_id: String, error: String },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ActiveRunView {
-    pub run_id: String,
-    pub status: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LiveEventLine {
-    pub offset: Option<u64>,
-    pub text: String,
-}
-
-impl LiveEventLine {
-    pub fn new(offset: Option<u64>, text: impl Into<String>) -> Self {
-        Self {
-            offset,
-            text: text.into(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ApprovalModalView {
-    pub run_id: String,
-    pub tool_call_id: String,
-    pub tool_name: String,
-    pub effect: String,
-    pub reason: String,
-    pub input_preview: String,
-}
-
-pub fn approval_from_event(
-    value: &Value,
-    input_preview: Option<String>,
-) -> Option<ApprovalModalView> {
-    let event = value.get("event").unwrap_or(value);
-    if event.get("kind").and_then(Value::as_str) != Some("approval_requested") {
-        return None;
-    }
-    Some(ApprovalModalView {
-        run_id: event.get("run_id")?.as_str()?.into(),
-        tool_call_id: event.get("tool_call_id")?.as_str()?.into(),
-        tool_name: event.get("tool_name")?.as_str()?.into(),
-        effect: event
-            .get("effect")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown effect")
-            .into(),
-        reason: event
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("approval required")
-            .into(),
-        input_preview: input_preview.unwrap_or_else(|| "input preview unavailable".into()),
-    })
-}
-
-pub fn tool_input_preview_from_event(value: &Value) -> Option<(String, String)> {
-    let event = value.get("event").unwrap_or(value);
-    if event.get("kind").and_then(Value::as_str) != Some("ledger")
-        || event.pointer("/record/event/event").and_then(Value::as_str)
-            != Some("tool_call_proposed")
-    {
-        return None;
-    }
-    let call_id = event
-        .pointer("/record/event/call/id")?
-        .as_str()?
-        .to_string();
-    let input = event.pointer("/record/event/call/input")?;
-    let preview =
-        serde_json::to_string_pretty(input).unwrap_or_else(|_| "input preview unavailable".into());
-    Some((call_id, truncate_preview(preview, 1200)))
-}
-
-pub fn live_event_line(value: &Value) -> LiveEventLine {
-    let offset = value.get("offset").and_then(Value::as_u64);
-    let event = value.get("event").unwrap_or(value);
-    let text = match event.get("kind").and_then(Value::as_str) {
-        Some("ledger") => ledger_event_line(event),
-        Some("approval_requested") => {
-            let tool_name = event
-                .get("tool_name")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown tool");
-            let effect = event
-                .get("effect")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown effect");
-            format!("approval pending {tool_name} ({effect})")
-        }
-        Some(kind) => kind.into(),
-        None => serde_json::to_string(event).unwrap_or_else(|_| "unrenderable event".into()),
-    };
-    LiveEventLine::new(offset, text)
-}
-
-fn ledger_event_line(event: &Value) -> String {
-    let event_name = event
-        .pointer("/record/event/event")
-        .and_then(Value::as_str)
-        .unwrap_or("ledger event");
-    match event_name {
-        "model_responded" => "assistant response".into(),
-        "tool_call_proposed" => {
-            let tool = event
-                .pointer("/record/event/call/tool")
-                .and_then(Value::as_str)
-                .unwrap_or("tool");
-            format!("tool proposed {tool}")
-        }
-        "tool_finished" => "tool finished".into(),
-        "run_finished" => "run finished".into(),
-        "run_failed" => "run failed".into(),
-        other => other.replace('_', " "),
-    }
-}
+use super::{ApprovalModalView, ConnectionState, TranscriptState, TuiState};
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     let [header, body, events, footer] = vertical(frame.area());
@@ -445,15 +231,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn truncate_preview(mut preview: String, max_chars: usize) -> String {
-    if preview.chars().count() <= max_chars {
-        return preview;
-    }
-    preview = preview.chars().take(max_chars).collect();
-    preview.push_str("\n... truncated");
-    preview
-}
-
 fn vertical(area: Rect) -> [Rect; 4] {
     Layout::default()
         .direction(Direction::Vertical)
@@ -476,6 +253,9 @@ fn horizontal(area: Rect) -> [Rect; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::protocol::{HelloResult, SessionSummary, TranscriptReadResult};
+
+    use super::super::{ActiveRunView, LiveEventLine};
 
     #[test]
     fn renders_connected_sessions_and_transcript() {
@@ -607,83 +387,6 @@ mod tests {
 
         assert!(output.contains("stream warning"));
         assert!(output.contains("lagged"));
-    }
-
-    #[test]
-    fn formats_daemon_event_lines() {
-        let approval = live_event_line(&serde_json::json!({
-            "offset": 4,
-            "event": {
-                "kind": "approval_requested",
-                "tool_name": "file.write",
-                "effect": "WorkspaceWrite"
-            }
-        }));
-        let ledger = live_event_line(&serde_json::json!({
-            "offset": 5,
-            "event": {
-                "kind": "ledger",
-                "record": {
-                    "event": {
-                        "event": "tool_call_proposed",
-                        "call": {
-                            "tool": "file.read"
-                        }
-                    }
-                }
-            }
-        }));
-
-        assert_eq!(
-            approval,
-            LiveEventLine::new(Some(4), "approval pending file.write (WorkspaceWrite)")
-        );
-        assert_eq!(
-            ledger,
-            LiveEventLine::new(Some(5), "tool proposed file.read")
-        );
-    }
-
-    #[test]
-    fn extracts_tool_input_preview_and_approval_modal_from_events() {
-        let proposed = serde_json::json!({
-            "offset": 3,
-            "event": {
-                "kind": "ledger",
-                "record": {
-                    "event": {
-                        "event": "tool_call_proposed",
-                        "call": {
-                            "id": "call_1",
-                            "tool": "file.write",
-                            "effect": "WorkspaceWrite",
-                            "input": {
-                                "path": "scratch.txt",
-                                "content": "hello"
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        let approval = serde_json::json!({
-            "offset": 4,
-            "event": {
-                "kind": "approval_requested",
-                "run_id": "run_1",
-                "tool_call_id": "call_1",
-                "tool_name": "file.write",
-                "effect": "WorkspaceWrite",
-                "reason": "file.write requires approval"
-            }
-        });
-        let (call_id, input_preview) = tool_input_preview_from_event(&proposed).unwrap();
-        let modal = approval_from_event(&approval, Some(input_preview)).unwrap();
-
-        assert_eq!(call_id, "call_1");
-        assert_eq!(modal.run_id, "run_1");
-        assert!(modal.input_preview.contains("scratch.txt"));
-        assert!(modal.input_preview.contains("hello"));
     }
 
     #[test]
