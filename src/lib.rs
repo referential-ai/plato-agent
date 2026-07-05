@@ -10,6 +10,7 @@ pub mod paths;
 pub mod replay;
 pub mod tool_catalog;
 pub mod tools;
+pub mod tui;
 
 pub use app::{
     ApprovalMode, ApprovalRequest, RunLedger, RunOptions, RunOutcome, new_run_id, run_question,
