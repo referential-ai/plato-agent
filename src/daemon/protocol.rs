@@ -78,14 +78,14 @@ pub struct ProtocolError {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HelloParams {
     pub workspace_root: String,
     pub workspace_id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HelloResult {
     pub daemon_version: String,
     pub workspace_id: String,
@@ -93,7 +93,7 @@ pub struct HelloResult {
     pub capabilities: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunStartParams {
     pub question: String,
@@ -103,7 +103,7 @@ pub struct RunStartParams {
     pub wait: Option<bool>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunStartResult {
     pub run_id: String,
     pub session_id: String,
@@ -112,7 +112,7 @@ pub struct RunStartResult {
     pub final_answer: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageAppendParams {
     pub message: String,
@@ -124,7 +124,7 @@ pub struct MessageAppendParams {
     pub wait: Option<bool>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsStreamParams {
     pub run_id: String,
@@ -134,7 +134,7 @@ pub struct EventsStreamParams {
     pub limit: Option<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EventsStreamResult {
     pub run_id: String,
     pub from_offset: u64,
@@ -143,7 +143,7 @@ pub struct EventsStreamResult {
     pub events: Vec<Value>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalDecideParams {
     pub run_id: String,
@@ -153,24 +153,24 @@ pub struct ApprovalDecideParams {
     pub reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunCancelParams {
     pub run_id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandAcceptedResult {
     pub run_id: String,
     pub status: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionsListResult {
     pub sessions: Vec<SessionSummary>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub session_id: String,
     pub run_id: String,
@@ -178,7 +178,7 @@ pub struct SessionSummary {
     pub ledger_path: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TranscriptReadParams {
     #[serde(default)]
@@ -187,7 +187,7 @@ pub struct TranscriptReadParams {
     pub session_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptReadResult {
     pub run_id: String,
     pub transcript: String,
