@@ -43,7 +43,7 @@ Question: Which provider/model should be the MVP default path?
 
 Recommended default: OpenRouter through the existing OpenAI-compatible wire path. Native Anthropic, provider fallback, and broad provider abstractions are out for MVP.
 
-Jerome:
+Jerome: Accept default.
 
 ### Q2. First Usable Tasks
 Question: What three tasks must work before calling this usable?
@@ -53,42 +53,42 @@ Recommended default:
 - Create or edit a note/file with approval and visible diff.
 - Run a build/test command and report the result.
 
-Jerome:
+Jerome: Accept default.
 
 ### Q3. Session Shape
 Question: What should `plato -c` and bare `plato "..."` mean?
 
 Recommended default: `plato -c "..."` continues the latest session for the current workspace from a SQLite pointer. Bare `plato "..."` starts a fresh session. Named sessions are deferred.
 
-Jerome:
+Jerome: Accept default.
 
 ### Q4. Long Sessions
 Question: What happens when a continued session exceeds the token budget?
 
 Recommended default: drop oldest turns with a visible marker. No automatic summarization in MVP.
 
-Jerome:
+Jerome: Accept default.
 
 ### Q5. `shell.exec` Safety
 Question: What is the MVP safety boundary for local command execution?
 
 Recommended default: every command requires approval; cwd is the workspace root; the child environment is deliberately scrubbed; output is capped; no provider credentials are inherited; `--yolo` does not cover `shell.exec` in MVP. OS/container sandboxing is a fast-follow, not the first gate.
 
-Jerome:
+Jerome: Accept default.
 
 ### Q6. Network
 Question: Is there a dedicated network tool in MVP?
 
 Recommended default: no dedicated network tool. Network effects only happen through approved `shell.exec` commands. Command text is visible at approval time; hidden network behavior inside scripts is a `shell.exec` safety-design concern.
 
-Jerome:
+Jerome: Accept default.
 
 ### Q7. Streaming
 Question: Is streaming required before MVP?
 
 Recommended default: no. Spinner plus final answer is acceptable for MVP. Streaming is a fast-follow after session continuation and `shell.exec` safety are proven.
 
-Jerome:
+Jerome: Require scoped streaming for MVP: live user-facing assistant text in CLI/TUI. Token deltas are not durable ledger events; replay records and shows the final assistant message only. Tool-call streaming is not required.
 
 ## Constraints
 - Keep the first product proof local and replayable.
