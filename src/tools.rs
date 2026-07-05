@@ -358,12 +358,11 @@ fn unified_diff(path: &str, current: &str, proposed: &str, max_chars: usize) -> 
     for line in &current_lines[current_start..prefix] {
         diff.push_line(' ', line);
     }
-    for line in &current_lines[prefix..current_changed_end] {
-        diff.push_line('-', line);
-    }
-    for line in &proposed_lines[prefix..proposed_changed_end] {
-        diff.push_line('+', line);
-    }
+    push_changed_lines(
+        &mut diff,
+        &current_lines[prefix..current_changed_end],
+        &proposed_lines[prefix..proposed_changed_end],
+    );
     for line in &current_lines[current_changed_end..current_end] {
         diff.push_line(' ', line);
     }
@@ -393,6 +392,36 @@ fn common_suffix(left: &[&str], right: &[&str]) -> usize {
         count += 1;
     }
     count
+}
+
+fn push_changed_lines(diff: &mut DiffPreview, current: &[&str], proposed: &[&str]) {
+    let mut current_index = 0usize;
+    let mut proposed_index = 0usize;
+
+    while current_index < current.len() || proposed_index < proposed.len() {
+        match (current.get(current_index), proposed.get(proposed_index)) {
+            (Some(current_line), Some(proposed_line)) if current_line == proposed_line => {
+                diff.push_line(' ', current_line);
+                current_index += 1;
+                proposed_index += 1;
+            }
+            (Some(current_line), Some(proposed_line)) => {
+                diff.push_line('-', current_line);
+                diff.push_line('+', proposed_line);
+                current_index += 1;
+                proposed_index += 1;
+            }
+            (Some(current_line), None) => {
+                diff.push_line('-', current_line);
+                current_index += 1;
+            }
+            (None, Some(proposed_line)) => {
+                diff.push_line('+', proposed_line);
+                proposed_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
 }
 
 fn hunk_start(start: usize, count: usize) -> usize {
@@ -738,6 +767,20 @@ mod tests {
     }
 
     #[test]
+    fn file_edit_diff_preview_skips_unreadable_current_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("note.txt")).unwrap();
+
+        let diff = approval_diff_preview(
+            dir.path(),
+            FILE_EDIT,
+            &json!({"path": "note.txt", "content": "hello\n"}),
+        );
+
+        assert_eq!(diff, None);
+    }
+
+    #[test]
     fn file_edit_diff_preview_truncates_huge_diff_with_marker() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("note.txt"), "old\n").unwrap();
@@ -751,6 +794,32 @@ mod tests {
 
         assert!(diff.contains(DIFF_TRUNCATED_MARKER));
         assert!(diff.chars().count() < DIFF_PREVIEW_CHARS + DIFF_TRUNCATED_MARKER.len() + 4);
+    }
+
+    #[test]
+    fn file_edit_diff_preview_truncation_keeps_proposed_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let middle = (0..2000)
+            .map(|line| format!("same-{line:04}\n"))
+            .collect::<String>();
+        fs::write(
+            dir.path().join("note.txt"),
+            format!("old top\n{middle}old bottom\n"),
+        )
+        .unwrap();
+
+        let diff = approval_diff_preview(
+            dir.path(),
+            FILE_EDIT,
+            &json!({"path": "note.txt", "content": format!("new top\n{middle}new bottom\n")}),
+        )
+        .unwrap();
+
+        assert!(diff.contains("-old top\n"));
+        assert!(diff.contains("+new top\n"));
+        assert!(diff.contains(" same-0000\n"));
+        assert!(diff.contains(DIFF_TRUNCATED_MARKER));
+        assert!(diff.find("+new top").unwrap() < diff.find(DIFF_TRUNCATED_MARKER).unwrap());
     }
 
     #[test]

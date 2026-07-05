@@ -215,4 +215,24 @@ mod tests {
         assert!(modal.input_preview.contains("note.txt"));
         assert!(modal.diff_preview.as_ref().unwrap().contains("-old"));
     }
+
+    #[test]
+    fn approval_modal_ignores_empty_diff_preview() {
+        let approval = serde_json::json!({
+            "offset": 4,
+            "event": {
+                "kind": "approval_requested",
+                "run_id": "run_1",
+                "tool_call_id": "call_1",
+                "tool_name": "file.edit",
+                "effect": "WorkspaceWrite",
+                "reason": "file.edit requires approval",
+                "diff_preview": ""
+            }
+        });
+        let modal = approval_from_event(&approval, Some(r#"{"path":"note.txt"}"#.into())).unwrap();
+
+        assert!(modal.input_preview.contains("note.txt"));
+        assert_eq!(modal.diff_preview, None);
+    }
 }
