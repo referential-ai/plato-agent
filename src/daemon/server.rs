@@ -122,13 +122,15 @@ mod tests {
     use crate::{
         daemon::{
             protocol::{
-                ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_RUN_FAILED, ERROR_WORKSPACE_MISMATCH,
-                Envelope, EnvelopeKind, ProtocolError,
+                ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_OVERLOAD, ERROR_RUN_FAILED,
+                ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, ProtocolError,
             },
             runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord},
         },
+        ledger::SqliteLedger,
         tools::ApprovalOutcome,
     };
+    use platonic_core::{HarnessEvent, RunId};
     use serde_json::json;
     use std::{io::Read, sync::Arc, thread};
 
@@ -259,6 +261,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
+            "session_1".into(),
             server.paths().ledger_path.clone(),
         ));
         record.push_event(json!({"kind": "test"}));
@@ -288,6 +291,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
+            "session_1".into(),
             server.paths().ledger_path.clone(),
         ));
         for index in 0..(MAX_EVENT_BUFFER + 1) {
@@ -317,6 +321,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
+            "session_1".into(),
             server.paths().ledger_path.clone(),
         ));
         record
@@ -350,6 +355,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
         let record = Arc::new(RunRecord::new(
             "run_1".into(),
+            "session_1".into(),
             server.paths().ledger_path.clone(),
         ));
         server
@@ -364,7 +370,94 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let result = response.result.unwrap();
 
         assert_eq!(response.kind, EnvelopeKind::Response);
-        assert_eq!(result["sessions"][0]["session_id"], "run_1");
+        assert_eq!(result["sessions"][0]["session_id"], "session_1");
         assert_eq!(result["sessions"][0]["run_id"], "run_1");
+    }
+
+    #[test]
+    fn message_append_rejects_active_session_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let record = Arc::new(RunRecord::new(
+            "run_1".into(),
+            "session_1".into(),
+            server.paths().ledger_path.clone(),
+        ));
+        server
+            .runtime
+            .runs
+            .lock()
+            .unwrap()
+            .insert("run_1".into(), record);
+
+        let response = server.handle_line(
+            r#"{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{"session_id":"session_1","message":"again"}}"#,
+        );
+        let error = response.error.unwrap();
+
+        assert_eq!(response.kind, EnvelopeKind::Error);
+        assert_eq!(error.code, ERROR_OVERLOAD);
+        assert!(error.message.contains("session already has an active run"));
+    }
+
+    #[test]
+    fn message_append_hydrates_persisted_session_turns() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[provider]
+api_key_env = "PATH"
+base_url = "http://127.0.0.1:9"
+timeout_ms = 1
+
+[limits]
+token_budget = 4000
+max_output_tokens = 1
+
+[tools]
+enabled = ["file.read"]
+"#,
+        )
+        .unwrap();
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let mut ledger = SqliteLedger::open_or_create(&server.paths().ledger_path).unwrap();
+        let prior_run = RunId::new("run_prior").unwrap();
+        ledger
+            .begin_session_run("session_1", &prior_run, "first question", true)
+            .unwrap();
+        ledger
+            .finish_session_run(&prior_run, "first answer")
+            .unwrap();
+        drop(ledger);
+
+        let response = server.handle_line(&format!(
+            r#"{{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{{"session_id":"session_1","message":"follow up","config_path":"{}","wait":true}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(response.kind, EnvelopeKind::Error);
+
+        let ledger = SqliteLedger::open_readonly(&server.paths().ledger_path).unwrap();
+        let (_run_id, records) = ledger.read_latest_run().unwrap();
+        let recent_turns = records
+            .iter()
+            .find_map(|record| match &record.event {
+                HarnessEvent::ContextBuilt { context, .. } => context
+                    .fragments
+                    .iter()
+                    .find(|fragment| fragment.source == "model.messages")
+                    .map(|fragment| fragment.content.as_str()),
+                _ => None,
+            })
+            .expect("continued run should record model messages context");
+
+        assert!(recent_turns.contains("first question"));
+        assert!(recent_turns.contains("first answer"));
+        assert!(recent_turns.contains("follow up"));
     }
 }

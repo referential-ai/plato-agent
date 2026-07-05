@@ -14,7 +14,8 @@ pub mod tools;
 pub mod tui;
 
 pub use app::{
-    ApprovalMode, ApprovalRequest, RunLedger, RunOptions, RunOutcome, new_run_id, run_question,
+    ApprovalMode, ApprovalRequest, RunLedger, RunOptions, RunOutcome, RunSession, new_run_id,
+    new_session_id, run_question,
 };
 pub use error::{AppError, AppResult};
-pub use replay::{replay_file, replay_sqlite};
+pub use replay::{replay_file, replay_sqlite, replay_sqlite_session};

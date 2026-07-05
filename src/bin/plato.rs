@@ -1,11 +1,13 @@
 use clap::{Parser, Subcommand};
 use plato_agent::{
-    AppError, ApprovalMode, RunLedger, RunOptions, RunOutcome,
+    AppError, ApprovalMode, RunLedger, RunOptions, RunOutcome, RunSession,
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
         lock::ensure_workspace_unlocked,
         server::DaemonServer,
     },
+    ledger::latest_sqlite_session_id,
+    new_session_id,
     paths::default_sqlite_path,
     replay_file, replay_sqlite, run_question,
     tui::{TuiOptions, run_tui},
@@ -53,6 +55,13 @@ struct Cli {
     )]
     yolo: bool,
 
+    #[arg(
+        short = 'c',
+        long = "continue",
+        help = "Continue the latest SQLite workspace session"
+    )]
+    continue_session: bool,
+
     #[arg(long, global = true, help = "Start the interactive terminal UI")]
     tui: bool,
 
@@ -95,6 +104,7 @@ fn run() -> plato_agent::AppResult<()> {
         None => {
             let question = cli.question.join(" ");
             let ledger = run_ledger(cli.events, cli.db, &workspace_root)?;
+            let session = run_session(cli.continue_session, &ledger)?;
             let outcome = run_question(RunOptions {
                 question,
                 config_path: cli.config,
@@ -102,6 +112,7 @@ fn run() -> plato_agent::AppResult<()> {
                 workspace_root,
                 approval_mode: ApprovalMode::from_yolo(cli.yolo),
                 run_id: None,
+                session,
                 event_sender: None,
                 cancel: None,
             })?;
@@ -134,9 +145,9 @@ fn validate_tui_cli(cli: &Cli) -> plato_agent::AppResult<()> {
             "plato --tui cannot be combined with a question".into(),
         ));
     }
-    if cli.events.is_some() || cli.db.is_some() || cli.yolo {
+    if cli.events.is_some() || cli.db.is_some() || cli.yolo || cli.continue_session {
         return Err(AppError::Config(
-            "plato --tui cannot be combined with --events, --db, or --yolo".into(),
+            "plato --tui cannot be combined with --events, --db, --yolo, or -c".into(),
         ));
     }
     Ok(())
@@ -257,6 +268,30 @@ fn sqlite_path(
     match db {
         None | Some(None) => default_sqlite_path(workspace_root),
         Some(Some(path)) => Ok(resolve_cli_path(path, workspace_root)),
+    }
+}
+
+fn run_session(
+    continue_session: bool,
+    ledger: &RunLedger,
+) -> plato_agent::AppResult<Option<RunSession>> {
+    match ledger {
+        RunLedger::Jsonl(_) if continue_session => Err(AppError::Config(
+            "plato -c requires the SQLite ledger; remove --events".into(),
+        )),
+        RunLedger::Jsonl(_) => Ok(None),
+        RunLedger::Sqlite(path) if continue_session => {
+            let session_id = latest_sqlite_session_id(path).map_err(|error| match error {
+                AppError::NoSqliteSessions | AppError::NoSqliteRuns => AppError::Config(
+                    "plato -c found no previous SQLite session; run plato \"...\" first".into(),
+                ),
+                error => error,
+            })?;
+            Ok(Some(RunSession::Continue { session_id }))
+        }
+        RunLedger::Sqlite(_) => Ok(Some(RunSession::Fresh {
+            session_id: new_session_id(),
+        })),
     }
 }
 
@@ -412,7 +447,7 @@ mod tests {
         assert!(matches!(
             error,
             AppError::Config(message)
-                if message == "plato --tui cannot be combined with --events, --db, or --yolo"
+                if message == "plato --tui cannot be combined with --events, --db, --yolo, or -c"
         ));
     }
 
@@ -479,6 +514,52 @@ mod tests {
             run_ledger(Some(PathBuf::from("events.jsonl")), None, workspace.path()).unwrap();
 
         assert_eq!(ledger, RunLedger::Jsonl(PathBuf::from("events.jsonl")));
+    }
+
+    #[test]
+    fn default_sqlite_run_starts_fresh_session() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ledger = RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap());
+
+        let session = run_session(false, &ledger).unwrap().unwrap();
+
+        assert!(matches!(session, RunSession::Fresh { .. }));
+    }
+
+    #[test]
+    fn continue_rejects_jsonl_ledger() {
+        let ledger = RunLedger::Jsonl(PathBuf::from("events.jsonl"));
+
+        let error = run_session(true, &ledger).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Config(message)
+                if message == "plato -c requires the SQLite ledger; remove --events"
+        ));
+    }
+
+    #[test]
+    fn continue_uses_latest_sqlite_session() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("agent.db");
+        let mut ledger = plato_agent::ledger::SqliteLedger::open_or_create(&path).unwrap();
+        let run_id = RunId::new("run_1").unwrap();
+        ledger
+            .begin_session_run("session_1", &run_id, "hello", true)
+            .unwrap();
+        ledger.finish_session_run(&run_id, "hi").unwrap();
+
+        let session = run_session(true, &RunLedger::Sqlite(path))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            session,
+            RunSession::Continue {
+                session_id: "session_1".into()
+            }
+        );
     }
 
     #[test]

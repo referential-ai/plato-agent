@@ -244,10 +244,6 @@ enum ClientCommand {
         question: String,
         config_path: Option<String>,
     },
-    MessageAppend {
-        message: String,
-        config_path: Option<String>,
-    },
     PollEvents {
         run_id: String,
         from_offset: u64,
@@ -270,7 +266,6 @@ enum ClientCommand {
 enum ClientEvent {
     Loaded(Box<TuiState>),
     RunStarted(RunStartResult),
-    MessageAppended(RunStartResult),
     EventsPolled(EventsStreamResult),
     ApprovalDecided(CommandAcceptedResult),
     RunCanceled(CommandAcceptedResult),
@@ -308,13 +303,6 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             client.run_start(question, config_path, false)
         })
         .map_or_else(failed_event("run.start"), ClientEvent::RunStarted),
-        ClientCommand::MessageAppend {
-            message,
-            config_path,
-        } => with_client(config, |client| {
-            client.message_append(message, config_path, false)
-        })
-        .map_or_else(failed_event("message.append"), ClientEvent::MessageAppended),
         ClientCommand::PollEvents {
             run_id,
             from_offset,
@@ -380,9 +368,6 @@ fn drain_client_events(
             }
             ClientEvent::RunStarted(result) => {
                 apply_run_response(state, runtime, result, "run started")
-            }
-            ClientEvent::MessageAppended(result) => {
-                apply_run_response(state, runtime, result, "message appended")
             }
             ClientEvent::EventsPolled(result) => {
                 apply_events_result(state, runtime, commands, result)
@@ -621,17 +606,14 @@ fn submit_composer(
     if message.is_empty() {
         return;
     }
+    if runtime.polling && runtime.active_run_id.is_some() {
+        state.status_message = Some("run already active".into());
+        return;
+    }
     state.composer.clear();
-    let command = if runtime.polling && runtime.active_run_id.is_some() {
-        ClientCommand::MessageAppend {
-            message,
-            config_path,
-        }
-    } else {
-        ClientCommand::RunStart {
-            question: message,
-            config_path,
-        }
+    let command = ClientCommand::RunStart {
+        question: message,
+        config_path,
     };
     state.status_message = Some("submitted to daemon".into());
     send_command(commands, command, state);
@@ -709,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_composer_uses_message_append_while_run_is_polling() {
+    fn submit_composer_rejects_follow_up_while_run_is_polling() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.composer = "next turn".into();
@@ -724,16 +706,9 @@ mod tests {
 
         submit_composer(&sender, &mut state, &runtime, None);
 
-        match receiver.try_recv().unwrap() {
-            ClientCommand::MessageAppend {
-                message,
-                config_path,
-            } => {
-                assert_eq!(message, "next turn");
-                assert_eq!(config_path, None);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(state.composer, "next turn");
+        assert_eq!(state.status_message.as_deref(), Some("run already active"));
     }
 
     #[test]
