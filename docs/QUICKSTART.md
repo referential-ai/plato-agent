@@ -11,14 +11,20 @@ export OPENROUTER_API_KEY="$(cat /path/to/your/openrouter-key)"
 export PATH="$PWD/target/debug:$PATH"     # so the binaries just work in this shell
 ```
 
-Create `plato.toml` in the directory you want the agent to work in — that
-directory becomes its workspace and it cannot read or write outside it:
+`plato` works without a local config when `OPENROUTER_API_KEY` is exported.
+Config is discovered in this order: `--config`, `PLATO_CONFIG`, `./plato.toml`,
+`~/.config/plato/config.toml`, built-in defaults. Optional local config:
 
 ```toml
 [provider]
 kind = "open_router"
 model = "~openai/gpt-latest"
 api_key_env = "OPENROUTER_API_KEY"
+
+[limits]
+token_budget = 4000
+max_output_tokens = 1024
+max_turns = 8
 
 [tools]
 enabled = ["file.read", "file.list", "file.write"]
@@ -28,10 +34,11 @@ enabled = ["file.read", "file.list", "file.write"]
 
 ```bash
 plato "list the files here and summarize what this project is"
-plato replay events.jsonl        # audit exactly what it did
+plato replay        # audit the latest default SQLite run
 ```
 
-The answer prints to stdout; the complete run ledger lands in `events.jsonl`.
+The answer prints to stdout; the complete run ledger lands in the default XDG
+SQLite store for the workspace. Use `--events <file>` when you want JSONL.
 
 ## 2. Test the approval boundary
 
@@ -49,12 +56,14 @@ Nothing escapes the workspace: `../`, absolute paths, and symlinks out are refus
 ## 3. Durable runs (SQLite)
 
 ```bash
-plato --db "read Cargo.toml and name the package"
+plato "read Cargo.toml and name the package"
 # stderr prints: run_id / ledger_path / the exact replay command
-plato replay --db                # replays the latest run
+plato replay                # replays the latest run
 ```
 
-Explicit paths need the equals form: `--db=/tmp/run.db`.
+Explicit SQLite paths need the equals form: `--db=/tmp/run.db`. If the
+workspace daemon lock is held, SQLite CLI run/replay paths fail closed instead
+of competing with the daemon-owned store.
 
 ## 4. The full experience: TUI
 
@@ -102,4 +111,4 @@ cargo fmt --check
 | `--db /path` ignored | use the equals form: `--db=/path` |
 | provider api key env is not set | re-export `OPENROUTER_API_KEY` in this shell |
 | ledger already exists | JSONL ledgers never overwrite — pass a fresh `--events` name |
-| run stops after 8 turns | by design: runs are bounded; ask a tighter question or start a new run |
+| run stops after 8 turns | runs are bounded by `limits.max_turns`; ask tighter or configure a different limit |

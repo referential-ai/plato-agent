@@ -23,12 +23,10 @@ use std::{
     },
 };
 
-const MAX_TURNS: u32 = 8;
-
 #[derive(Clone, Debug)]
 pub struct RunOptions {
     pub question: String,
-    pub config_path: PathBuf,
+    pub config_path: Option<PathBuf>,
     pub ledger: RunLedger,
     pub workspace_root: PathBuf,
     pub approval_mode: ApprovalMode,
@@ -141,7 +139,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         return Err(AppError::EmptyQuestion);
     }
 
-    let config = Config::load(&options.config_path)?;
+    let config = Config::load(&options.workspace_root, options.config_path.as_deref())?;
     let run_id = options.run_id.clone().unwrap_or(new_run_id()?);
     let client = OpenAiCompatibleClient::from_config(
         &config.provider.api_key_env,
@@ -171,7 +169,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
     let mut messages = vec![ModelMessage::user_text(options.question.clone())];
     let tools = tool_specs(&config.tools.enabled);
 
-    for turn_index in 0..MAX_TURNS {
+    for turn_index in 0..config.limits.max_turns {
         let turn_id = TurnId::new(format!("turn_{}", turn_index + 1))?;
         let request = ModelRequest {
             model: config.provider.model.clone(),
@@ -487,11 +485,12 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         &options,
         HarnessEvent::RunFailed {
             run_id,
-            reason: format!("exceeded maximum turn count of {MAX_TURNS}"),
+            reason: format!("exceeded maximum turn count of {}", config.limits.max_turns),
         },
     )?;
     Err(AppError::RunFailed(format!(
-        "exceeded maximum turn count of {MAX_TURNS}"
+        "exceeded maximum turn count of {}",
+        config.limits.max_turns
     )))
 }
 
