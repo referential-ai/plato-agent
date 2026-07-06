@@ -26,7 +26,7 @@ use super::{
     commands::{
         SlashCommandAction, find_slash_command, has_slash_command_prefix, matching_slash_commands,
     },
-    state::SlashPopupView,
+    state::{SessionPickerView, SlashPopupView},
 };
 
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -128,6 +128,10 @@ fn handle_key_press(
             _ => {}
         }
         return true;
+    }
+
+    if state.session_picker.is_some() {
+        return handle_session_picker_key(key, state, commands);
     }
 
     if state.slash_popup.is_some()
@@ -360,6 +364,114 @@ fn handle_slash_popup_key(
         )),
         _ => None,
     }
+}
+
+fn handle_session_picker_key(
+    key: KeyEvent,
+    state: &mut TuiState,
+    commands: &Sender<ClientCommand>,
+) -> bool {
+    match key {
+        KeyEvent {
+            code: KeyCode::Up, ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            move_session_picker_selection(state, -1);
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Down,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            move_session_picker_selection(state, 1);
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => {
+            select_picker_session(commands, state);
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Esc, ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('q'),
+            ..
+        } => {
+            state.session_picker = None;
+            true
+        }
+        _ => true,
+    }
+}
+
+fn open_session_picker(state: &mut TuiState) {
+    let selected = state
+        .selected_session_id
+        .as_deref()
+        .and_then(|session_id| {
+            state
+                .sessions
+                .iter()
+                .position(|session| session.session_id == session_id)
+        })
+        .unwrap_or(0);
+    state.session_picker = Some(SessionPickerView {
+        selected: selected.min(state.sessions.len().saturating_sub(1)),
+    });
+    state.status_message = Some("session picker opened".into());
+}
+
+fn move_session_picker_selection(state: &mut TuiState, delta: isize) {
+    let Some(picker) = state.session_picker.as_mut() else {
+        return;
+    };
+    let count = state.sessions.len();
+    if count == 0 {
+        picker.selected = 0;
+        return;
+    }
+    let current = picker.selected.min(count - 1);
+    picker.selected = if delta < 0 {
+        current.checked_sub(1).unwrap_or(count - 1)
+    } else {
+        (current + 1) % count
+    };
+}
+
+fn select_picker_session(commands: &Sender<ClientCommand>, state: &mut TuiState) {
+    let Some(session) = state
+        .session_picker
+        .as_ref()
+        .and_then(|picker| state.sessions.get(picker.selected))
+        .cloned()
+    else {
+        state.session_picker = None;
+        state.status_message = Some("no sessions".into());
+        return;
+    };
+    state.session_picker = None;
+    state.selected_session_id = Some(session.session_id.clone());
+    state.status_message = Some(format!("loading session {}", session.session_id));
+    send_command(
+        commands,
+        ClientCommand::LoadSession {
+            session_id: session.session_id,
+        },
+        state,
+    );
 }
 
 fn move_slash_popup_selection(state: &mut TuiState, delta: isize) {
@@ -760,7 +872,7 @@ fn clamp_composer_cursor(state: &mut TuiState) {
 }
 
 fn load_state(config: &DaemonConnectionConfig, run_id: Option<&str>) -> TuiState {
-    match load_connected_state(config, run_id) {
+    match load_connected_state(config, run_id, None) {
         Ok(state) => state,
         Err(error) => TuiState::disconnected(
             config.workspace_root.to_string_lossy().into_owned(),
@@ -773,22 +885,41 @@ fn load_state(config: &DaemonConnectionConfig, run_id: Option<&str>) -> TuiState
 fn load_connected_state(
     config: &DaemonConnectionConfig,
     run_id: Option<&str>,
+    session_id: Option<&str>,
 ) -> AppResult<TuiState> {
     let mut client = DaemonClient::connect(&config.socket_path)?;
     let hello = client.hello(&config.workspace_root)?;
     let sessions = client.sessions_list()?;
-    let selected_run = run_id
+    let selected_session_id = session_id
         .map(str::to_owned)
-        .or_else(|| sessions.first().map(|session| session.run_id.clone()));
-    let transcript = match selected_run {
-        Some(run_id) => match client.transcript_read(&run_id) {
+        .or_else(|| {
+            run_id.and_then(|run_id| {
+                sessions
+                    .iter()
+                    .find(|session| session.run_id == run_id)
+                    .map(|session| session.session_id.clone())
+            })
+        })
+        .or_else(|| sessions.first().map(|session| session.session_id.clone()));
+    let transcript = if let Some(session_id) = session_id.or(selected_session_id.as_deref()) {
+        match client.transcript_read_session(session_id) {
             Ok(transcript) => TranscriptState::Loaded(TranscriptView::from(transcript)),
             Err(error) => TranscriptState::Unavailable {
-                run_id,
+                run_id: session_id.to_owned(),
                 error: error.to_string(),
             },
-        },
-        None => TranscriptState::None,
+        }
+    } else {
+        match run_id {
+            Some(run_id) => match client.transcript_read(run_id) {
+                Ok(transcript) => TranscriptState::Loaded(TranscriptView::from(transcript)),
+                Err(error) => TranscriptState::Unavailable {
+                    run_id: run_id.to_owned(),
+                    error: error.to_string(),
+                },
+            },
+            None => TranscriptState::None,
+        }
     };
     let mut state = TuiState::connected(
         config.workspace_root.to_string_lossy().into_owned(),
@@ -797,17 +928,40 @@ fn load_connected_state(
         sessions,
         transcript,
     );
-    if let Some(session) = state
-        .sessions
-        .iter()
-        .find(|session| session.status == "running")
-    {
+    state.selected_session_id = selected_session_id;
+    let active_session = state
+        .selected_session_id
+        .as_deref()
+        .and_then(|session_id| {
+            state
+                .sessions
+                .iter()
+                .find(|session| session.session_id == session_id && session.status == "running")
+        })
+        .or_else(|| {
+            state
+                .sessions
+                .iter()
+                .find(|session| session.status == "running")
+        });
+    if let Some(session) = active_session {
         state.active_run = Some(crate::tui::ActiveRunView {
             run_id: session.run_id.clone(),
             status: session.status.clone(),
         });
     }
     Ok(state)
+}
+
+fn load_selected_session_state(config: &DaemonConnectionConfig, session_id: &str) -> TuiState {
+    match load_connected_state(config, None, Some(session_id)) {
+        Ok(state) => state,
+        Err(error) => TuiState::disconnected(
+            config.workspace_root.to_string_lossy().into_owned(),
+            config.socket_path.to_string_lossy().into_owned(),
+            error.to_string(),
+        ),
+    }
 }
 
 #[derive(Debug)]
@@ -858,8 +1012,16 @@ enum ClientCommand {
     Load {
         run_id: Option<String>,
     },
+    LoadSession {
+        session_id: String,
+    },
     RunStart {
         question: String,
+        config_path: Option<String>,
+    },
+    MessageAppend {
+        message: String,
+        session_id: String,
         config_path: Option<String>,
     },
     PollEvents {
@@ -914,6 +1076,9 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
         ClientCommand::Load { run_id } => {
             ClientEvent::Loaded(Box::new(load_state(config, run_id.as_deref())))
         }
+        ClientCommand::LoadSession { session_id } => {
+            ClientEvent::Loaded(Box::new(load_selected_session_state(config, &session_id)))
+        }
         ClientCommand::RunStart {
             question,
             config_path,
@@ -921,6 +1086,14 @@ fn handle_client_command(config: &DaemonConnectionConfig, command: ClientCommand
             client.run_start(question, config_path, false)
         })
         .map_or_else(failed_event("run.start"), ClientEvent::RunStarted),
+        ClientCommand::MessageAppend {
+            message,
+            session_id,
+            config_path,
+        } => with_client(config, |client| {
+            client.message_append_to_session(message, Some(session_id), config_path, false)
+        })
+        .map_or_else(failed_event("message.append"), ClientEvent::RunStarted),
         ClientCommand::PollEvents {
             run_id,
             from_offset,
@@ -1088,6 +1261,7 @@ fn apply_run_response(
 ) {
     let run_id = result.run_id.clone();
     let status = result.status.clone();
+    state.selected_session_id = Some(result.session_id.clone());
     state.status_message = Some(format!("{message}: {run_id}"));
     state.stream_warning = None;
     state.cancel_requested = false;
@@ -1274,10 +1448,7 @@ fn submit_composer(
         return true;
     }
     push_live_event(state, crate::tui::LiveEventLine::user(message.clone()));
-    let command = ClientCommand::RunStart {
-        question: message,
-        config_path,
-    };
+    let command = submit_message_command(message, state.selected_session_id.clone(), config_path);
     state.status_message = Some("submitted to daemon".into());
     send_command(commands, command, state);
     true
@@ -1329,6 +1500,14 @@ fn dispatch_slash_command(
             state.status_message = Some("visible transcript cleared".into());
             true
         }
+        SlashCommandAction::Sessions => {
+            open_session_picker(state);
+            true
+        }
+        SlashCommandAction::NewSession => {
+            start_fresh_session(state);
+            true
+        }
         SlashCommandAction::Reconnect => {
             if is_disconnected(state) {
                 reconnect(commands, state, initial_run_id);
@@ -1348,6 +1527,16 @@ fn clear_visible_transcript(state: &mut TuiState) {
     state.scroll_offset = 0;
 }
 
+fn start_fresh_session(state: &mut TuiState) {
+    state.selected_session_id = None;
+    state.transcript = TranscriptState::None;
+    state.live_events.clear();
+    state.stream_warning = None;
+    state.session_picker = None;
+    state.scroll_offset = 0;
+    state.status_message = Some("new session selected".into());
+}
+
 fn runtime_is_busy(runtime: &UiRuntime) -> bool {
     runtime.polling || runtime.poll_in_flight
 }
@@ -1362,16 +1551,35 @@ fn start_next_queued(
     }
     let message = state.queued_messages.remove(0);
     push_live_event(state, crate::tui::LiveEventLine::user(message.clone()));
-    let command = ClientCommand::RunStart {
-        question: message,
-        config_path: runtime.config_path.clone(),
-    };
+    let command = submit_message_command(
+        message,
+        state.selected_session_id.clone(),
+        runtime.config_path.clone(),
+    );
     runtime.polling = true;
     runtime.poll_in_flight = false;
     runtime.active_run_id = None;
     runtime.active_since = Some(Instant::now());
     state.status_message = Some("submitted queued message".into());
     send_command(commands, command, state);
+}
+
+fn submit_message_command(
+    message: String,
+    selected_session_id: Option<String>,
+    config_path: Option<String>,
+) -> ClientCommand {
+    match selected_session_id {
+        Some(session_id) => ClientCommand::MessageAppend {
+            message,
+            session_id,
+            config_path,
+        },
+        None => ClientCommand::RunStart {
+            question: message,
+            config_path,
+        },
+    }
 }
 
 fn send_command(commands: &Sender<ClientCommand>, command: ClientCommand, state: &mut TuiState) {
@@ -1446,7 +1654,10 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{daemon::protocol::HelloResult, tui::TranscriptState};
+    use crate::{
+        daemon::protocol::{HelloResult, SessionSummary},
+        tui::TranscriptState,
+    };
     use serde_json::json;
 
     fn press_key(
@@ -1487,6 +1698,37 @@ mod tests {
     }
 
     #[test]
+    fn submit_composer_uses_message_append_when_session_selected() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = Some("session_1".into());
+        state.composer = "continue work".into();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(
+            &sender,
+            &mut state,
+            &runtime,
+            None,
+            Some("plato.toml".into())
+        ));
+
+        match receiver.try_recv().unwrap() {
+            ClientCommand::MessageAppend {
+                message,
+                session_id,
+                config_path,
+            } => {
+                assert_eq!(message, "continue work");
+                assert_eq!(session_id, "session_1");
+                assert_eq!(config_path.as_deref(), Some("plato.toml"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(state.composer.is_empty());
+    }
+
+    #[test]
     fn submit_composer_queues_follow_up_while_run_is_polling() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
@@ -1510,6 +1752,34 @@ mod tests {
         assert_eq!(state.composer_cursor, 0);
         assert_eq!(state.queued_messages, vec!["next turn"]);
         assert_eq!(state.input_history, vec!["next turn"]);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("queued for next turn")
+        );
+    }
+
+    #[test]
+    fn submit_selected_session_queues_without_second_active_run() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = Some("session_1".into());
+        state.composer = "next turn".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime {
+            active_run_id: Some("run_1".into()),
+            config_path: Some("plato.toml".into()),
+            next_offset: 0,
+            poll_in_flight: false,
+            polling: true,
+            last_poll: Instant::now(),
+            tool_inputs: HashMap::new(),
+            active_since: Some(Instant::now()),
+        };
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(state.queued_messages, vec!["next turn"]);
         assert_eq!(
             state.status_message.as_deref(),
             Some("queued for next turn")
@@ -1647,6 +1917,89 @@ mod tests {
             Some("unknown command: /wat; try /help")
         );
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn sessions_command_opens_picker_without_daemon_command() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.sessions = vec![test_session("session_1", "run_1", "finished", "first")];
+        state.composer = "/sessions".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+
+        assert_eq!(
+            state.session_picker,
+            Some(SessionPickerView { selected: 0 })
+        );
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("session picker opened")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn session_picker_enter_loads_selected_session() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.sessions = vec![
+            test_session("session_1", "run_1", "finished", "first"),
+            test_session("session_2", "run_2", "interrupted", "second"),
+        ];
+        state.session_picker = Some(SessionPickerView { selected: 0 });
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+
+        assert!(state.session_picker.is_none());
+        assert_eq!(state.selected_session_id.as_deref(), Some("session_2"));
+        match receiver.try_recv().unwrap() {
+            ClientCommand::LoadSession { session_id } => assert_eq!(session_id, "session_2"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_command_clears_selected_session_for_fresh_submit() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = Some("session_1".into());
+        state.live_events = vec![crate::tui::LiveEventLine::assistant(None, "old")];
+        state.composer = "/new".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+
+        assert!(state.selected_session_id.is_none());
+        assert!(state.live_events.is_empty());
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("new session selected")
+        );
+        assert!(receiver.try_recv().is_err());
+
+        state.composer = "fresh work".into();
+        state.composer_cursor = state.composer.len();
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        match receiver.try_recv().unwrap() {
+            ClientCommand::RunStart { question, .. } => assert_eq!(question, "fresh work"),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
@@ -2179,6 +2532,28 @@ mod tests {
     }
 
     #[test]
+    fn run_response_selects_returned_session_for_continuation() {
+        let mut state = test_state();
+        let mut runtime = UiRuntime::from_state(&state, None);
+
+        apply_run_response(
+            &mut state,
+            &mut runtime,
+            RunStartResult {
+                run_id: "run_1".into(),
+                session_id: "session_1".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                status: "running".into(),
+                final_answer: None,
+            },
+            "run started",
+        );
+
+        assert_eq!(state.selected_session_id.as_deref(), Some("session_1"));
+        assert_eq!(runtime.active_run_id.as_deref(), Some("run_1"));
+    }
+
+    #[test]
     fn page_keys_adjust_scroll_offset() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
@@ -2250,6 +2625,48 @@ mod tests {
             state.status_message.as_deref(),
             Some("submitted queued message")
         );
+    }
+
+    #[test]
+    fn events_result_drains_queued_selected_session_message_after_finish() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.selected_session_id = Some("session_1".into());
+        state.queued_messages = vec!["next turn".into()];
+        let mut runtime = UiRuntime {
+            active_run_id: Some("run_1".into()),
+            config_path: Some("plato.toml".into()),
+            next_offset: 0,
+            poll_in_flight: true,
+            polling: true,
+            last_poll: Instant::now(),
+            tool_inputs: HashMap::new(),
+            active_since: Some(Instant::now()),
+        };
+        let result = EventsStreamResult {
+            run_id: "run_1".into(),
+            from_offset: 0,
+            next_offset: 1,
+            status: "finished".into(),
+            events: Vec::new(),
+        };
+
+        apply_events_result(&mut state, &mut runtime, &sender, result);
+        let _load = receiver.try_recv().unwrap();
+
+        match receiver.try_recv().unwrap() {
+            ClientCommand::MessageAppend {
+                message,
+                session_id,
+                config_path,
+            } => {
+                assert_eq!(message, "next turn");
+                assert_eq!(session_id, "session_1");
+                assert_eq!(config_path.as_deref(), Some("plato.toml"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(state.queued_messages.is_empty());
     }
 
     #[test]
@@ -2437,5 +2854,20 @@ mod tests {
             Vec::new(),
             TranscriptState::None,
         )
+    }
+
+    fn test_session(
+        session_id: &str,
+        run_id: &str,
+        status: &str,
+        latest_question: &str,
+    ) -> SessionSummary {
+        SessionSummary {
+            session_id: session_id.into(),
+            run_id: run_id.into(),
+            status: status.into(),
+            latest_question: latest_question.into(),
+            ledger_path: "/tmp/agent.db".into(),
+        }
     }
 }

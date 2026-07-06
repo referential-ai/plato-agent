@@ -19,6 +19,9 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     if state.help_visible {
         render_help_modal(frame, frame.area());
     }
+    if state.session_picker.is_some() {
+        render_session_picker(frame, frame.area(), state);
+    }
     if let Some(approval) = &state.approval {
         render_approval_modal(frame, frame.area(), approval);
     }
@@ -495,6 +498,88 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+fn render_session_picker(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let area = centered_rect(78, 64, area);
+    let selected = state
+        .session_picker
+        .as_ref()
+        .map(|picker| picker.selected)
+        .unwrap_or(0);
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            "Sessions",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("Enter resume    /new fresh    Esc close"),
+        Line::from(""),
+    ];
+    if state.sessions.is_empty() {
+        lines.push(Line::from("No sessions"));
+    } else {
+        lines.extend(
+            state
+                .sessions
+                .iter()
+                .enumerate()
+                .map(|(index, session)| session_picker_row(state, session, index == selected)),
+        );
+    }
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Sessions"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn session_picker_row(
+    state: &TuiState,
+    session: &crate::daemon::protocol::SessionSummary,
+    focused: bool,
+) -> Line<'static> {
+    let focus = if focused { ">" } else { " " };
+    let current = if state.selected_session_id.as_deref() == Some(session.session_id.as_str()) {
+        "*"
+    } else {
+        " "
+    };
+    let style = if focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(format!("{focus}{current} "), style),
+        Span::styled(
+            format!("{:<11}", session.status),
+            status_style(&session.status),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            short_id(&session.session_id),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw(" "),
+        Span::raw(session.latest_question.clone()),
+    ])
+}
+
+fn status_style(status: &str) -> Style {
+    match status {
+        "running" => Style::default().fg(Color::Green),
+        "interrupted" => Style::default().fg(Color::Yellow),
+        "failed" | "canceled" => Style::default().fg(Color::Red),
+        _ => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(18).collect()
+}
+
 fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalModalView) {
     let area = centered_rect(74, 64, area);
     let mut lines = vec![
@@ -639,6 +724,7 @@ mod tests {
                 session_id: "run_1".into(),
                 run_id: "run_1".into(),
                 status: "finished".into(),
+                latest_question: "read README".into(),
                 ledger_path: "/tmp/agent.db".into(),
             }],
             TranscriptState::Loaded(
@@ -681,6 +767,7 @@ mod tests {
                 session_id: "run_1".into(),
                 run_id: "run_1".into(),
                 status: "failed".into(),
+                latest_question: "read README".into(),
                 ledger_path: "/tmp/agent.db".into(),
             }],
             TranscriptState::Unavailable {
@@ -903,7 +990,48 @@ mod tests {
 
         assert!(output.contains("/clear"));
         assert!(output.contains("clear the visible transcript"));
-        assert!(output.contains("/help /clear /reconnect /quit"));
+        assert!(output.contains("/help /clear /sessions /new /reconnect /quit"));
+    }
+
+    #[test]
+    fn renders_session_picker_overlay() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            vec![
+                SessionSummary {
+                    session_id: "session_1".into(),
+                    run_id: "run_1".into(),
+                    status: "finished".into(),
+                    latest_question: "read README".into(),
+                    ledger_path: "/tmp/agent.db".into(),
+                },
+                SessionSummary {
+                    session_id: "session_2".into(),
+                    run_id: "run_2".into(),
+                    status: "interrupted".into(),
+                    latest_question: "continue docs".into(),
+                    ledger_path: "/tmp/agent.db".into(),
+                },
+            ],
+            TranscriptState::None,
+        );
+        state.selected_session_id = Some("session_1".into());
+        state.session_picker = Some(super::super::state::SessionPickerView { selected: 1 });
+
+        let output = render_to_text(&state);
+
+        assert!(output.contains("Sessions"));
+        assert!(output.contains("Enter resume"));
+        assert!(output.contains("read README"));
+        assert!(output.contains("interrupted"));
+        assert!(output.contains("continue docs"));
     }
 
     #[test]

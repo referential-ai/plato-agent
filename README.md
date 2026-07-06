@@ -159,7 +159,7 @@ PY
 `plato --tui` is the interactive local entrypoint. It attaches to the workspace
 daemon if one is running, or starts an embedded daemon for the TUI session.
 It renders a chat-first transcript surface with an intro, live activity,
-status rule, composer, and approval modal.
+status rule, composer, session picker, and approval modal.
 
 ```bash
 cargo run --bin plato -- --tui --config plato.toml
@@ -170,6 +170,11 @@ does not spawn, supervise, restart, or stop the daemon, and it does not call
 providers, execute tools, or write SQLite directly.
 Assistant text appears live through daemon `events.stream`; replay remains
 based on final ledger messages.
+Session picker statuses are `running`, `finished`, `failed`, `canceled`, or
+`interrupted`; `interrupted` means a daemon restart closed a previously running
+session so it can be resumed.
+On attach, the TUI selects the latest session by default; submitted messages
+continue that session until `/new` clears the selection.
 
 ```bash
 cargo run --bin plato-agentd -- --workspace "$PWD"
@@ -184,6 +189,9 @@ Keys:
 
 - `Enter`: submit the composer to the daemon. A session can have only one
   active run.
+- `/sessions`: open the session picker. `Enter` resumes the focused session;
+  `Esc` closes the picker.
+- `/new`: clear the selected session so the next submitted message starts fresh.
 - `g` / `d`: grant or deny the focused approval request.
 - `Ctrl-C`: request `run.cancel` for the active run; a second `Ctrl-C` exits the
   TUI. Exiting the TUI does not stop the daemon.

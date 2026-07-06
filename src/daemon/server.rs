@@ -53,6 +53,7 @@ impl DaemonServer {
             fs::create_dir_all(parent)?;
         }
         let lock = WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)?;
+        crate::ledger::interrupt_orphaned_sqlite_runs(&paths.ledger_path)?;
         if paths.socket_path.exists() {
             fs::remove_file(&paths.socket_path)?;
         }
@@ -407,6 +408,141 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(result["sessions"][0]["session_id"], "session_1");
         assert_eq!(result["sessions"][0]["run_id"], "run_1");
+        assert_eq!(result["sessions"][0]["status"], "running");
+    }
+
+    #[test]
+    fn sessions_list_reports_persisted_sessions_after_restart() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let first_socket = socket_dir.path().join("agent-1.sock");
+        let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
+        let ledger_path = first_server.paths().ledger_path.clone();
+        let mut ledger = SqliteLedger::open_or_create(&ledger_path).unwrap();
+        let run_id = RunId::new("run_1").unwrap();
+        ledger
+            .begin_session_run("session_1", &run_id, "first question", true)
+            .unwrap();
+        ledger.finish_session_run(&run_id, "first answer").unwrap();
+        drop(ledger);
+        drop(first_server);
+
+        let second_socket = socket_dir.path().join("agent-2.sock");
+        let second_server = DaemonServer::bind(workspace.path(), Some(second_socket)).unwrap();
+        let response = second_server
+            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+        let result = response.result.unwrap();
+
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(result["sessions"][0]["session_id"], "session_1");
+        assert_eq!(result["sessions"][0]["run_id"], "run_1");
+        assert_eq!(result["sessions"][0]["status"], "finished");
+        assert_eq!(result["sessions"][0]["latest_question"], "first question");
+    }
+
+    #[test]
+    fn sessions_list_empty_fresh_workspace_does_not_create_ledger() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let ledger_path = server.paths().ledger_path.clone();
+        assert!(!ledger_path.exists());
+
+        let response = server
+            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+        let result = response.result.unwrap();
+
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
+        assert!(!ledger_path.exists());
+    }
+
+    #[test]
+    fn sessions_list_marks_orphaned_running_session_interrupted_after_restart() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let first_socket = socket_dir.path().join("agent-1.sock");
+        let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
+        let ledger_path = first_server.paths().ledger_path.clone();
+        let mut ledger = SqliteLedger::open_or_create(&ledger_path).unwrap();
+        let run_id = RunId::new("run_1").unwrap();
+        ledger
+            .begin_session_run("session_1", &run_id, "first question", true)
+            .unwrap();
+        drop(ledger);
+        drop(first_server);
+
+        let second_socket = socket_dir.path().join("agent-2.sock");
+        let second_server = DaemonServer::bind(workspace.path(), Some(second_socket)).unwrap();
+        let response = second_server
+            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+        let result = response.result.unwrap();
+
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(result["sessions"][0]["session_id"], "session_1");
+        assert_eq!(result["sessions"][0]["run_id"], "run_1");
+        assert_eq!(result["sessions"][0]["status"], "interrupted");
+    }
+
+    #[test]
+    fn daemon_startup_reconciles_orphaned_running_session_for_resume() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let first_socket = socket_dir.path().join("agent-1.sock");
+        let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
+        let ledger_path = first_server.paths().ledger_path.clone();
+        let mut ledger = SqliteLedger::open_or_create(&ledger_path).unwrap();
+        ledger
+            .begin_session_run(
+                "session_1",
+                &RunId::new("run_1").unwrap(),
+                "first question",
+                true,
+            )
+            .unwrap();
+        drop(ledger);
+        drop(first_server);
+
+        let second_socket = socket_dir.path().join("agent-2.sock");
+        let _second_server = DaemonServer::bind(workspace.path(), Some(second_socket)).unwrap();
+        let mut ledger = SqliteLedger::open_or_create(&ledger_path).unwrap();
+
+        assert_eq!(ledger.session_summaries().unwrap()[0].status, "interrupted");
+        ledger
+            .begin_session_run(
+                "session_1",
+                &RunId::new("run_2").unwrap(),
+                "follow up",
+                false,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn sessions_list_reports_latest_question_preview() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let mut ledger = SqliteLedger::open_or_create(&server.paths().ledger_path).unwrap();
+        let run_id = RunId::new("run_1").unwrap();
+        let long_question = format!("{}\nsecond line", "x".repeat(130));
+        ledger
+            .begin_session_run("session_1", &run_id, &long_question, true)
+            .unwrap();
+        ledger.finish_session_run(&run_id, "first answer").unwrap();
+        drop(ledger);
+
+        let response = server
+            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+        let result = response.result.unwrap();
+
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(
+            result["sessions"][0]["latest_question"],
+            format!("{}...", "x".repeat(120))
+        );
     }
 
     #[test]
