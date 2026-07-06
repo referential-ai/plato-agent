@@ -2,7 +2,7 @@ use ratatui::{
     Frame, Terminal,
     backend::TestBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
@@ -10,11 +10,10 @@ use ratatui::{
 use super::{ApprovalModalView, ConnectionState, TranscriptState, TuiState};
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
-    let [header, body, events, footer] = vertical(frame.area());
-    render_header(frame, header, state);
-    render_body(frame, body, state);
-    render_live_events(frame, events, state);
-    render_footer(frame, footer, state);
+    let [history, status, composer] = vertical(frame.area());
+    render_history(frame, history, state);
+    render_status_rule(frame, status, state);
+    render_composer(frame, composer, state);
     if let Some(approval) = &state.approval {
         render_approval_modal(frame, frame.area(), approval);
     }
@@ -36,93 +35,128 @@ pub fn render_snapshot(state: &TuiState, width: u16, height: u16) -> std::io::Re
     Ok(output)
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let status = match &state.connection {
-        ConnectionState::Connected {
-            workspace_id,
-            daemon_version,
-            ..
-        } => vec![
-            Span::styled("connected", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!(" workspace={workspace_id} daemon={daemon_version}")),
-        ],
-        ConnectionState::Disconnected { error } => vec![
-            Span::styled(
-                "daemon unavailable",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" {error}")),
-        ],
-    };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from("Plato TUI"),
-            Line::from(status),
-            Line::from(format!("socket: {}", state.socket_path)),
-        ])
-        .block(Block::default().borders(Borders::ALL).title("Status")),
-        area,
-    );
+fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let mut lines = history_lines(state);
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
-fn render_body(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let [sessions_area, transcript_area] = horizontal(area);
-    render_sessions(frame, sessions_area, state);
-    render_transcript(frame, transcript_area, state);
-}
-
-fn render_sessions(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let lines = if state.sessions.is_empty() {
-        vec![Line::from("No daemon-lifetime sessions.")]
-    } else {
-        state
-            .sessions
-            .iter()
-            .map(|session| {
-                Line::from(vec![
-                    Span::styled(
-                        session.status.clone(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(format!(" {}", session.run_id)),
-                ])
-            })
-            .collect()
-    };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title("Sessions"))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
-
-fn render_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let text = match &state.transcript {
+fn history_lines(state: &TuiState) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match &state.transcript {
         TranscriptState::Loaded(transcript) => {
-            format!("run: {}\n\n{}", transcript.run_id, transcript.content)
+            lines.push(Line::from(vec![
+                Span::styled("run ", Style::default().fg(Color::Yellow)),
+                Span::raw(transcript.run_id.clone()),
+            ]));
+            lines.push(Line::from(""));
+            lines.extend(
+                transcript
+                    .content
+                    .lines()
+                    .map(|line| Line::from(line.to_owned())),
+            );
         }
         TranscriptState::Unavailable { run_id, error } => {
-            format!("Transcript unavailable for run {run_id}.\n\n{error}")
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "transcript unavailable ",
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(run_id.clone()),
+            ]));
+            lines.push(Line::from(error.clone()));
         }
         TranscriptState::None if matches!(state.connection, ConnectionState::Connected { .. }) => {
-            "No transcript selected. Start with --run <RUN_ID>.".into()
+            lines.extend(intro_lines(state));
         }
-        TranscriptState::None => format!(
-            "Start plato-agentd manually, then reconnect.\n\ncargo run --bin plato-agentd -- --workspace {}",
-            state.workspace_root
-        ),
-    };
-    frame.render_widget(
-        Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title("Transcript"))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+        TranscriptState::None => {
+            lines.push(Line::from(vec![Span::styled(
+                "daemon unavailable",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )]));
+            if let ConnectionState::Disconnected { error } = &state.connection {
+                lines.push(Line::from(error.clone()));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(
+                "Start plato-agentd manually, then press r to reconnect.",
+            ));
+            lines.push(Line::from(format!(
+                "cargo run --bin plato-agentd -- --workspace {}",
+                state.workspace_root
+            )));
+        }
+    }
+
+    append_live_activity(&mut lines, state);
+    lines
 }
 
-fn render_live_events(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let mut lines = Vec::new();
+fn intro_lines(state: &TuiState) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            "Plato Agent",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("Local Rust agent runtime"),
+        Line::from(""),
+    ];
+
+    if let ConnectionState::Connected {
+        workspace_id,
+        daemon_version,
+        ledger_path,
+    } = &state.connection
+    {
+        lines.extend([
+            Line::from(vec![
+                Span::styled("workspace ", Style::default().fg(Color::DarkGray)),
+                Span::raw(workspace_id.clone()),
+            ]),
+            Line::from(vec![
+                Span::styled("daemon    ", Style::default().fg(Color::DarkGray)),
+                Span::raw(daemon_version.clone()),
+            ]),
+            Line::from(vec![
+                Span::styled("ledger    ", Style::default().fg(Color::DarkGray)),
+                Span::raw(ledger_path.clone()),
+            ]),
+            Line::from(vec![
+                Span::styled("cwd       ", Style::default().fg(Color::DarkGray)),
+                Span::raw(state.workspace_root.clone()),
+            ]),
+            Line::from(""),
+            Line::from(format!(
+                "{} session{}",
+                state.sessions.len(),
+                plural(state.sessions.len())
+            )),
+        ]);
+    }
+
+    lines
+}
+
+fn append_live_activity(lines: &mut Vec<Line<'static>>, state: &TuiState) {
+    let has_activity = state.active_run.is_some()
+        || state.status_message.is_some()
+        || state.stream_warning.is_some()
+        || !state.live_events.is_empty();
+    if !has_activity {
+        return;
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "activity",
+        Style::default().fg(Color::Yellow),
+    )]));
+
     if let Some(active) = &state.active_run {
         lines.push(Line::from(vec![
             Span::styled(
@@ -136,46 +170,82 @@ fn render_live_events(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         lines.push(Line::from(message.clone()));
     }
     if let Some(warning) = &state.stream_warning {
-        lines.push(Line::from(vec![
+        lines.push(Line::from(format!("stream warning {warning}")));
+    }
+    lines.extend(state.live_events.iter().map(|event| match event.offset {
+        Some(offset) => Line::from(format!("#{offset} {}", event.text)),
+        None => Line::from(event.text.clone()),
+    }));
+}
+
+fn render_status_rule(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    frame.render_widget(Paragraph::new(status_rule(state)), area);
+}
+
+fn status_rule(state: &TuiState) -> Line<'static> {
+    let status = match &state.connection {
+        ConnectionState::Connected { workspace_id, .. } => {
+            let run_status = state
+                .active_run
+                .as_ref()
+                .map(|run| run.status.as_str())
+                .unwrap_or("ready");
+            format!(
+                "-- {run_status} | plato | {} session{} | {} -- {}",
+                state.sessions.len(),
+                plural(state.sessions.len()),
+                workspace_id,
+                state.workspace_root
+            )
+        }
+        ConnectionState::Disconnected { .. } => format!(
+            "-- offline | plato | press r to reconnect -- {}",
+            state.workspace_root
+        ),
+    };
+    Line::from(Span::styled(status, Style::default().fg(Color::DarkGray)))
+}
+
+fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let prompt = if state.composer.is_empty() {
+        Line::from(vec![
             Span::styled(
-                "stream warning",
-                Style::default().add_modifier(Modifier::BOLD),
+                ">",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(" {warning}")),
-        ]));
-    }
-    if state.live_events.is_empty() {
-        lines.push(Line::from("No live events."));
+            Span::raw(" "),
+            Span::styled(
+                "Try \"read README.md and summarize it\"",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
     } else {
-        lines.extend(state.live_events.iter().map(|event| match event.offset {
-            Some(offset) => Line::from(format!("#{offset} {}", event.text)),
-            None => Line::from(event.text.clone()),
-        }));
-    }
+        Line::from(vec![
+            Span::styled(
+                ">",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" {}", state.composer)),
+        ])
+    };
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title("Live Events"))
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(vec![
+            prompt,
+            Line::from(Span::styled(
+                "Enter submits | Ctrl-C cancels | /help coming soon",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]),
         area,
     );
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let composer = if state.composer.is_empty() {
-        ">".into()
-    } else {
-        format!("> {}", state.composer)
-    };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(composer),
-            Line::from(
-                "Type text. Enter submits. r reconnects if disconnected. q exits empty composer. Ctrl-C cancels.",
-            ),
-        ])
-        .block(Block::default().borders(Borders::ALL).title("Composer")),
-        area,
-    );
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
 }
 
 fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalModalView) {
@@ -243,22 +313,14 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn vertical(area: Rect) -> [Rect; 4] {
+fn vertical(area: Rect) -> [Rect; 3] {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
-            Constraint::Min(6),
-            Constraint::Length(7),
-            Constraint::Length(4),
+            Constraint::Min(8),
+            Constraint::Length(1),
+            Constraint::Length(2),
         ])
-        .areas(area)
-}
-
-fn horizontal(area: Rect) -> [Rect; 2] {
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(32), Constraint::Min(20)])
         .areas(area)
 }
 
@@ -268,6 +330,34 @@ mod tests {
     use crate::daemon::protocol::{HelloResult, SessionSummary, TranscriptReadResult};
 
     use super::super::{ActiveRunView, LiveEventLine};
+
+    #[test]
+    fn renders_intro_as_chat_surface() {
+        let state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+
+        let output = render_to_text(&state);
+
+        assert!(output.contains("Plato Agent"));
+        assert!(output.contains("Local Rust agent runtime"));
+        assert!(output.contains("work-1234"));
+        assert!(output.contains("ready | plato"));
+        assert!(output.contains("Try \"read README.md and summarize it\""));
+        assert!(!output.contains("Status"));
+        assert!(!output.contains("Sessions"));
+        assert!(!output.contains("Live Events"));
+        assert!(!output.contains("Composer"));
+    }
 
     #[test]
     fn renders_connected_sessions_and_transcript() {
@@ -297,7 +387,7 @@ mod tests {
 
         let output = render_to_text(&state);
 
-        assert!(output.contains("connected"));
+        assert!(output.contains("ready"));
         assert!(output.contains("run_1"));
         assert!(output.contains("final_phase"));
     }
@@ -327,7 +417,7 @@ mod tests {
 
         let output = render_to_text(&state);
 
-        assert!(output.contains("Transcript unavailable"));
+        assert!(output.contains("transcript unavailable"));
         assert!(output.contains("run_1"));
     }
 
@@ -343,9 +433,8 @@ mod tests {
 
         assert!(output.contains("daemon unavailable"));
         assert!(output.contains("cargo run --bin plato-agentd"));
-        assert!(output.contains("r reconnects if disconnected"));
-        assert!(output.contains("q exits empty composer"));
-        assert!(output.contains("Ctrl-C cancels"));
+        assert!(output.contains("press r to reconnect"));
+        assert!(output.contains("offline | plato"));
     }
 
     #[test]

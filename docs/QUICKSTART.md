@@ -85,6 +85,7 @@ plato --tui --config plato.toml
 
 This attaches to the workspace daemon if one is already running. Otherwise it
 starts an embedded daemon for this TUI session.
+The screen is a chat-first transcript with a bottom status rule and composer.
 
 Manual two-terminal mode still works:
 
@@ -98,7 +99,7 @@ plato-tui --workspace "$PWD" --config plato.toml      # terminal B
 | type + Enter | start a run when idle |
 | `g` / `d` | grant / deny in the approval modal |
 | Ctrl-C | first press cancels the active run; second quits the TUI |
-| `r` | reconnect (only when the header shows daemon unavailable) |
+| `r` | reconnect (only when the screen shows daemon unavailable) |
 | `q` / Esc | quit (`q` only with an empty composer, so it is typeable in words) |
 | Ctrl-U | clear the composer |
 
