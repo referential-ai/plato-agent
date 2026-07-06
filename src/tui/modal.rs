@@ -71,8 +71,8 @@ pub fn tool_input_preview_from_event(value: &Value) -> Option<(String, String)> 
 pub fn live_event_line(value: &Value) -> LiveEventLine {
     let offset = value.get("offset").and_then(Value::as_u64);
     let event = value.get("event").unwrap_or(value);
-    let text = match event.get("kind").and_then(Value::as_str) {
-        Some("ledger") => ledger_event_line(event),
+    match event.get("kind").and_then(Value::as_str) {
+        Some("ledger") => ledger_event_line(offset, event),
         Some("approval_requested") => {
             let tool_name = event
                 .get("tool_name")
@@ -82,37 +82,95 @@ pub fn live_event_line(value: &Value) -> LiveEventLine {
                 .get("effect")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown effect");
-            format!("approval pending {tool_name} ({effect})")
+            LiveEventLine::warning(offset, format!("approval pending {tool_name} ({effect})"))
         }
         Some("assistant_delta") => event
             .get("text")
             .and_then(Value::as_str)
-            .map(|text| format!("assistant {text}"))
-            .unwrap_or_else(|| "assistant delta".into()),
-        Some(kind) => kind.into(),
-        None => serde_json::to_string(event).unwrap_or_else(|_| "unrenderable event".into()),
-    };
-    LiveEventLine::new(offset, text)
+            .map(|text| LiveEventLine::assistant_delta(offset, text))
+            .unwrap_or_else(|| LiveEventLine::status(offset, "assistant delta")),
+        Some(kind) => LiveEventLine::status(offset, kind),
+        None => LiveEventLine::status(
+            offset,
+            serde_json::to_string(event).unwrap_or_else(|_| "unrenderable event".into()),
+        ),
+    }
 }
 
-fn ledger_event_line(event: &Value) -> String {
+pub fn model_from_event(value: &Value) -> Option<String> {
+    let event = value.get("event").unwrap_or(value);
+    if event.get("kind").and_then(Value::as_str) != Some("ledger")
+        || event.pointer("/record/event/event").and_then(Value::as_str) != Some("model_requested")
+    {
+        return None;
+    }
+    event
+        .pointer("/record/event/model")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn ledger_event_line(offset: Option<u64>, event: &Value) -> LiveEventLine {
     let event_name = event
         .pointer("/record/event/event")
         .and_then(Value::as_str)
         .unwrap_or("ledger event");
     match event_name {
-        "model_responded" => "assistant response".into(),
+        "model_requested" => {
+            let model = event
+                .pointer("/record/event/model")
+                .and_then(Value::as_str)
+                .unwrap_or("model");
+            LiveEventLine::status(offset, format!("model {model}"))
+        }
+        "model_responded" => {
+            let output = event
+                .pointer("/record/event/output/content")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if output.is_empty() {
+                LiveEventLine::status(offset, "assistant response")
+            } else {
+                LiveEventLine::assistant(offset, output)
+            }
+        }
         "tool_call_proposed" => {
             let tool = event
                 .pointer("/record/event/call/tool")
                 .and_then(Value::as_str)
                 .unwrap_or("tool");
-            format!("tool proposed {tool}")
+            LiveEventLine::tool(offset, format!("{tool} proposed"))
         }
-        "tool_finished" => "tool finished".into(),
-        "run_finished" => "run finished".into(),
-        "run_failed" => "run failed".into(),
-        other => other.replace('_', " "),
+        "tool_started" => {
+            let call_id = event
+                .pointer("/record/event/call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            LiveEventLine::tool(offset, format!("{call_id} running"))
+        }
+        "tool_finished" => {
+            let summary = event
+                .pointer("/record/event/result/summary")
+                .and_then(Value::as_str)
+                .unwrap_or("finished");
+            LiveEventLine::tool(offset, summary)
+        }
+        "tool_failed" => {
+            let reason = event
+                .pointer("/record/event/reason")
+                .and_then(Value::as_str)
+                .unwrap_or("failed");
+            LiveEventLine::warning(offset, format!("tool failed: {reason}"))
+        }
+        "run_finished" => LiveEventLine::status(offset, "run finished"),
+        "run_failed" => {
+            let reason = event
+                .pointer("/record/event/reason")
+                .and_then(Value::as_str)
+                .unwrap_or("run failed");
+            LiveEventLine::warning(offset, reason)
+        }
+        other => LiveEventLine::status(offset, other.replace('_', " ")),
     }
 }
 
@@ -163,13 +221,10 @@ mod tests {
 
         assert_eq!(
             approval,
-            LiveEventLine::new(Some(4), "approval pending file.write (WorkspaceWrite)")
+            LiveEventLine::warning(Some(4), "approval pending file.write (WorkspaceWrite)")
         );
-        assert_eq!(
-            ledger,
-            LiveEventLine::new(Some(5), "tool proposed file.read")
-        );
-        assert_eq!(delta, LiveEventLine::new(Some(6), "assistant hello"));
+        assert_eq!(ledger, LiveEventLine::tool(Some(5), "file.read proposed"));
+        assert_eq!(delta, LiveEventLine::assistant_delta(Some(6), "hello"));
     }
 
     #[test]

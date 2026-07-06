@@ -322,13 +322,14 @@ fn handle_events_stream(runtime: &DaemonRuntime, request: Envelope) -> Envelope 
         .take(limit)
         .cloned()
         .collect::<Vec<_>>();
+    let next_offset = from_offset + events.len() as u64;
     Envelope::response(
         request.id,
         Some("events.stream".into()),
         to_value(EventsStreamResult {
             run_id: record.run_id.clone(),
             from_offset,
-            next_offset: buffer.next_offset,
+            next_offset,
             status: record.status().state.as_str().into(),
             events,
         })

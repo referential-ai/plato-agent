@@ -20,8 +20,8 @@ use std::{
 };
 
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const EVENT_LIMIT: usize = 32;
-const MAX_LIVE_EVENT_LINES: usize = 80;
+const EVENT_LIMIT: usize = 128;
+const SCROLL_PAGE_LINES: usize = 10;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TuiOptions {
@@ -62,6 +62,7 @@ pub fn run_tui(options: TuiOptions) -> AppResult<()> {
     loop {
         drain_client_events(&mut state, &mut runtime, &events, &commands);
         maybe_poll_events(&mut runtime, &commands);
+        update_elapsed(&mut state, &runtime);
         terminal.draw(&state)?;
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
@@ -168,6 +169,14 @@ fn handle_key_press(
             recall_history_next(state);
             true
         }
+        KeyCode::PageUp => {
+            scroll_history_up(state);
+            true
+        }
+        KeyCode::PageDown => {
+            scroll_history_down(state);
+            true
+        }
         KeyCode::Char(ch)
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
@@ -252,6 +261,14 @@ fn clear_composer(state: &mut TuiState) {
     state.composer.clear();
     state.composer_cursor = 0;
     state.history_index = None;
+}
+
+fn scroll_history_up(state: &mut TuiState) {
+    state.scroll_offset = state.scroll_offset.saturating_add(SCROLL_PAGE_LINES);
+}
+
+fn scroll_history_down(state: &mut TuiState) {
+    state.scroll_offset = state.scroll_offset.saturating_sub(SCROLL_PAGE_LINES);
 }
 
 fn move_composer_left(state: &mut TuiState) {
@@ -419,6 +436,7 @@ struct UiRuntime {
     polling: bool,
     last_poll: Instant,
     tool_inputs: HashMap<String, String>,
+    active_since: Option<Instant>,
 }
 
 impl UiRuntime {
@@ -434,6 +452,7 @@ impl UiRuntime {
                 .is_some_and(|run| run.status == "running"),
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
+            active_since: state.active_run.as_ref().map(|_| Instant::now()),
         }
     }
 
@@ -447,6 +466,7 @@ impl UiRuntime {
         self.poll_in_flight = false;
         self.last_poll = Instant::now();
         self.tool_inputs.clear();
+        self.active_since = state.active_run.as_ref().map(|_| Instant::now());
     }
 }
 
@@ -604,7 +624,13 @@ fn drain_client_events(
                     run_id: result.run_id.clone(),
                     status: result.status,
                 });
-                push_live_event(state, None, format!("cancel requested: {}", result.run_id));
+                push_live_event(
+                    state,
+                    crate::tui::LiveEventLine::status(
+                        None,
+                        format!("cancel requested: {}", result.run_id),
+                    ),
+                );
             }
             ClientEvent::Failed { context, error } => {
                 runtime.poll_in_flight = false;
@@ -653,6 +679,13 @@ fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
     if loaded.live_events.is_empty() {
         loaded.live_events = state.live_events.clone();
     }
+    loaded.scroll_offset = state.scroll_offset;
+    if loaded.active_model.is_none() {
+        loaded.active_model = state.active_model.clone();
+    }
+    if loaded.active_run_elapsed_secs.is_none() {
+        loaded.active_run_elapsed_secs = state.active_run_elapsed_secs;
+    }
     if loaded.active_run.as_ref().map(|run| &run.run_id)
         == state.active_run.as_ref().map(|run| &run.run_id)
     {
@@ -677,13 +710,18 @@ fn apply_run_response(
         run_id: run_id.clone(),
         status: status.clone(),
     });
-    push_live_event(state, None, format!("{message}: {run_id}"));
+    push_live_event(
+        state,
+        crate::tui::LiveEventLine::status(None, format!("{message}: {run_id}")),
+    );
+    state.scroll_offset = 0;
     runtime.active_run_id = Some(run_id);
     runtime.next_offset = 0;
     runtime.poll_in_flight = false;
     runtime.polling = status == "running";
     runtime.last_poll = Instant::now() - ACTIVE_POLL_INTERVAL;
     runtime.tool_inputs.clear();
+    runtime.active_since = Some(Instant::now());
 }
 
 fn apply_events_result(
@@ -694,13 +732,18 @@ fn apply_events_result(
 ) {
     runtime.poll_in_flight = false;
     runtime.next_offset = result.next_offset;
-    runtime.polling = result.status == "running";
+    let needs_catch_up =
+        result.events.len() == EVENT_LIMIT && result.next_offset > result.from_offset;
+    runtime.polling = result.status == "running" || needs_catch_up;
     state.stream_warning = None;
     state.active_run = Some(crate::tui::ActiveRunView {
         run_id: result.run_id.clone(),
         status: result.status.clone(),
     });
     for event in result.events {
+        if let Some(model) = crate::tui::model_from_event(&event) {
+            state.active_model = Some(model);
+        }
         if let Some((call_id, input_preview)) = crate::tui::tool_input_preview_from_event(&event) {
             runtime
                 .tool_inputs
@@ -722,9 +765,12 @@ fn apply_events_result(
             state.approval = Some(approval);
         }
         let line = crate::tui::live_event_line(&event);
-        push_live_event(state, line.offset, line.text);
+        push_live_event(state, line);
     }
-    if result.status != "running" {
+    if needs_catch_up {
+        maybe_poll_events_now(runtime, commands);
+    } else if result.status != "running" {
+        runtime.active_since = None;
         send_command(
             commands,
             ClientCommand::Load {
@@ -743,6 +789,10 @@ fn maybe_poll_events(runtime: &mut UiRuntime, commands: &Sender<ClientCommand>) 
     if runtime.last_poll.elapsed() < ACTIVE_POLL_INTERVAL {
         return;
     }
+    maybe_poll_events_now(runtime, commands);
+}
+
+fn maybe_poll_events_now(runtime: &mut UiRuntime, commands: &Sender<ClientCommand>) {
     let Some(run_id) = runtime.active_run_id.clone() else {
         return;
     };
@@ -833,6 +883,7 @@ fn submit_composer(
         state.status_message = Some("queued for next turn".into());
         return;
     }
+    push_live_event(state, crate::tui::LiveEventLine::user(message.clone()));
     let command = ClientCommand::RunStart {
         question: message,
         config_path,
@@ -854,6 +905,7 @@ fn start_next_queued(
         return;
     }
     let message = state.queued_messages.remove(0);
+    push_live_event(state, crate::tui::LiveEventLine::user(message.clone()));
     let command = ClientCommand::RunStart {
         question: message,
         config_path: runtime.config_path.clone(),
@@ -861,6 +913,7 @@ fn start_next_queued(
     runtime.polling = true;
     runtime.poll_in_flight = false;
     runtime.active_run_id = None;
+    runtime.active_since = Some(Instant::now());
     state.status_message = Some("submitted queued message".into());
     send_command(commands, command, state);
 }
@@ -871,14 +924,36 @@ fn send_command(commands: &Sender<ClientCommand>, command: ClientCommand, state:
     }
 }
 
-fn push_live_event(state: &mut TuiState, offset: Option<u64>, text: impl Into<String>) {
-    state
-        .live_events
-        .push(crate::tui::LiveEventLine::new(offset, text));
-    if state.live_events.len() > MAX_LIVE_EVENT_LINES {
-        let excess = state.live_events.len() - MAX_LIVE_EVENT_LINES;
-        state.live_events.drain(0..excess);
+fn update_elapsed(state: &mut TuiState, runtime: &UiRuntime) {
+    state.active_run_elapsed_secs = runtime
+        .active_since
+        .map(|started| started.elapsed().as_secs());
+}
+
+fn push_live_event(state: &mut TuiState, mut line: crate::tui::LiveEventLine) {
+    use crate::tui::LiveEventKind;
+
+    if line.kind == LiveEventKind::AssistantDelta {
+        if let Some(last) = state.live_events.last_mut()
+            && last.kind == LiveEventKind::Assistant
+        {
+            last.text.push_str(&line.text);
+            last.offset = line.offset;
+            state.scroll_offset = 0;
+            return;
+        }
+        line.kind = LiveEventKind::Assistant;
+    } else if line.kind == LiveEventKind::Assistant
+        && let Some(last) = state.live_events.last_mut()
+        && last.kind == LiveEventKind::Assistant
+    {
+        last.text = line.text;
+        last.offset = line.offset;
+        state.scroll_offset = 0;
+        return;
     }
+    state.live_events.push(line);
+    state.scroll_offset = 0;
 }
 
 struct TerminalSession {
@@ -950,6 +1025,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
+            active_since: Some(Instant::now()),
         };
 
         submit_composer(&sender, &mut state, &runtime, None);
@@ -1137,6 +1213,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
+            active_since: Some(Instant::now()),
         };
         let result = EventsStreamResult {
             run_id: "run_1".into(),
@@ -1168,6 +1245,182 @@ mod tests {
     }
 
     #[test]
+    fn assistant_delta_flood_accumulates_into_one_message() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let mut runtime = UiRuntime {
+            active_run_id: Some("run_1".into()),
+            config_path: None,
+            next_offset: 0,
+            poll_in_flight: true,
+            polling: true,
+            last_poll: Instant::now(),
+            tool_inputs: HashMap::new(),
+            active_since: Some(Instant::now()),
+        };
+        let events = (0..500)
+            .map(|index| {
+                json!({
+                    "offset": index,
+                    "event": {
+                        "kind": "assistant_delta",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 0,
+                        "delta_index": index,
+                        "text": "x"
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        apply_events_result(
+            &mut state,
+            &mut runtime,
+            &sender,
+            EventsStreamResult {
+                run_id: "run_1".into(),
+                from_offset: 0,
+                next_offset: 500,
+                status: "running".into(),
+                events,
+            },
+        );
+
+        assert_eq!(state.live_events.len(), 1);
+        assert_eq!(
+            state.live_events[0].kind,
+            crate::tui::LiveEventKind::Assistant
+        );
+        assert_eq!(state.live_events[0].text.len(), 500);
+        assert!(state.stream_warning.is_none());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn full_event_page_immediately_requests_catch_up_poll() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let mut runtime = UiRuntime {
+            active_run_id: Some("run_1".into()),
+            config_path: None,
+            next_offset: 0,
+            poll_in_flight: true,
+            polling: true,
+            last_poll: Instant::now(),
+            tool_inputs: HashMap::new(),
+            active_since: Some(Instant::now()),
+        };
+        let events = (0..EVENT_LIMIT)
+            .map(|index| {
+                json!({
+                    "offset": index,
+                    "event": {
+                        "kind": "assistant_delta",
+                        "text": "x"
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        apply_events_result(
+            &mut state,
+            &mut runtime,
+            &sender,
+            EventsStreamResult {
+                run_id: "run_1".into(),
+                from_offset: 0,
+                next_offset: EVENT_LIMIT as u64,
+                status: "running".into(),
+                events,
+            },
+        );
+
+        match receiver.try_recv().unwrap() {
+            ClientCommand::PollEvents {
+                run_id,
+                from_offset,
+            } => {
+                assert_eq!(run_id, "run_1");
+                assert_eq!(from_offset, EVENT_LIMIT as u64);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(runtime.poll_in_flight);
+        assert!(runtime.polling);
+    }
+
+    #[test]
+    fn model_requested_event_updates_status_model() {
+        let (sender, _receiver) = mpsc::channel();
+        let mut state = test_state();
+        let mut runtime = UiRuntime {
+            active_run_id: Some("run_1".into()),
+            config_path: None,
+            next_offset: 0,
+            poll_in_flight: true,
+            polling: true,
+            last_poll: Instant::now(),
+            tool_inputs: HashMap::new(),
+            active_since: Some(Instant::now()),
+        };
+
+        apply_events_result(
+            &mut state,
+            &mut runtime,
+            &sender,
+            EventsStreamResult {
+                run_id: "run_1".into(),
+                from_offset: 0,
+                next_offset: 1,
+                status: "running".into(),
+                events: vec![json!({
+                    "offset": 0,
+                    "event": {
+                        "kind": "ledger",
+                        "record": {
+                            "event": {
+                                "event": "model_requested",
+                                "model": "openrouter/auto"
+                            }
+                        }
+                    }
+                })],
+            },
+        );
+
+        assert_eq!(state.active_model.as_deref(), Some("openrouter/auto"));
+    }
+
+    #[test]
+    fn page_keys_adjust_scroll_offset() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+            None,
+            None,
+        ));
+        assert_eq!(state.scroll_offset, SCROLL_PAGE_LINES);
+
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+            None,
+            None,
+        ));
+        assert_eq!(state.scroll_offset, 0);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn events_result_drains_queued_message_after_finish() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
@@ -1180,6 +1433,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
+            active_since: Some(Instant::now()),
         };
         let result = EventsStreamResult {
             run_id: "run_1".into(),
@@ -1229,6 +1483,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now() - ACTIVE_POLL_INTERVAL,
             tool_inputs: HashMap::new(),
+            active_since: Some(Instant::now()),
         };
         event_sender
             .send(ClientEvent::Failed {
@@ -1258,6 +1513,7 @@ mod tests {
             polling: true,
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
+            active_since: Some(Instant::now()),
         };
         let result = EventsStreamResult {
             run_id: "run_1".into(),

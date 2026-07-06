@@ -284,6 +284,41 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
     }
 
     #[test]
+    fn events_stream_next_offset_advances_by_returned_page() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let record = Arc::new(RunRecord::new(
+            "run_1".into(),
+            "session_1".into(),
+            server.paths().ledger_path.clone(),
+        ));
+        record.push_event(json!({"kind": "first"}));
+        record.push_event(json!({"kind": "second"}));
+        server
+            .runtime
+            .runs
+            .lock()
+            .unwrap()
+            .insert("run_1".into(), record);
+
+        let first = server.handle_line(
+            r#"{"v":1,"id":"events_1","kind":"request","method":"events.stream","params":{"run_id":"run_1","from_offset":0,"limit":1}}"#,
+        );
+        let second = server.handle_line(
+            r#"{"v":1,"id":"events_2","kind":"request","method":"events.stream","params":{"run_id":"run_1","from_offset":1,"limit":1}}"#,
+        );
+
+        let first = first.result.unwrap();
+        let second = second.result.unwrap();
+        assert_eq!(first["next_offset"], 1);
+        assert_eq!(first["events"][0]["event"]["kind"], "first");
+        assert_eq!(second["next_offset"], 2);
+        assert_eq!(second["events"][0]["event"]["kind"], "second");
+    }
+
+    #[test]
     fn events_stream_reports_lagged_offsets() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
