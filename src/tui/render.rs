@@ -7,10 +7,11 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
-use super::{ApprovalModalView, ConnectionState, TranscriptState, TuiState};
+use super::{ApprovalModalView, ConnectionState, LiveEventKind, TranscriptState, TuiState};
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
-    let [history, status, composer] = vertical(frame.area(), state);
+    let [header, history, status, composer] = vertical(frame.area(), state);
+    render_header(frame, header, state);
     render_history(frame, history, state);
     render_status_rule(frame, status, state);
     render_composer(frame, composer, state);
@@ -40,7 +41,8 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if lines.is_empty() {
         lines.push(Line::from(""));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    let visible = visible_lines(lines, area.height, state.scroll_offset);
+    frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), area);
 }
 
 fn history_lines(state: &TuiState) -> Vec<Line<'static>> {
@@ -91,7 +93,7 @@ fn history_lines(state: &TuiState) -> Vec<Line<'static>> {
         }
     }
 
-    append_live_activity(&mut lines, state);
+    append_live_transcript(&mut lines, state);
     append_queue_preview(&mut lines, state);
     lines
 }
@@ -143,7 +145,7 @@ fn intro_lines(state: &TuiState) -> Vec<Line<'static>> {
     lines
 }
 
-fn append_live_activity(lines: &mut Vec<Line<'static>>, state: &TuiState) {
+fn append_live_transcript(lines: &mut Vec<Line<'static>>, state: &TuiState) {
     let has_activity = state.active_run.is_some()
         || state.status_message.is_some()
         || state.stream_warning.is_some()
@@ -154,29 +156,20 @@ fn append_live_activity(lines: &mut Vec<Line<'static>>, state: &TuiState) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "activity",
+        "transcript",
         Style::default().fg(Color::Yellow),
     )]));
 
     if let Some(active) = &state.active_run {
-        lines.push(Line::from(vec![
-            Span::styled(
-                active.status.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" {}", active.run_id)),
-        ]));
+        lines.push(status_row(format!("{} {}", active.status, active.run_id)));
     }
     if let Some(message) = &state.status_message {
-        lines.push(Line::from(message.clone()));
+        lines.push(status_row(message.clone()));
     }
     if let Some(warning) = &state.stream_warning {
-        lines.push(Line::from(format!("stream warning {warning}")));
+        lines.push(warning_row(format!("stream warning {warning}")));
     }
-    lines.extend(state.live_events.iter().map(|event| match event.offset {
-        Some(offset) => Line::from(format!("#{offset} {}", event.text)),
-        None => Line::from(event.text.clone()),
-    }));
+    lines.extend(state.live_events.iter().map(event_row));
 }
 
 fn append_queue_preview(lines: &mut Vec<Line<'static>>, state: &TuiState) {
@@ -202,7 +195,40 @@ fn render_status_rule(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(Paragraph::new(status_rule(state)), area);
 }
 
+fn render_header(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    frame.render_widget(Paragraph::new(header_rule(state)), area);
+}
+
+fn header_rule(state: &TuiState) -> Line<'static> {
+    let run_status = state
+        .active_run
+        .as_ref()
+        .map(|run| run.status.as_str())
+        .unwrap_or("ready");
+    let elapsed = state
+        .active_run_elapsed_secs
+        .map(format_elapsed)
+        .unwrap_or_else(|| "0s".into());
+    let model = state.active_model.as_deref().unwrap_or("model pending");
+    let workspace = match &state.connection {
+        ConnectionState::Connected { workspace_id, .. } => workspace_id.as_str(),
+        ConnectionState::Disconnected { .. } => "offline",
+    };
+    Line::from(vec![
+        Span::styled(
+            "Plato Agent",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            " | {run_status} | {elapsed} | {model} | {workspace}"
+        )),
+    ])
+}
+
 fn status_rule(state: &TuiState) -> Line<'static> {
+    let queued = state.queued_messages.len();
     let status = match &state.connection {
         ConnectionState::Connected { workspace_id, .. } => {
             let run_status = state
@@ -211,7 +237,7 @@ fn status_rule(state: &TuiState) -> Line<'static> {
                 .map(|run| run.status.as_str())
                 .unwrap_or("ready");
             format!(
-                "-- {run_status} | plato | {} session{} | {} -- {}",
+                "-- {run_status} | plato | queued {queued} | {} session{} | {} -- {}",
                 state.sessions.len(),
                 plural(state.sessions.len()),
                 workspace_id,
@@ -236,14 +262,15 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
+            Span::styled("|", Style::default().fg(Color::Yellow)),
+            Span::raw(" "),
             Span::styled(
                 "Try \"read README.md and summarize it\"",
                 Style::default().fg(Color::DarkGray),
             ),
         ])]
     } else {
-        state
-            .composer
+        composer_with_cursor(state)
             .lines()
             .enumerate()
             .map(|(index, line)| {
@@ -261,7 +288,10 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .collect()
     };
     lines.push(Line::from(Span::styled(
-        "Enter submits | Alt/Shift-Enter newline | Ctrl-C cancels",
+        format!(
+            "Enter submits | Alt/Shift-Enter newline | PgUp/PgDown scroll | queued {}",
+            state.queued_messages.len()
+        ),
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
@@ -269,6 +299,74 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
+}
+
+fn event_row(event: &super::LiveEventLine) -> Line<'static> {
+    match event.kind {
+        LiveEventKind::User => role_row("user", Color::Cyan, &event.text),
+        LiveEventKind::Assistant | LiveEventKind::AssistantDelta => {
+            role_row("assistant", Color::Green, &event.text)
+        }
+        LiveEventKind::Tool => role_row("tool", Color::Magenta, &event.text),
+        LiveEventKind::Status => status_row(offset_text(event)),
+        LiveEventKind::Warning => warning_row(offset_text(event)),
+    }
+}
+
+fn role_row(role: &'static str, color: Color, text: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{role:<9} "), Style::default().fg(color)),
+        Span::raw(text.to_owned()),
+    ])
+}
+
+fn status_row(text: impl Into<String>) -> Line<'static> {
+    role_row("status", Color::DarkGray, &text.into())
+}
+
+fn warning_row(text: impl Into<String>) -> Line<'static> {
+    role_row("warning", Color::Red, &text.into())
+}
+
+fn offset_text(event: &super::LiveEventLine) -> String {
+    match event.offset {
+        Some(offset) => format!("#{offset} {}", event.text),
+        None => event.text.clone(),
+    }
+}
+
+fn visible_lines(
+    lines: Vec<Line<'static>>,
+    height: u16,
+    scroll_offset: usize,
+) -> Vec<Line<'static>> {
+    let height = height as usize;
+    if height == 0 || lines.len() <= height {
+        return lines;
+    }
+    let end = lines.len().saturating_sub(scroll_offset).max(height);
+    let start = end.saturating_sub(height);
+    lines[start..end].to_vec()
+}
+
+fn composer_with_cursor(state: &TuiState) -> String {
+    let mut draft = state.composer.clone();
+    let mut cursor = state.composer_cursor.min(draft.len());
+    while !draft.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    draft.insert(cursor, '|');
+    draft
+}
+
+fn format_elapsed(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m{seconds:02}s")
+    }
 }
 
 fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalModalView) {
@@ -336,11 +434,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn vertical(area: Rect, state: &TuiState) -> [Rect; 3] {
+fn vertical(area: Rect, state: &TuiState) -> [Rect; 4] {
     let composer_height = composer_height(state);
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Min(8),
             Constraint::Length(1),
             Constraint::Length(composer_height),
@@ -384,6 +483,7 @@ mod tests {
         assert!(output.contains("Plato Agent"));
         assert!(output.contains("Local Rust agent runtime"));
         assert!(output.contains("work-1234"));
+        assert!(output.contains("model pending"));
         assert!(output.contains("ready | plato"));
         assert!(output.contains("Try \"read README.md and summarize it\""));
         assert!(!output.contains("Status"));
@@ -489,16 +589,17 @@ mod tests {
             status: "running".into(),
         });
         state.composer = "summarize this file".into();
+        state.composer_cursor = "summarize".len();
         state
             .live_events
-            .push(LiveEventLine::new(Some(2), "assistant response"));
+            .push(LiveEventLine::assistant(Some(2), "assistant response"));
 
         let output = render_to_text(&state);
 
         assert!(output.contains("running"));
         assert!(output.contains("run_1"));
-        assert!(output.contains("#2 assistant response"));
-        assert!(output.contains("> summarize this file"));
+        assert!(output.contains("assistant response"));
+        assert!(output.contains("> summarize| this file"));
     }
 
     #[test]
@@ -522,9 +623,69 @@ mod tests {
         let output = render_to_text(&state);
 
         assert!(output.contains("queued"));
+        assert!(output.contains("queued 1"));
         assert!(output.contains("1 queued next"));
         assert!(output.contains("> first line"));
-        assert!(output.contains("| second line"));
+        assert!(output.contains("| second line|"));
+    }
+
+    #[test]
+    fn renders_typed_tool_and_status_rows() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+        state.active_model = Some("openrouter/auto".into());
+        state.active_run_elapsed_secs = Some(65);
+        state.live_events = vec![
+            LiveEventLine::user("read README"),
+            LiveEventLine::tool(Some(3), "file.read finished"),
+            LiveEventLine::warning(Some(4), "approval pending shell.exec"),
+        ];
+
+        let output = render_to_text(&state);
+
+        assert!(output.contains("1m05s"));
+        assert!(output.contains("openrouter/auto"));
+        assert!(output.contains("user"));
+        assert!(output.contains("read README"));
+        assert!(output.contains("tool"));
+        assert!(output.contains("file.read finished"));
+        assert!(output.contains("warning"));
+        assert!(output.contains("approval pending shell.exec"));
+    }
+
+    #[test]
+    fn renders_scrolled_transcript_window() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+        state.live_events = (0..30)
+            .map(|index| LiveEventLine::status(Some(index), format!("line {index}")))
+            .collect();
+        state.scroll_offset = 10;
+
+        let output = render_snapshot(&state, 100, 12).unwrap();
+
+        assert!(output.contains("line 15"));
+        assert!(!output.contains("line 29"));
     }
 
     #[test]

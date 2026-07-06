@@ -11,6 +11,9 @@ pub struct TuiState {
     pub transcript: TranscriptState,
     pub active_run: Option<ActiveRunView>,
     pub live_events: Vec<LiveEventLine>,
+    pub scroll_offset: usize,
+    pub active_model: Option<String>,
+    pub active_run_elapsed_secs: Option<u64>,
     pub composer: String,
     pub composer_cursor: usize,
     pub queued_messages: Vec<String>,
@@ -42,6 +45,9 @@ impl TuiState {
             transcript,
             active_run: None,
             live_events: Vec::new(),
+            scroll_offset: 0,
+            active_model: None,
+            active_run_elapsed_secs: None,
             composer: String::new(),
             composer_cursor: 0,
             queued_messages: Vec::new(),
@@ -63,6 +69,9 @@ impl TuiState {
             transcript: TranscriptState::None,
             active_run: None,
             live_events: Vec::new(),
+            scroll_offset: 0,
+            active_model: None,
+            active_run_elapsed_secs: None,
             composer: String::new(),
             composer_cursor: 0,
             queued_messages: Vec::new(),
@@ -119,14 +128,70 @@ pub struct ActiveRunView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveEventLine {
     pub offset: Option<u64>,
+    pub kind: LiveEventKind,
     pub text: String,
 }
 
 impl LiveEventLine {
     pub fn new(offset: Option<u64>, text: impl Into<String>) -> Self {
+        Self::status(offset, text)
+    }
+
+    pub fn user(text: impl Into<String>) -> Self {
         Self {
-            offset,
+            offset: None,
+            kind: LiveEventKind::User,
             text: text.into(),
         }
     }
+
+    pub fn assistant(offset: Option<u64>, text: impl Into<String>) -> Self {
+        Self {
+            offset,
+            kind: LiveEventKind::Assistant,
+            text: text.into(),
+        }
+    }
+
+    pub fn assistant_delta(offset: Option<u64>, text: impl Into<String>) -> Self {
+        Self {
+            offset,
+            kind: LiveEventKind::AssistantDelta,
+            text: text.into(),
+        }
+    }
+
+    pub fn tool(offset: Option<u64>, text: impl Into<String>) -> Self {
+        Self {
+            offset,
+            kind: LiveEventKind::Tool,
+            text: text.into(),
+        }
+    }
+
+    pub fn status(offset: Option<u64>, text: impl Into<String>) -> Self {
+        Self {
+            offset,
+            kind: LiveEventKind::Status,
+            text: text.into(),
+        }
+    }
+
+    pub fn warning(offset: Option<u64>, text: impl Into<String>) -> Self {
+        Self {
+            offset,
+            kind: LiveEventKind::Warning,
+            text: text.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveEventKind {
+    User,
+    Assistant,
+    AssistantDelta,
+    Tool,
+    Status,
+    Warning,
 }
