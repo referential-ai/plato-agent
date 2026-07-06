@@ -54,10 +54,10 @@ api_key_env = "OPENAI_API_KEY"
 `shell.exec` require stdin approval and default to no. `shell.exec` runs from
 the workspace root with a scrubbed child environment, no provider credentials,
 bounded stdout/stderr, and a timeout.
-Use `--yolo` to auto-approve enabled tools that would otherwise prompt. Yolo
-mode does not enable disabled or unknown tools, permit deny-class effects such
-as external side effects or secret access, approve `shell.exec`, or bypass
-workspace path checks.
+Use `--yolo` to auto-approve enabled workspace-write tools that would otherwise
+prompt. Yolo mode does not enable disabled or unknown tools, approve network
+tools, permit deny-class effects such as external side effects or secret access,
+approve `shell.exec`, or bypass workspace path checks.
 
 ## SQLite Ledgers
 
