@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 use super::{ApprovalModalView, ConnectionState, LiveEventKind, TranscriptState, TuiState};
+use crate::tui::commands::{SLASH_COMMANDS, footer_command_hint, matching_slash_commands};
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     let [header, history, status, composer] = vertical(frame.area(), state);
@@ -248,7 +249,8 @@ fn status_rule(state: &TuiState) -> Line<'static> {
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let mut lines = if state.composer.is_empty() {
+    let mut lines = slash_popup_lines(state);
+    let mut composer_lines = if state.composer.is_empty() {
         vec![Line::from(vec![
             Span::styled(
                 ">",
@@ -282,14 +284,52 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             })
             .collect()
     };
+    lines.append(&mut composer_lines);
     lines.push(Line::from(Span::styled(
         format!(
-            "? help | /help /clear /quit /reconnect | Enter submits | Alt-Enter newline | queued {}",
+            "? help | {} | Enter submits | Shift-Enter newline | queued {}",
+            footer_command_hint(),
             state.queued_messages.len()
         ),
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+fn slash_popup_lines(state: &TuiState) -> Vec<Line<'static>> {
+    let Some(popup) = &state.slash_popup else {
+        return Vec::new();
+    };
+    let matches = matching_slash_commands(&popup.filter);
+    if matches.is_empty() {
+        return vec![Line::from(Span::styled(
+            "  no commands match",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    }
+    matches
+        .into_iter()
+        .take(5)
+        .enumerate()
+        .map(|(index, command)| {
+            let style = if index == popup.selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Line::from(vec![
+                Span::styled(if index == popup.selected { "> " } else { "  " }, style),
+                Span::styled(format!("/{}", command.name), style),
+                Span::raw("  "),
+                Span::styled(
+                    command.description.to_owned(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect()
 }
 
 fn plural(count: usize) -> &'static str {
@@ -419,28 +459,33 @@ fn format_elapsed(seconds: u64) -> String {
 }
 
 fn render_help_modal(frame: &mut Frame<'_>, area: Rect) {
-    let area = centered_rect(68, 64, area);
-    let lines = vec![
-        Line::from(vec![Span::styled(
-            "Commands",
-            Style::default().add_modifier(Modifier::BOLD),
-        )]),
-        Line::from("/help        show this help"),
-        Line::from("/clear       clear the visible transcript"),
-        Line::from("/reconnect   reconnect when offline"),
-        Line::from("/quit        close the TUI"),
+    let area = centered_rect(68, 82, area);
+    let mut lines = vec![Line::from(vec![Span::styled(
+        "Commands",
+        Style::default().add_modifier(Modifier::BOLD),
+    )])];
+    for command in SLASH_COMMANDS {
+        lines.push(Line::from(format!(
+            "/{:<10} {}",
+            command.name, command.description
+        )));
+    }
+    lines.extend([
         Line::from(""),
         Line::from(vec![Span::styled(
             "Keys",
             Style::default().add_modifier(Modifier::BOLD),
         )]),
         Line::from("Enter        submit"),
+        Line::from("Shift-Enter  newline"),
         Line::from("Alt-Enter    newline"),
+        Line::from("Ctrl-J/M     newline"),
+        Line::from("Tab          complete command or submit/queue"),
         Line::from("PgUp/PgDown  scroll"),
         Line::from("Up/Down      input history"),
         Line::from("Ctrl-C       cancel active run"),
         Line::from("Esc or q     close"),
-    ];
+    ]);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines)
@@ -534,7 +579,12 @@ fn composer_height(state: &TuiState) -> u16 {
     } else {
         state.composer.lines().count().max(1)
     };
-    (draft_lines + 1).clamp(2, 6) as u16
+    let popup_lines = state
+        .slash_popup
+        .as_ref()
+        .map(|popup| matching_slash_commands(&popup.filter).len().clamp(1, 5))
+        .unwrap_or(0);
+    (draft_lines + popup_lines + 1).clamp(2, 10) as u16
 }
 
 #[cfg(test)]
@@ -826,6 +876,34 @@ mod tests {
         assert!(output.contains("/quit"));
         assert!(output.contains("PgUp/PgDown"));
         assert!(output.contains("Ctrl-C"));
+    }
+
+    #[test]
+    fn renders_slash_command_popup_from_registry() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+        state.composer = "/c".into();
+        state.composer_cursor = state.composer.len();
+        state.slash_popup = Some(super::super::state::SlashPopupView {
+            filter: "c".into(),
+            selected: 0,
+        });
+
+        let output = render_to_text(&state);
+
+        assert!(output.contains("/clear"));
+        assert!(output.contains("clear the visible transcript"));
+        assert!(output.contains("/help /clear /reconnect /quit"));
     }
 
     #[test]

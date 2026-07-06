@@ -16,6 +16,8 @@ pub struct TuiState {
     pub active_run_elapsed_secs: Option<u64>,
     pub composer: String,
     pub composer_cursor: usize,
+    pub composer_kill_buffer: String,
+    pub slash_popup: Option<SlashPopupView>,
     pub queued_messages: Vec<String>,
     pub input_history: Vec<String>,
     pub history_index: Option<usize>,
@@ -51,6 +53,8 @@ impl TuiState {
             active_run_elapsed_secs: None,
             composer: String::new(),
             composer_cursor: 0,
+            composer_kill_buffer: String::new(),
+            slash_popup: None,
             queued_messages: Vec::new(),
             input_history: Vec::new(),
             history_index: None,
@@ -76,6 +80,8 @@ impl TuiState {
             active_run_elapsed_secs: None,
             composer: String::new(),
             composer_cursor: 0,
+            composer_kill_buffer: String::new(),
+            slash_popup: None,
             queued_messages: Vec::new(),
             input_history: Vec::new(),
             history_index: None,
@@ -86,6 +92,12 @@ impl TuiState {
             cancel_requested: false,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlashPopupView {
+    pub filter: String,
+    pub selected: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,4 +1,5 @@
 mod app;
+mod commands;
 mod modal;
 mod render;
 mod state;
