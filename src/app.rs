@@ -152,7 +152,7 @@ impl ApprovalMode {
     fn auto_grant_actor(&self, call: &ToolCall, policy: &PolicyDecision) -> Option<&'static str> {
         match (self, policy) {
             (Self::AutoApprove, PolicyDecision::RequireApproval { .. })
-                if call.tool.as_str() != SHELL_EXEC =>
+                if call.effect == EffectClass::WorkspaceWrite =>
             {
                 Some("yolo")
             }
@@ -1022,6 +1022,43 @@ mod tests {
             ApprovalMode::AutoApprove.auto_grant_actor(&call, &policy),
             None
         );
+    }
+
+    #[test]
+    fn yolo_does_not_auto_grant_network_tools() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            tool: ToolName::new("http.fetch").unwrap(),
+            effect: EffectClass::Network,
+            input: json!({"url": "https://example.com"}),
+        };
+        let policy = evaluate_policy(&["http.fetch".into()], &call);
+
+        assert!(matches!(policy, PolicyDecision::RequireApproval { .. }));
+        assert_eq!(
+            ApprovalMode::AutoApprove.auto_grant_actor(&call, &policy),
+            None
+        );
+    }
+
+    #[test]
+    fn yolo_does_not_auto_grant_secret_or_external_effects() {
+        let policy = PolicyDecision::RequireApproval {
+            reason: "requires approval".into(),
+        };
+        for effect in [EffectClass::ExternalSideEffect, EffectClass::SecretAccess] {
+            let call = ToolCall {
+                id: ToolCallId::new("call_1").unwrap(),
+                tool: ToolName::new("custom.effect").unwrap(),
+                effect,
+                input: json!({}),
+            };
+
+            assert_eq!(
+                ApprovalMode::AutoApprove.auto_grant_actor(&call, &policy),
+                None
+            );
+        }
     }
 
     #[test]

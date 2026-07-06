@@ -56,9 +56,10 @@ plato --events w3.jsonl "run cargo test --locked and summarize the result"
 # -> Approve shell.exec?   press y to run the command
 ```
 
-Reads and listings never prompt. Writes prompt unless `--yolo`.
-`shell.exec` always prompts, even with `--yolo`, and runs with a scrubbed
-environment that does not inherit provider credentials.
+Reads and listings never prompt. Workspace writes prompt unless `--yolo`.
+Yolo does not approve network tools or `shell.exec`. `shell.exec` always
+prompts and runs with a scrubbed environment that does not inherit provider
+credentials.
 Nothing escapes the workspace: `../`, absolute paths, and symlinks out are refused.
 
 ## 3. Durable runs (SQLite)
