@@ -158,6 +158,8 @@ PY
 
 `plato --tui` is the interactive local entrypoint. It attaches to the workspace
 daemon if one is running, or starts an embedded daemon for the TUI session.
+It renders a chat-first transcript surface with an intro, live activity,
+status rule, composer, and approval modal.
 
 ```bash
 cargo run --bin plato -- --tui --config plato.toml
