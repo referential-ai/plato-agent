@@ -5,7 +5,10 @@ use crate::{
     tui::{TranscriptState, TranscriptView, TuiState, render, render_snapshot},
 };
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -17,6 +20,13 @@ use std::{
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
+};
+
+use super::{
+    commands::{
+        SlashCommandAction, find_slash_command, has_slash_command_prefix, matching_slash_commands,
+    },
+    state::SlashPopupView,
 };
 
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -64,19 +74,25 @@ pub fn run_tui(options: TuiOptions) -> AppResult<()> {
         maybe_poll_events(&mut runtime, &commands);
         update_elapsed(&mut state, &runtime);
         terminal.draw(&state)?;
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-            && !handle_key_press(
-                key,
-                &mut state,
-                &runtime,
-                &commands,
-                options.run.clone(),
-                config_path.clone(),
-            )
-        {
-            break;
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    if !handle_key_press(
+                        key,
+                        &mut state,
+                        &runtime,
+                        &commands,
+                        options.run.clone(),
+                        config_path.clone(),
+                    ) {
+                        break;
+                    }
+                }
+                Event::Paste(text) => handle_paste_text(&mut state, &text),
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -114,16 +130,68 @@ fn handle_key_press(
         return true;
     }
 
+    if state.slash_popup.is_some()
+        && let Some(keep_running) = handle_slash_popup_key(
+            key,
+            state,
+            commands,
+            initial_run_id.clone(),
+            runtime,
+            config_path.clone(),
+        )
+    {
+        return keep_running;
+    }
+
+    if is_newline_key(key) {
+        insert_composer_text(state, "\n");
+        return true;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
-            KeyCode::Char('a') => move_composer_home(state),
-            KeyCode::Char('e') => move_composer_end(state),
-            KeyCode::Char('k') => delete_composer_to_end(state),
-            KeyCode::Char('u') => clear_composer(state),
-            KeyCode::Char('w') => delete_previous_word(state),
+            KeyCode::Char('a') => {
+                move_composer_line_start(state);
+                return true;
+            }
+            KeyCode::Char('b') => {
+                move_composer_left(state);
+                return true;
+            }
+            KeyCode::Char('e') => {
+                move_composer_line_end(state);
+                return true;
+            }
+            KeyCode::Char('f') => {
+                move_composer_right(state);
+                return true;
+            }
+            KeyCode::Char('k') => {
+                delete_composer_to_line_end(state);
+                return true;
+            }
+            KeyCode::Char('u') => {
+                kill_composer_to_start(state);
+                return true;
+            }
+            KeyCode::Char('w') => {
+                delete_previous_word(state);
+                return true;
+            }
+            KeyCode::Char('y') => {
+                yank_composer_kill_buffer(state);
+                return true;
+            }
+            KeyCode::Char('p') => {
+                recall_history_previous(state);
+                return true;
+            }
+            KeyCode::Char('n') => {
+                recall_history_next(state);
+                return true;
+            }
             _ => {}
         }
-        return true;
     }
 
     match key.code {
@@ -137,18 +205,19 @@ fn handle_key_press(
             reconnect(commands, state, initial_run_id);
             true
         }
-        KeyCode::Enter
-            if key
-                .modifiers
-                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-        {
-            insert_composer_text(state, "\n");
-            true
-        }
         KeyCode::Enter => {
             if !consume_line_continuation(state) {
                 return submit_composer(commands, state, runtime, initial_run_id, config_path);
             }
+            true
+        }
+        KeyCode::Tab => submit_composer(commands, state, runtime, initial_run_id, config_path),
+        KeyCode::Char('b') if key.modifiers == KeyModifiers::ALT => {
+            move_composer_word_left(state);
+            true
+        }
+        KeyCode::Char('f') if key.modifiers == KeyModifiers::ALT => {
+            move_composer_word_right(state);
             true
         }
         KeyCode::Backspace => {
@@ -160,27 +229,39 @@ fn handle_key_press(
             true
         }
         KeyCode::Left => {
-            move_composer_left(state);
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                move_composer_word_left(state);
+            } else {
+                move_composer_left(state);
+            }
             true
         }
         KeyCode::Right => {
-            move_composer_right(state);
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                move_composer_word_right(state);
+            } else {
+                move_composer_right(state);
+            }
             true
         }
         KeyCode::Home => {
-            move_composer_home(state);
+            move_composer_line_start(state);
             true
         }
         KeyCode::End => {
-            move_composer_end(state);
+            move_composer_line_end(state);
             true
         }
-        KeyCode::Up if !state.composer.contains('\n') => {
-            recall_history_previous(state);
+        KeyCode::Up => {
+            if !move_composer_up(state) {
+                recall_history_previous(state);
+            }
             true
         }
-        KeyCode::Down if !state.composer.contains('\n') => {
-            recall_history_next(state);
+        KeyCode::Down => {
+            if !move_composer_down(state) {
+                recall_history_next(state);
+            }
             true
         }
         KeyCode::PageUp => {
@@ -214,6 +295,172 @@ fn is_disconnected(state: &TuiState) -> bool {
     )
 }
 
+fn is_newline_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Enter)
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL)
+        || matches!(key.code, KeyCode::Char('j' | 'm')) && key.modifiers == KeyModifiers::CONTROL
+}
+
+fn handle_slash_popup_key(
+    key: KeyEvent,
+    state: &mut TuiState,
+    commands: &Sender<ClientCommand>,
+    initial_run_id: Option<String>,
+    runtime: &UiRuntime,
+    config_path: Option<String>,
+) -> Option<bool> {
+    match key {
+        KeyEvent {
+            code: KeyCode::Up, ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            move_slash_popup_selection(state, -1);
+            Some(true)
+        }
+        KeyEvent {
+            code: KeyCode::Down,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            move_slash_popup_selection(state, 1);
+            Some(true)
+        }
+        KeyEvent {
+            code: KeyCode::Esc, ..
+        } => {
+            state.slash_popup = None;
+            Some(true)
+        }
+        KeyEvent {
+            code: KeyCode::Tab, ..
+        } => {
+            complete_selected_slash_command(state);
+            Some(true)
+        }
+        KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => Some(dispatch_selected_slash_command(
+            commands,
+            state,
+            initial_run_id,
+            runtime,
+            config_path,
+        )),
+        _ => None,
+    }
+}
+
+fn move_slash_popup_selection(state: &mut TuiState, delta: isize) {
+    let Some(popup) = state.slash_popup.as_mut() else {
+        return;
+    };
+    let count = matching_slash_commands(&popup.filter).len().min(5);
+    if count == 0 {
+        popup.selected = 0;
+        return;
+    }
+    let current = popup.selected.min(count - 1);
+    popup.selected = if delta < 0 {
+        current.checked_sub(1).unwrap_or(count - 1)
+    } else {
+        (current + 1) % count
+    };
+}
+
+fn selected_slash_command(state: &TuiState) -> Option<&'static super::commands::SlashCommandSpec> {
+    let popup = state.slash_popup.as_ref()?;
+    matching_slash_commands(&popup.filter)
+        .into_iter()
+        .take(5)
+        .nth(popup.selected)
+}
+
+fn complete_selected_slash_command(state: &mut TuiState) {
+    let Some(command) = selected_slash_command(state) else {
+        return;
+    };
+    state.composer = format!("/{} ", command.name);
+    state.composer_cursor = state.composer.len();
+    state.history_index = None;
+    state.slash_popup = None;
+}
+
+fn dispatch_selected_slash_command(
+    commands: &Sender<ClientCommand>,
+    state: &mut TuiState,
+    initial_run_id: Option<String>,
+    runtime: &UiRuntime,
+    config_path: Option<String>,
+) -> bool {
+    let Some(command) = selected_slash_command(state) else {
+        return submit_composer(commands, state, runtime, initial_run_id, config_path);
+    };
+    let message = format!("/{}", command.name);
+    record_input_history(state, &message);
+    clear_composer(state);
+    dispatch_slash_command(commands, state, command.action, &message, initial_run_id)
+}
+
+fn sync_slash_popup(state: &mut TuiState) {
+    let Some(filter) = slash_filter_at_cursor(&state.composer, state.composer_cursor) else {
+        state.slash_popup = None;
+        return;
+    };
+    let selected = state.slash_popup.as_ref().map_or(0, |popup| popup.selected);
+    let count = matching_slash_commands(&filter).len().min(5);
+    state.slash_popup = Some(SlashPopupView {
+        filter,
+        selected: selected.min(count.saturating_sub(1)),
+    });
+}
+
+fn slash_filter_at_cursor(text: &str, cursor: usize) -> Option<String> {
+    if !text.starts_with('/') {
+        return None;
+    }
+    let first_line_end = text.find('\n').unwrap_or(text.len());
+    if cursor > first_line_end {
+        return None;
+    }
+    let after_slash = &text[1..first_line_end];
+    let name_len = after_slash
+        .find(char::is_whitespace)
+        .unwrap_or(after_slash.len());
+    let name_end = 1 + name_len;
+    if cursor > name_end {
+        return None;
+    }
+    let name = &after_slash[..name_len];
+    let rest = &text[name_end..first_line_end];
+    if name.is_empty() && !rest.is_empty() {
+        return None;
+    }
+    if name.is_empty() || has_slash_command_prefix(name) {
+        Some(name.to_owned())
+    } else {
+        None
+    }
+}
+
+fn handle_paste_text(state: &mut TuiState, text: &str) {
+    if state.help_visible || state.approval.is_some() {
+        return;
+    }
+    insert_composer_text(state, &text.replace('\r', "\n"));
+}
+
 fn insert_composer_char(state: &mut TuiState, ch: char) {
     let mut buffer = [0; 4];
     insert_composer_text(state, ch.encode_utf8(&mut buffer));
@@ -224,6 +471,7 @@ fn insert_composer_text(state: &mut TuiState, text: &str) {
     state.composer.insert_str(state.composer_cursor, text);
     state.composer_cursor += text.len();
     state.history_index = None;
+    sync_slash_popup(state);
 }
 
 fn delete_composer_before_cursor(state: &mut TuiState) {
@@ -237,6 +485,7 @@ fn delete_composer_before_cursor(state: &mut TuiState) {
         .replace_range(start..state.composer_cursor, "");
     state.composer_cursor = start;
     state.history_index = None;
+    sync_slash_popup(state);
 }
 
 fn delete_composer_after_cursor(state: &mut TuiState) {
@@ -247,12 +496,16 @@ fn delete_composer_after_cursor(state: &mut TuiState) {
     let end = next_boundary(&state.composer, state.composer_cursor);
     state.composer.replace_range(state.composer_cursor..end, "");
     state.history_index = None;
+    sync_slash_popup(state);
 }
 
-fn delete_composer_to_end(state: &mut TuiState) {
+fn delete_composer_to_line_end(state: &mut TuiState) {
     clamp_composer_cursor(state);
-    state.composer.truncate(state.composer_cursor);
+    let end = line_end_at(&state.composer, state.composer_cursor);
+    state.composer_kill_buffer = state.composer[state.composer_cursor..end].to_owned();
+    state.composer.replace_range(state.composer_cursor..end, "");
     state.history_index = None;
+    sync_slash_popup(state);
 }
 
 fn delete_previous_word(state: &mut TuiState) {
@@ -264,17 +517,37 @@ fn delete_previous_word(state: &mut TuiState) {
     while start > 0 && char_before(&state.composer, start).is_some_and(|ch| !ch.is_whitespace()) {
         start = previous_boundary(&state.composer, start);
     }
+    state.composer_kill_buffer = state.composer[start..state.composer_cursor].to_owned();
     state
         .composer
         .replace_range(start..state.composer_cursor, "");
     state.composer_cursor = start;
     state.history_index = None;
+    sync_slash_popup(state);
+}
+
+fn kill_composer_to_start(state: &mut TuiState) {
+    clamp_composer_cursor(state);
+    state.composer_kill_buffer = state.composer[..state.composer_cursor].to_owned();
+    state.composer.replace_range(..state.composer_cursor, "");
+    state.composer_cursor = 0;
+    state.history_index = None;
+    sync_slash_popup(state);
+}
+
+fn yank_composer_kill_buffer(state: &mut TuiState) {
+    if state.composer_kill_buffer.is_empty() {
+        return;
+    }
+    let text = state.composer_kill_buffer.clone();
+    insert_composer_text(state, &text);
 }
 
 fn clear_composer(state: &mut TuiState) {
     state.composer.clear();
     state.composer_cursor = 0;
     state.history_index = None;
+    state.slash_popup = None;
 }
 
 fn scroll_history_up(state: &mut TuiState) {
@@ -288,19 +561,85 @@ fn scroll_history_down(state: &mut TuiState) {
 fn move_composer_left(state: &mut TuiState) {
     clamp_composer_cursor(state);
     state.composer_cursor = previous_boundary(&state.composer, state.composer_cursor);
+    sync_slash_popup(state);
 }
 
 fn move_composer_right(state: &mut TuiState) {
     clamp_composer_cursor(state);
     state.composer_cursor = next_boundary(&state.composer, state.composer_cursor);
+    sync_slash_popup(state);
 }
 
-fn move_composer_home(state: &mut TuiState) {
-    state.composer_cursor = 0;
+fn move_composer_line_start(state: &mut TuiState) {
+    clamp_composer_cursor(state);
+    state.composer_cursor = line_start_at(&state.composer, state.composer_cursor);
+    sync_slash_popup(state);
 }
 
-fn move_composer_end(state: &mut TuiState) {
-    state.composer_cursor = state.composer.len();
+fn move_composer_line_end(state: &mut TuiState) {
+    clamp_composer_cursor(state);
+    state.composer_cursor = line_end_at(&state.composer, state.composer_cursor);
+    sync_slash_popup(state);
+}
+
+fn move_composer_word_left(state: &mut TuiState) {
+    clamp_composer_cursor(state);
+    let mut start = state.composer_cursor;
+    while start > 0 && char_before(&state.composer, start).is_some_and(char::is_whitespace) {
+        start = previous_boundary(&state.composer, start);
+    }
+    while start > 0 && char_before(&state.composer, start).is_some_and(|ch| !ch.is_whitespace()) {
+        start = previous_boundary(&state.composer, start);
+    }
+    state.composer_cursor = start;
+    sync_slash_popup(state);
+}
+
+fn move_composer_word_right(state: &mut TuiState) {
+    clamp_composer_cursor(state);
+    let mut end = state.composer_cursor;
+    while end < state.composer.len()
+        && char_at(&state.composer, end).is_some_and(|ch| !ch.is_whitespace())
+    {
+        end = next_boundary(&state.composer, end);
+    }
+    while end < state.composer.len()
+        && char_at(&state.composer, end).is_some_and(char::is_whitespace)
+    {
+        end = next_boundary(&state.composer, end);
+    }
+    state.composer_cursor = end;
+    sync_slash_popup(state);
+}
+
+fn move_composer_up(state: &mut TuiState) -> bool {
+    clamp_composer_cursor(state);
+    let start = line_start_at(&state.composer, state.composer_cursor);
+    if start == 0 {
+        return false;
+    }
+    let column = state.composer[start..state.composer_cursor].chars().count();
+    let previous_end = previous_boundary(&state.composer, start);
+    let previous_start = line_start_at(&state.composer, previous_end);
+    state.composer_cursor =
+        nth_char_boundary(&state.composer, previous_start, previous_end, column);
+    sync_slash_popup(state);
+    true
+}
+
+fn move_composer_down(state: &mut TuiState) -> bool {
+    clamp_composer_cursor(state);
+    let start = line_start_at(&state.composer, state.composer_cursor);
+    let end = line_end_at(&state.composer, state.composer_cursor);
+    if end >= state.composer.len() {
+        return false;
+    }
+    let column = state.composer[start..state.composer_cursor].chars().count();
+    let next_start = next_boundary(&state.composer, end);
+    let next_end = line_end_at(&state.composer, next_start);
+    state.composer_cursor = nth_char_boundary(&state.composer, next_start, next_end, column);
+    sync_slash_popup(state);
+    true
 }
 
 fn consume_line_continuation(state: &mut TuiState) -> bool {
@@ -317,6 +656,7 @@ fn consume_line_continuation(state: &mut TuiState) -> bool {
         .replace_range(start..state.composer_cursor, "\n");
     state.composer_cursor = start + 1;
     state.history_index = None;
+    sync_slash_popup(state);
     true
 }
 
@@ -331,6 +671,7 @@ fn recall_history_previous(state: &mut TuiState) {
     state.history_index = Some(index);
     state.composer = state.input_history[index].clone();
     state.composer_cursor = state.composer.len();
+    sync_slash_popup(state);
 }
 
 fn recall_history_next(state: &mut TuiState) {
@@ -344,6 +685,7 @@ fn recall_history_next(state: &mut TuiState) {
         state.history_index = Some(next);
         state.composer = state.input_history[next].clone();
         state.composer_cursor = state.composer.len();
+        sync_slash_popup(state);
     }
 }
 
@@ -381,6 +723,33 @@ fn char_before(value: &str, position: usize) -> Option<char> {
     } else {
         value[..position].chars().next_back()
     }
+}
+
+fn char_at(value: &str, position: usize) -> Option<char> {
+    if position >= value.len() {
+        None
+    } else {
+        value[position..].chars().next()
+    }
+}
+
+fn line_start_at(value: &str, position: usize) -> usize {
+    value[..position].rfind('\n').map_or(0, |index| index + 1)
+}
+
+fn line_end_at(value: &str, position: usize) -> usize {
+    value[position..]
+        .find('\n')
+        .map_or(value.len(), |index| position + index)
+}
+
+fn nth_char_boundary(value: &str, start: usize, end: usize, column: usize) -> usize {
+    value[start..end]
+        .char_indices()
+        .map(|(index, _)| start + index)
+        .chain(std::iter::once(end))
+        .nth(column)
+        .unwrap_or(end)
 }
 
 fn clamp_composer_cursor(state: &mut TuiState) {
@@ -681,6 +1050,8 @@ fn drain_client_events(
 fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
     loaded.composer = std::mem::take(&mut state.composer);
     loaded.composer_cursor = state.composer_cursor;
+    loaded.composer_kill_buffer = state.composer_kill_buffer.clone();
+    loaded.slash_popup = state.slash_popup.clone();
     loaded.queued_messages = std::mem::take(&mut state.queued_messages);
     loaded.input_history = std::mem::take(&mut state.input_history);
     loaded.history_index = state.history_index;
@@ -921,30 +1292,52 @@ fn handle_composer_command(
     if !message.starts_with('/') {
         return None;
     }
-    match message {
-        "/help" => {
+    let name = message
+        .strip_prefix('/')
+        .unwrap_or(message)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    let Some(command) = find_slash_command(name) else {
+        state.status_message = Some(format!("unknown command: {message}; try /help"));
+        return Some(true);
+    };
+    Some(dispatch_slash_command(
+        commands,
+        state,
+        command.action,
+        message,
+        initial_run_id,
+    ))
+}
+
+fn dispatch_slash_command(
+    commands: &Sender<ClientCommand>,
+    state: &mut TuiState,
+    action: SlashCommandAction,
+    _message: &str,
+    initial_run_id: Option<String>,
+) -> bool {
+    match action {
+        SlashCommandAction::Help => {
             state.help_visible = true;
             state.status_message = Some("help opened".into());
-            Some(true)
+            true
         }
-        "/clear" => {
+        SlashCommandAction::Clear => {
             clear_visible_transcript(state);
             state.status_message = Some("visible transcript cleared".into());
-            Some(true)
+            true
         }
-        "/quit" => Some(false),
-        "/reconnect" => {
+        SlashCommandAction::Reconnect => {
             if is_disconnected(state) {
                 reconnect(commands, state, initial_run_id);
             } else {
                 state.status_message = Some("already connected".into());
             }
-            Some(true)
+            true
         }
-        _ => {
-            state.status_message = Some(format!("unknown command: {message}; try /help"));
-            Some(true)
-        }
+        SlashCommandAction::Quit => false,
     }
 }
 
@@ -1027,7 +1420,7 @@ impl TerminalSession {
     fn enter() -> AppResult<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
     }
@@ -1041,7 +1434,11 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -1051,6 +1448,15 @@ mod tests {
     use super::*;
     use crate::{daemon::protocol::HelloResult, tui::TranscriptState};
     use serde_json::json;
+
+    fn press_key(
+        key: KeyEvent,
+        state: &mut TuiState,
+        runtime: &UiRuntime,
+        sender: &Sender<ClientCommand>,
+    ) -> bool {
+        handle_key_press(key, state, runtime, sender, None, None)
+    }
 
     #[test]
     fn submit_composer_uses_run_start_when_idle() {
@@ -1240,6 +1646,184 @@ mod tests {
             state.status_message.as_deref(),
             Some("unknown command: /wat; try /help")
         );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_popup_filters_and_tab_completes_selected_command() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(
+            state
+                .slash_popup
+                .as_ref()
+                .map(|popup| popup.filter.as_str()),
+            Some("")
+        );
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(state.composer, "/c");
+        assert_eq!(
+            state
+                .slash_popup
+                .as_ref()
+                .map(|popup| popup.filter.as_str()),
+            Some("c")
+        );
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(state.composer, "/clear ");
+        assert_eq!(state.composer_cursor, state.composer.len());
+        assert!(state.slash_popup.is_none());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_popup_enter_dispatches_selected_command() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("visible transcript cleared")
+        );
+        assert_eq!(state.input_history, vec!["/clear"]);
+        assert!(state.composer.is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn slash_popup_ctrl_navigation_matches_codex_keys() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(
+            state.slash_popup.as_ref().map(|popup| popup.selected),
+            Some(1)
+        );
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(
+            state.slash_popup.as_ref().map(|popup| popup.selected),
+            Some(0)
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn codex_newline_keys_insert_newlines_without_submitting() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        state.composer = "a".into();
+        state.composer_cursor = state.composer.len();
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+        ] {
+            assert!(press_key(key, &mut state, &runtime, &sender));
+            state.composer.push('x');
+            state.composer_cursor = state.composer.len();
+        }
+
+        assert_eq!(state.composer, "a\nx\nx\nx\nx");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn paste_normalizes_carriage_returns_and_updates_popup() {
+        let (_sender, _receiver) = mpsc::channel::<ClientCommand>();
+        let mut state = test_state();
+
+        handle_paste_text(&mut state, "/c\rnext");
+
+        assert_eq!(state.composer, "/c\nnext");
+        assert_eq!(state.composer_cursor, state.composer.len());
+        assert!(state.slash_popup.is_none());
+    }
+
+    #[test]
+    fn kill_and_yank_follow_codex_composer_basics() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+        state.composer = "hello world".into();
+        state.composer_cursor = "hello ".len();
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(state.composer, "hello ");
+        assert_eq!(state.composer_kill_buffer, "world");
+
+        assert!(press_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &mut state,
+            &runtime,
+            &sender,
+        ));
+        assert_eq!(state.composer, "hello world");
         assert!(receiver.try_recv().is_err());
     }
 
