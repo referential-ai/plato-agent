@@ -22,6 +22,7 @@ pub struct TuiState {
     pub status_message: Option<String>,
     pub stream_warning: Option<String>,
     pub approval: Option<ApprovalModalView>,
+    pub help_visible: bool,
     pub cancel_requested: bool,
 }
 
@@ -56,6 +57,7 @@ impl TuiState {
             status_message: None,
             stream_warning: None,
             approval: None,
+            help_visible: false,
             cancel_requested: false,
         }
     }
@@ -80,6 +82,7 @@ impl TuiState {
             status_message: None,
             stream_warning: None,
             approval: None,
+            help_visible: false,
             cancel_requested: false,
         }
     }
