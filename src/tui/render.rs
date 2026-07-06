@@ -49,17 +49,9 @@ fn history_lines(state: &TuiState) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match &state.transcript {
         TranscriptState::Loaded(transcript) => {
-            lines.push(Line::from(vec![
-                Span::styled("run ", Style::default().fg(Color::Yellow)),
-                Span::raw(transcript.run_id.clone()),
-            ]));
+            lines.push(status_row(format!("run {}", transcript.run_id)));
             lines.push(Line::from(""));
-            lines.extend(
-                transcript
-                    .content
-                    .lines()
-                    .map(|line| Line::from(line.to_owned())),
-            );
+            lines.extend(readback_lines(&transcript.content));
         }
         TranscriptState::Unavailable { run_id, error } => {
             lines.push(Line::from(vec![
@@ -313,6 +305,60 @@ fn event_row(event: &super::LiveEventLine) -> Line<'static> {
     }
 }
 
+fn readback_lines(content: &str) -> Vec<Line<'static>> {
+    let mut lines = content
+        .lines()
+        .filter_map(readback_line)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(status_row("no chat messages in readback"));
+    }
+    lines
+}
+
+fn readback_line(line: &str) -> Option<Line<'static>> {
+    if line.starts_with("final_phase:")
+        || line.starts_with("next_seq:")
+        || line.starts_with("session_id:")
+        || line.contains("] context ")
+    {
+        return None;
+    }
+    if let Some(run_id) = line.strip_prefix("run_id: ") {
+        return Some(status_row(format!("run {run_id}")));
+    }
+    if let Some(text) = turn_text(line, "user: ") {
+        return Some(role_row("user", Color::Cyan, text));
+    }
+    if let Some(text) = turn_text(line, "assistant: ") {
+        return Some(role_row("assistant", Color::Green, text));
+    }
+    if let Some(text) = turn_text(line, "tool: ") {
+        return Some(role_row("tool", Color::Magenta, text));
+    }
+    if let Some(text) = turn_text(line, "tool_call ") {
+        return Some(role_row("tool", Color::Magenta, text));
+    }
+    if let Some(text) = line.strip_prefix("tool_result ") {
+        return Some(role_row("tool", Color::Magenta, text));
+    }
+    if line.starts_with("policy_denied ")
+        || line.starts_with("approval_denied ")
+        || line.starts_with("tool_failed ")
+    {
+        return Some(warning_row(line.to_owned()));
+    }
+    if line.starts_with("approval_granted ") {
+        return Some(status_row(line.to_owned()));
+    }
+    Some(status_row(line.to_owned()))
+}
+
+fn turn_text<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    let start = line.find("] ")? + 2;
+    line[start..].strip_prefix(marker)
+}
+
 fn role_row(role: &'static str, color: Color, text: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{role:<9} "), Style::default().fg(color)),
@@ -512,7 +558,9 @@ mod tests {
             TranscriptState::Loaded(
                 TranscriptReadResult {
                     run_id: "run_1".into(),
-                    transcript: "final_phase: Finished".into(),
+                    transcript:
+                        "final_phase: Finished\nnext_seq: 5\n[turn_1] context ToolSchemas model.tools: [{\"name\":\"file_read\"}]\n[turn_1] user: read README\n[turn_1] assistant: README summary\n"
+                            .into(),
                 }
                 .into(),
             ),
@@ -522,7 +570,14 @@ mod tests {
 
         assert!(output.contains("ready"));
         assert!(output.contains("run_1"));
-        assert!(output.contains("final_phase"));
+        assert!(output.contains("user"));
+        assert!(output.contains("read README"));
+        assert!(output.contains("assistant"));
+        assert!(output.contains("README summary"));
+        assert!(!output.contains("final_phase"));
+        assert!(!output.contains("next_seq"));
+        assert!(!output.contains("ToolSchemas"));
+        assert!(!output.contains("file_read"));
     }
 
     #[test]
