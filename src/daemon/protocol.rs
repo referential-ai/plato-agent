@@ -5,6 +5,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 pub const ERROR_MALFORMED_REQUEST: &str = "malformed_request";
 pub const ERROR_LAGGED: &str = "lagged";
+pub const ERROR_INTERNAL: &str = "internal_error";
 pub const ERROR_NOT_FOUND: &str = "not_found";
 pub const ERROR_OVERLOAD: &str = "overload";
 pub const ERROR_RUN_FAILED: &str = "run_failed";
@@ -175,6 +176,7 @@ pub struct SessionSummary {
     pub session_id: String,
     pub run_id: String,
     pub status: String,
+    pub latest_question: String,
     pub ledger_path: String,
 }
 

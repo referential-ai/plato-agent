@@ -11,6 +11,6 @@ pub use modal::{
 };
 pub use render::{render, render_snapshot};
 pub use state::{
-    ActiveRunView, ConnectionState, LiveEventKind, LiveEventLine, TranscriptState, TranscriptView,
-    TuiState,
+    ActiveRunView, ConnectionState, LiveEventKind, LiveEventLine, SessionPickerView,
+    TranscriptState, TranscriptView, TuiState,
 };

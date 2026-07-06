@@ -2,6 +2,8 @@
 pub(crate) enum SlashCommandAction {
     Help,
     Clear,
+    Sessions,
+    NewSession,
     Reconnect,
     Quit,
 }
@@ -23,6 +25,16 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "clear",
         description: "clear the visible transcript",
         action: SlashCommandAction::Clear,
+    },
+    SlashCommandSpec {
+        name: "sessions",
+        description: "open the session picker",
+        action: SlashCommandAction::Sessions,
+    },
+    SlashCommandSpec {
+        name: "new",
+        description: "start a fresh session",
+        action: SlashCommandAction::NewSession,
     },
     SlashCommandSpec {
         name: "reconnect",

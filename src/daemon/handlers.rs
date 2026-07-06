@@ -2,12 +2,12 @@ use crate::{
     ApprovalMode, RunEvent, RunLedger, RunOptions, RunSession,
     daemon::{
         protocol::{
-            ApprovalDecideParams, CommandAcceptedResult, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
-            ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_UNSUPPORTED_METHOD,
-            ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams, EventsStreamResult,
-            HelloParams, HelloResult, MessageAppendParams, RunCancelParams, RunStartParams,
-            RunStartResult, SessionSummary, SessionsListResult, TranscriptReadParams,
-            TranscriptReadResult, decode_request,
+            ApprovalDecideParams, CommandAcceptedResult, ERROR_INTERNAL, ERROR_LAGGED,
+            ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
+            ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams,
+            EventsStreamResult, HelloParams, HelloResult, MessageAppendParams, RunCancelParams,
+            RunStartParams, RunStartResult, SessionSummary, SessionsListResult,
+            TranscriptReadParams, TranscriptReadResult, decode_request,
         },
         runtime::{DaemonRuntime, RunRecord, approval_handler},
     },
@@ -23,6 +23,9 @@ use std::{
 
 const DEFAULT_EVENT_LIMIT: usize = 64;
 const MAX_EVENT_LIMIT: usize = 128;
+const SESSION_STATUS_RUNNING: &str = "running";
+const SESSION_STATUS_INTERRUPTED: &str = "interrupted";
+const LATEST_QUESTION_MAX_CHARS: usize = 120;
 
 pub(super) fn handle_line(runtime: &DaemonRuntime, line: &str) -> Envelope {
     match decode_request(line) {
@@ -414,20 +417,91 @@ fn handle_run_cancel(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
 }
 
 fn handle_sessions_list(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
-    let runs = runtime.runs.lock().expect("runs lock poisoned");
-    let sessions = runs
-        .values()
-        .map(|record| SessionSummary {
-            session_id: record.session_id.clone(),
-            run_id: record.run_id.clone(),
-            status: record.status().state.as_str().into(),
-            ledger_path: record.ledger_path.to_string_lossy().into_owned(),
+    match session_summaries(runtime) {
+        Ok(sessions) => Envelope::response(
+            request.id,
+            Some("sessions.list".into()),
+            to_value(SessionsListResult { sessions }).expect("sessions.list result serializes"),
+        ),
+        Err(error) => Envelope::error(
+            request.id,
+            Some("sessions.list".into()),
+            ERROR_INTERNAL,
+            error.to_string(),
+        ),
+    }
+}
+
+fn session_summaries(runtime: &DaemonRuntime) -> crate::AppResult<Vec<SessionSummary>> {
+    let ledger_path = runtime.paths.ledger_path.clone();
+    let mut sessions = crate::ledger::sqlite_session_summaries(&ledger_path)?
+        .into_iter()
+        .map(|session| SessionSummary {
+            session_id: session.session_id,
+            run_id: session.run_id,
+            status: session.status,
+            latest_question: latest_question_preview(&session.latest_question),
+            ledger_path: ledger_path.to_string_lossy().into_owned(),
         })
-        .collect();
-    Envelope::response(
-        request.id,
-        Some("sessions.list".into()),
-        to_value(SessionsListResult { sessions }).expect("sessions.list result serializes"),
+        .collect::<Vec<_>>();
+
+    let active_sessions = runtime
+        .runs
+        .lock()
+        .expect("runs lock poisoned")
+        .values()
+        .filter_map(|record| {
+            let status = record.status();
+            if status.state != crate::daemon::runtime::RunStateName::Running {
+                return None;
+            }
+            Some(SessionSummary {
+                session_id: record.session_id.clone(),
+                run_id: record.run_id.clone(),
+                status: status.state.as_str().into(),
+                latest_question: String::new(),
+                ledger_path: record.ledger_path.to_string_lossy().into_owned(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for session in &mut sessions {
+        if session.status == SESSION_STATUS_RUNNING
+            && !active_sessions
+                .iter()
+                .any(|active| active.session_id == session.session_id)
+        {
+            session.status = SESSION_STATUS_INTERRUPTED.into();
+        }
+    }
+
+    for summary in active_sessions {
+        if let Some(existing) = sessions
+            .iter_mut()
+            .find(|session| session.session_id == summary.session_id)
+        {
+            existing.run_id = summary.run_id;
+            existing.status = summary.status;
+            existing.ledger_path = summary.ledger_path;
+        } else {
+            // wait=false runs can be visible before begin_session_run persists the question.
+            sessions.insert(0, summary);
+        }
+    }
+
+    Ok(sessions)
+}
+
+fn latest_question_preview(question: &str) -> String {
+    let line = question.lines().next().unwrap_or_default();
+    if line.chars().count() <= LATEST_QUESTION_MAX_CHARS {
+        return line.to_owned();
+    }
+    format!(
+        "{}...",
+        line.chars()
+            .take(LATEST_QUESTION_MAX_CHARS)
+            .collect::<String>()
     )
 }
 

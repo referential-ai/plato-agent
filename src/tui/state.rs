@@ -8,6 +8,7 @@ pub struct TuiState {
     pub socket_path: String,
     pub connection: ConnectionState,
     pub sessions: Vec<SessionSummary>,
+    pub selected_session_id: Option<String>,
     pub transcript: TranscriptState,
     pub active_run: Option<ActiveRunView>,
     pub live_events: Vec<LiveEventLine>,
@@ -18,6 +19,7 @@ pub struct TuiState {
     pub composer_cursor: usize,
     pub composer_kill_buffer: String,
     pub slash_popup: Option<SlashPopupView>,
+    pub session_picker: Option<SessionPickerView>,
     pub queued_messages: Vec<String>,
     pub input_history: Vec<String>,
     pub history_index: Option<usize>,
@@ -36,6 +38,7 @@ impl TuiState {
         sessions: Vec<SessionSummary>,
         transcript: TranscriptState,
     ) -> Self {
+        let selected_session_id = sessions.first().map(|session| session.session_id.clone());
         Self {
             workspace_root,
             socket_path,
@@ -45,6 +48,7 @@ impl TuiState {
                 ledger_path: hello.ledger_path,
             },
             sessions,
+            selected_session_id,
             transcript,
             active_run: None,
             live_events: Vec::new(),
@@ -55,6 +59,7 @@ impl TuiState {
             composer_cursor: 0,
             composer_kill_buffer: String::new(),
             slash_popup: None,
+            session_picker: None,
             queued_messages: Vec::new(),
             input_history: Vec::new(),
             history_index: None,
@@ -72,6 +77,7 @@ impl TuiState {
             socket_path,
             connection: ConnectionState::Disconnected { error },
             sessions: Vec::new(),
+            selected_session_id: None,
             transcript: TranscriptState::None,
             active_run: None,
             live_events: Vec::new(),
@@ -82,6 +88,7 @@ impl TuiState {
             composer_cursor: 0,
             composer_kill_buffer: String::new(),
             slash_popup: None,
+            session_picker: None,
             queued_messages: Vec::new(),
             input_history: Vec::new(),
             history_index: None,
@@ -97,6 +104,11 @@ impl TuiState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlashPopupView {
     pub filter: String,
+    pub selected: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionPickerView {
     pub selected: usize,
 }
 

@@ -16,6 +16,7 @@ const RUN_STATUS_RUNNING: &str = "running";
 const RUN_STATUS_FINISHED: &str = "finished";
 const RUN_STATUS_FAILED: &str = "failed";
 const RUN_STATUS_CANCELED: &str = "canceled";
+const RUN_STATUS_INTERRUPTED: &str = "interrupted";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,6 +130,14 @@ pub struct SessionRunRecords {
 pub struct SessionRecords {
     pub session_id: String,
     pub runs: Vec<SessionRunRecords>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedSessionSummary {
+    pub session_id: String,
+    pub run_id: String,
+    pub status: String,
+    pub latest_question: String,
 }
 
 impl SqliteLedger {
@@ -331,6 +340,35 @@ impl SqliteLedger {
         self.update_session_run(run_id, status, None, Some(error))
     }
 
+    pub fn interrupt_running_session_runs(&mut self, error: &str) -> AppResult<usize> {
+        let now = sqlite_i64(now_ms(), "occurred_at_ms")?;
+        let transaction = self.connection.transaction()?;
+        let session_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT DISTINCT session_id
+                 FROM session_runs
+                 WHERE status = ?1",
+            )?;
+            statement
+                .query_map(params![RUN_STATUS_RUNNING], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let updated = transaction.execute(
+            "UPDATE session_runs
+             SET status = ?2, error = ?3, updated_at_ms = ?4
+             WHERE status = ?1",
+            params![RUN_STATUS_RUNNING, RUN_STATUS_INTERRUPTED, error, now],
+        )?;
+        for session_id in session_ids {
+            transaction.execute(
+                "UPDATE sessions SET updated_at_ms = ?2 WHERE session_id = ?1",
+                params![session_id, now],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(updated)
+    }
+
     pub fn read_session(&self, session_id: &str) -> AppResult<SessionRecords> {
         if !self.session_exists(session_id)? {
             return Err(AppError::SessionNotFound(session_id.into()));
@@ -362,6 +400,30 @@ impl SqliteLedger {
     pub fn read_latest_session(&self) -> AppResult<SessionRecords> {
         let session_id = self.latest_session_id()?;
         self.read_session(&session_id)
+    }
+
+    pub fn session_summaries(&self) -> AppResult<Vec<PersistedSessionSummary>> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.session_id, sr.run_id, sr.status, sr.question
+             FROM sessions s
+             JOIN session_runs sr ON sr.session_id = s.session_id
+             WHERE sr.session_index = (
+               SELECT MAX(session_index)
+               FROM session_runs
+               WHERE session_id = s.session_id
+             )
+             ORDER BY s.updated_at_ms DESC, s.session_id DESC",
+        )?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(PersistedSessionSummary {
+                    session_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    status: row.get(2)?,
+                    latest_question: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     fn session_exists(&self, session_id: &str) -> AppResult<bool> {
@@ -598,6 +660,21 @@ pub fn read_sqlite_session(path: &Path, session_id: &str) -> AppResult<SessionRe
     SqliteLedger::open_readonly(path)?.read_session(session_id)
 }
 
+pub fn sqlite_session_summaries(path: &Path) -> AppResult<Vec<PersistedSessionSummary>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    SqliteLedger::open_readonly(path)?.session_summaries()
+}
+
+pub fn interrupt_orphaned_sqlite_runs(path: &Path) -> AppResult<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    SqliteLedger::open_or_create(path)?
+        .interrupt_running_session_runs("daemon restarted before run completed")
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -721,6 +798,66 @@ mod tests {
                 final_answer: "hi".into(),
             }]
         );
+    }
+
+    #[test]
+    fn sqlite_session_summaries_report_latest_session_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let first_run = RunId::new("run_1").unwrap();
+        let second_run = RunId::new("run_2").unwrap();
+
+        ledger
+            .begin_session_run("session_1", &first_run, "first question", true)
+            .unwrap();
+        ledger
+            .finish_session_run(&first_run, "first answer")
+            .unwrap();
+        ledger
+            .begin_session_run("session_1", &second_run, "second question", false)
+            .unwrap();
+
+        assert_eq!(
+            ledger.session_summaries().unwrap(),
+            vec![PersistedSessionSummary {
+                session_id: "session_1".into(),
+                run_id: "run_2".into(),
+                status: RUN_STATUS_RUNNING.into(),
+                latest_question: "second question".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn sqlite_interrupts_running_session_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let run_id = RunId::new("run_1").unwrap();
+
+        ledger
+            .begin_session_run("session_1", &run_id, "first question", true)
+            .unwrap();
+
+        assert_eq!(
+            ledger
+                .interrupt_running_session_runs("daemon restarted")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            ledger.session_summaries().unwrap()[0].status,
+            RUN_STATUS_INTERRUPTED
+        );
+        ledger
+            .begin_session_run(
+                "session_1",
+                &RunId::new("run_2").unwrap(),
+                "follow up",
+                false,
+            )
+            .unwrap();
     }
 
     #[test]

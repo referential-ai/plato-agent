@@ -60,6 +60,16 @@ impl DaemonClient {
         )
     }
 
+    pub fn transcript_read_session(&mut self, session_id: &str) -> AppResult<TranscriptReadResult> {
+        self.request(
+            "transcript.read",
+            TranscriptReadParams {
+                run_id: None,
+                session_id: Some(session_id.into()),
+            },
+        )
+    }
+
     pub fn run_start(
         &mut self,
         question: String,
@@ -82,11 +92,21 @@ impl DaemonClient {
         config_path: Option<String>,
         wait: bool,
     ) -> AppResult<RunStartResult> {
+        self.message_append_to_session(message, None, config_path, wait)
+    }
+
+    pub fn message_append_to_session(
+        &mut self,
+        message: String,
+        session_id: Option<String>,
+        config_path: Option<String>,
+        wait: bool,
+    ) -> AppResult<RunStartResult> {
         self.request(
             "message.append",
             MessageAppendParams {
                 message,
-                session_id: None,
+                session_id,
                 config_path,
                 wait: Some(wait),
             },
@@ -300,6 +320,7 @@ mod tests {
                         "session_id": "run_1",
                         "run_id": "run_1",
                         "status": "finished",
+                        "latest_question": "hello",
                         "ledger_path": "/tmp/agent.db"
                     }]
                 }),
@@ -318,6 +339,7 @@ mod tests {
                 session_id: "run_1".into(),
                 run_id: "run_1".into(),
                 status: "finished".into(),
+                latest_question: "hello".into(),
                 ledger_path: "/tmp/agent.db".into(),
             }]
         );
@@ -418,6 +440,69 @@ mod tests {
         assert_eq!(run.run_id, "run_1");
         assert_eq!(events.next_offset, 3);
         assert_eq!(events.events.len(), 1);
+    }
+
+    #[test]
+    fn client_sends_session_transcript_and_message_append_requests() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+
+            let transcript = read_request(&mut reader);
+            assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
+            assert!(transcript.params.as_ref().unwrap()["run_id"].is_null());
+            assert_eq!(
+                transcript.params.as_ref().unwrap()["session_id"],
+                "session_1"
+            );
+            write_response(
+                &mut writer,
+                transcript.id,
+                "transcript.read",
+                json!({
+                    "run_id": "session_1",
+                    "transcript": "[turn_1] user: hello"
+                }),
+            );
+
+            let append = read_request(&mut reader);
+            assert_eq!(append.method.as_deref(), Some("message.append"));
+            assert_eq!(append.params.as_ref().unwrap()["message"], "follow up");
+            assert_eq!(append.params.as_ref().unwrap()["session_id"], "session_1");
+            assert_eq!(append.params.as_ref().unwrap()["wait"], false);
+            write_response(
+                &mut writer,
+                append.id,
+                "message.append",
+                json!({
+                    "run_id": "run_2",
+                    "session_id": "session_1",
+                    "ledger_path": "/tmp/agent.db",
+                    "status": "running",
+                    "final_answer": null
+                }),
+            );
+        });
+
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        let transcript = client.transcript_read_session("session_1").unwrap();
+        let run = client
+            .message_append_to_session(
+                "follow up".into(),
+                Some("session_1".into()),
+                Some("plato.toml".into()),
+                false,
+            )
+            .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(transcript.run_id, "session_1");
+        assert_eq!(run.session_id, "session_1");
+        assert_eq!(run.run_id, "run_2");
     }
 
     #[test]
