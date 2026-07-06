@@ -15,6 +15,9 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     render_history(frame, history, state);
     render_status_rule(frame, status, state);
     render_composer(frame, composer, state);
+    if state.help_visible {
+        render_help_modal(frame, frame.area());
+    }
     if let Some(approval) = &state.approval {
         render_approval_modal(frame, frame.area(), approval);
     }
@@ -281,7 +284,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     };
     lines.push(Line::from(Span::styled(
         format!(
-            "Enter submits | Alt/Shift-Enter newline | PgUp/PgDown scroll | queued {}",
+            "? help | /help /clear /quit /reconnect | Enter submits | Alt-Enter newline | queued {}",
             state.queued_messages.len()
         ),
         Style::default().fg(Color::DarkGray),
@@ -415,6 +418,38 @@ fn format_elapsed(seconds: u64) -> String {
     }
 }
 
+fn render_help_modal(frame: &mut Frame<'_>, area: Rect) {
+    let area = centered_rect(68, 64, area);
+    let lines = vec![
+        Line::from(vec![Span::styled(
+            "Commands",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("/help        show this help"),
+        Line::from("/clear       clear the visible transcript"),
+        Line::from("/reconnect   reconnect when offline"),
+        Line::from("/quit        close the TUI"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Keys",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("Enter        submit"),
+        Line::from("Alt-Enter    newline"),
+        Line::from("PgUp/PgDown  scroll"),
+        Line::from("Up/Down      input history"),
+        Line::from("Ctrl-C       cancel active run"),
+        Line::from("Esc or q     close"),
+    ];
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Help"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalModalView) {
     let area = centered_rect(74, 64, area);
     let mut lines = vec![
@@ -532,6 +567,7 @@ mod tests {
         assert!(output.contains("model pending"));
         assert!(output.contains("ready | plato"));
         assert!(output.contains("Try \"read README.md and summarize it\""));
+        assert!(output.contains("? help"));
         assert!(!output.contains("Status"));
         assert!(!output.contains("Sessions"));
         assert!(!output.contains("Live Events"));
@@ -763,6 +799,33 @@ mod tests {
 
         assert!(output.contains("stream warning"));
         assert!(output.contains("lagged"));
+    }
+
+    #[test]
+    fn renders_help_modal() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+        state.help_visible = true;
+
+        let output = render_to_text(&state);
+
+        assert!(output.contains("Help"));
+        assert!(output.contains("/help"));
+        assert!(output.contains("/clear"));
+        assert!(output.contains("/reconnect"));
+        assert!(output.contains("/quit"));
+        assert!(output.contains("PgUp/PgDown"));
+        assert!(output.contains("Ctrl-C"));
     }
 
     #[test]

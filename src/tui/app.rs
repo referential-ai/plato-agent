@@ -94,6 +94,16 @@ fn handle_key_press(
         return request_cancel(commands, state);
     }
 
+    if state.help_visible {
+        match key.code {
+            KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => {
+                state.help_visible = false;
+            }
+            _ => {}
+        }
+        return true;
+    }
+
     if state.approval.is_some() {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return false,
@@ -118,6 +128,10 @@ fn handle_key_press(
 
     match key.code {
         KeyCode::Esc => false,
+        KeyCode::Char('?') if state.composer.is_empty() => {
+            state.help_visible = true;
+            true
+        }
         KeyCode::Char('q') if state.composer.is_empty() => false,
         KeyCode::Char('r') if is_disconnected(state) => {
             reconnect(commands, state, initial_run_id);
@@ -133,7 +147,7 @@ fn handle_key_press(
         }
         KeyCode::Enter => {
             if !consume_line_continuation(state) {
-                submit_composer(commands, state, runtime, config_path);
+                return submit_composer(commands, state, runtime, initial_run_id, config_path);
             }
             true
         }
@@ -670,6 +684,7 @@ fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
     loaded.queued_messages = std::mem::take(&mut state.queued_messages);
     loaded.input_history = std::mem::take(&mut state.input_history);
     loaded.history_index = state.history_index;
+    loaded.help_visible = state.help_visible;
     if loaded.status_message.is_none() {
         loaded.status_message = state.status_message.clone();
     }
@@ -870,18 +885,22 @@ fn submit_composer(
     commands: &Sender<ClientCommand>,
     state: &mut TuiState,
     runtime: &UiRuntime,
+    initial_run_id: Option<String>,
     config_path: Option<String>,
-) {
+) -> bool {
     let message = state.composer.trim().to_string();
     if message.is_empty() {
-        return;
+        return true;
     }
     record_input_history(state, &message);
     clear_composer(state);
+    if let Some(keep_running) = handle_composer_command(commands, state, &message, initial_run_id) {
+        return keep_running;
+    }
     if runtime_is_busy(runtime) {
         state.queued_messages.push(message);
         state.status_message = Some("queued for next turn".into());
-        return;
+        return true;
     }
     push_live_event(state, crate::tui::LiveEventLine::user(message.clone()));
     let command = ClientCommand::RunStart {
@@ -890,6 +909,50 @@ fn submit_composer(
     };
     state.status_message = Some("submitted to daemon".into());
     send_command(commands, command, state);
+    true
+}
+
+fn handle_composer_command(
+    commands: &Sender<ClientCommand>,
+    state: &mut TuiState,
+    message: &str,
+    initial_run_id: Option<String>,
+) -> Option<bool> {
+    if !message.starts_with('/') {
+        return None;
+    }
+    match message {
+        "/help" => {
+            state.help_visible = true;
+            state.status_message = Some("help opened".into());
+            Some(true)
+        }
+        "/clear" => {
+            clear_visible_transcript(state);
+            state.status_message = Some("visible transcript cleared".into());
+            Some(true)
+        }
+        "/quit" => Some(false),
+        "/reconnect" => {
+            if is_disconnected(state) {
+                reconnect(commands, state, initial_run_id);
+            } else {
+                state.status_message = Some("already connected".into());
+            }
+            Some(true)
+        }
+        _ => {
+            state.status_message = Some(format!("unknown command: {message}; try /help"));
+            Some(true)
+        }
+    }
+}
+
+fn clear_visible_transcript(state: &mut TuiState) {
+    state.transcript = TranscriptState::None;
+    state.live_events.clear();
+    state.stream_warning = None;
+    state.scroll_offset = 0;
 }
 
 fn runtime_is_busy(runtime: &UiRuntime) -> bool {
@@ -996,7 +1059,13 @@ mod tests {
         state.composer = "start work".into();
         let runtime = UiRuntime::from_state(&state, None);
 
-        submit_composer(&sender, &mut state, &runtime, Some("plato.toml".into()));
+        assert!(submit_composer(
+            &sender,
+            &mut state,
+            &runtime,
+            None,
+            Some("plato.toml".into())
+        ));
 
         match receiver.try_recv().unwrap() {
             ClientCommand::RunStart {
@@ -1028,7 +1097,7 @@ mod tests {
             active_since: Some(Instant::now()),
         };
 
-        submit_composer(&sender, &mut state, &runtime, None);
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
 
         assert!(receiver.try_recv().is_err());
         assert!(state.composer.is_empty());
@@ -1039,6 +1108,139 @@ mod tests {
             state.status_message.as_deref(),
             Some("queued for next turn")
         );
+    }
+
+    #[test]
+    fn question_mark_opens_and_esc_closes_help() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+            None,
+            None,
+        ));
+        assert!(state.help_visible);
+
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+            None,
+            None,
+        ));
+        assert!(!state.help_visible);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn help_command_opens_help_without_daemon_command() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.composer = "/help".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+
+        assert!(state.help_visible);
+        assert_eq!(state.status_message.as_deref(), Some("help opened"));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn clear_command_clears_visible_transcript_only() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.transcript = TranscriptState::Unavailable {
+            run_id: "run_1".into(),
+            error: "boom".into(),
+        };
+        state.live_events = vec![crate::tui::LiveEventLine::assistant(Some(1), "hello")];
+        state.stream_warning = Some("lagged".into());
+        state.scroll_offset = 10;
+        state.composer = "/clear".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+
+        assert_eq!(state.transcript, TranscriptState::None);
+        assert!(state.live_events.is_empty());
+        assert!(state.stream_warning.is_none());
+        assert_eq!(state.scroll_offset, 0);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("visible transcript cleared")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn quit_command_exits_without_daemon_command() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.composer = "/quit".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(!submit_composer(&sender, &mut state, &runtime, None, None));
+
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn reconnect_command_only_sends_load_when_offline() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.composer = "/reconnect".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+        assert_eq!(state.status_message.as_deref(), Some("already connected"));
+        assert!(receiver.try_recv().is_err());
+
+        state.connection = crate::tui::ConnectionState::Disconnected {
+            error: "connection closed".into(),
+        };
+        state.composer = "/reconnect".into();
+        state.composer_cursor = state.composer.len();
+        assert!(submit_composer(
+            &sender,
+            &mut state,
+            &runtime,
+            Some("run_1".into()),
+            None
+        ));
+
+        assert_eq!(state.status_message.as_deref(), Some("reconnecting"));
+        match receiver.try_recv().unwrap() {
+            ClientCommand::Load { run_id } => assert_eq!(run_id.as_deref(), Some("run_1")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_slash_command_does_not_hit_daemon() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.composer = "/wat".into();
+        state.composer_cursor = state.composer.len();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        assert!(submit_composer(&sender, &mut state, &runtime, None, None));
+
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("unknown command: /wat; try /help")
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
