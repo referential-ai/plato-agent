@@ -56,7 +56,7 @@ pub fn run_tui(options: TuiOptions) -> AppResult<()> {
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let (commands, events) = spawn_client_worker(config.clone());
-    let mut runtime = UiRuntime::from_state(&state);
+    let mut runtime = UiRuntime::from_state(&state, config_path.clone());
     let mut terminal = TerminalSession::enter()?;
 
     loop {
@@ -103,8 +103,15 @@ fn handle_key_press(
         return true;
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
-        state.composer.clear();
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('a') => move_composer_home(state),
+            KeyCode::Char('e') => move_composer_end(state),
+            KeyCode::Char('k') => delete_composer_to_end(state),
+            KeyCode::Char('u') => clear_composer(state),
+            KeyCode::Char('w') => delete_previous_word(state),
+            _ => {}
+        }
         return true;
     }
 
@@ -115,19 +122,57 @@ fn handle_key_press(
             reconnect(commands, state, initial_run_id);
             true
         }
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            insert_composer_text(state, "\n");
+            true
+        }
         KeyCode::Enter => {
-            submit_composer(commands, state, runtime, config_path);
+            if !consume_line_continuation(state) {
+                submit_composer(commands, state, runtime, config_path);
+            }
             true
         }
         KeyCode::Backspace => {
-            state.composer.pop();
+            delete_composer_before_cursor(state);
+            true
+        }
+        KeyCode::Delete => {
+            delete_composer_after_cursor(state);
+            true
+        }
+        KeyCode::Left => {
+            move_composer_left(state);
+            true
+        }
+        KeyCode::Right => {
+            move_composer_right(state);
+            true
+        }
+        KeyCode::Home => {
+            move_composer_home(state);
+            true
+        }
+        KeyCode::End => {
+            move_composer_end(state);
+            true
+        }
+        KeyCode::Up if !state.composer.contains('\n') => {
+            recall_history_previous(state);
+            true
+        }
+        KeyCode::Down if !state.composer.contains('\n') => {
+            recall_history_next(state);
             true
         }
         KeyCode::Char(ch)
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT) =>
         {
-            state.composer.push(ch);
+            insert_composer_char(state, ch);
             true
         }
         _ => true,
@@ -144,6 +189,174 @@ fn is_disconnected(state: &TuiState) -> bool {
         state.connection,
         crate::tui::ConnectionState::Disconnected { .. }
     )
+}
+
+fn insert_composer_char(state: &mut TuiState, ch: char) {
+    let mut buffer = [0; 4];
+    insert_composer_text(state, ch.encode_utf8(&mut buffer));
+}
+
+fn insert_composer_text(state: &mut TuiState, text: &str) {
+    clamp_composer_cursor(state);
+    state.composer.insert_str(state.composer_cursor, text);
+    state.composer_cursor += text.len();
+    state.history_index = None;
+}
+
+fn delete_composer_before_cursor(state: &mut TuiState) {
+    clamp_composer_cursor(state);
+    if state.composer_cursor == 0 {
+        return;
+    }
+    let start = previous_boundary(&state.composer, state.composer_cursor);
+    state
+        .composer
+        .replace_range(start..state.composer_cursor, "");
+    state.composer_cursor = start;
+    state.history_index = None;
+}
+
+fn delete_composer_after_cursor(state: &mut TuiState) {
+    clamp_composer_cursor(state);
+    if state.composer_cursor >= state.composer.len() {
+        return;
+    }
+    let end = next_boundary(&state.composer, state.composer_cursor);
+    state.composer.replace_range(state.composer_cursor..end, "");
+    state.history_index = None;
+}
+
+fn delete_composer_to_end(state: &mut TuiState) {
+    clamp_composer_cursor(state);
+    state.composer.truncate(state.composer_cursor);
+    state.history_index = None;
+}
+
+fn delete_previous_word(state: &mut TuiState) {
+    clamp_composer_cursor(state);
+    let mut start = state.composer_cursor;
+    while start > 0 && char_before(&state.composer, start).is_some_and(char::is_whitespace) {
+        start = previous_boundary(&state.composer, start);
+    }
+    while start > 0 && char_before(&state.composer, start).is_some_and(|ch| !ch.is_whitespace()) {
+        start = previous_boundary(&state.composer, start);
+    }
+    state
+        .composer
+        .replace_range(start..state.composer_cursor, "");
+    state.composer_cursor = start;
+    state.history_index = None;
+}
+
+fn clear_composer(state: &mut TuiState) {
+    state.composer.clear();
+    state.composer_cursor = 0;
+    state.history_index = None;
+}
+
+fn move_composer_left(state: &mut TuiState) {
+    clamp_composer_cursor(state);
+    state.composer_cursor = previous_boundary(&state.composer, state.composer_cursor);
+}
+
+fn move_composer_right(state: &mut TuiState) {
+    clamp_composer_cursor(state);
+    state.composer_cursor = next_boundary(&state.composer, state.composer_cursor);
+}
+
+fn move_composer_home(state: &mut TuiState) {
+    state.composer_cursor = 0;
+}
+
+fn move_composer_end(state: &mut TuiState) {
+    state.composer_cursor = state.composer.len();
+}
+
+fn consume_line_continuation(state: &mut TuiState) -> bool {
+    clamp_composer_cursor(state);
+    if state.composer_cursor == 0 {
+        return false;
+    }
+    let start = previous_boundary(&state.composer, state.composer_cursor);
+    if &state.composer[start..state.composer_cursor] != "\\" {
+        return false;
+    }
+    state
+        .composer
+        .replace_range(start..state.composer_cursor, "\n");
+    state.composer_cursor = start + 1;
+    state.history_index = None;
+    true
+}
+
+fn recall_history_previous(state: &mut TuiState) {
+    if state.input_history.is_empty() {
+        return;
+    }
+    let index = state
+        .history_index
+        .map(|index| index.saturating_sub(1))
+        .unwrap_or_else(|| state.input_history.len() - 1);
+    state.history_index = Some(index);
+    state.composer = state.input_history[index].clone();
+    state.composer_cursor = state.composer.len();
+}
+
+fn recall_history_next(state: &mut TuiState) {
+    let Some(index) = state.history_index else {
+        return;
+    };
+    if index + 1 >= state.input_history.len() {
+        clear_composer(state);
+    } else {
+        let next = index + 1;
+        state.history_index = Some(next);
+        state.composer = state.input_history[next].clone();
+        state.composer_cursor = state.composer.len();
+    }
+}
+
+fn record_input_history(state: &mut TuiState, message: &str) {
+    if state
+        .input_history
+        .last()
+        .is_none_or(|last| last != message)
+    {
+        state.input_history.push(message.to_owned());
+    }
+    state.history_index = None;
+}
+
+fn previous_boundary(value: &str, position: usize) -> usize {
+    if position == 0 {
+        return 0;
+    }
+    value[..position]
+        .char_indices()
+        .last()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_boundary(value: &str, position: usize) -> usize {
+    if position >= value.len() {
+        return value.len();
+    }
+    position + value[position..].chars().next().map_or(0, char::len_utf8)
+}
+
+fn char_before(value: &str, position: usize) -> Option<char> {
+    if position == 0 {
+        None
+    } else {
+        value[..position].chars().next_back()
+    }
+}
+
+fn clamp_composer_cursor(state: &mut TuiState) {
+    state.composer_cursor = state.composer_cursor.min(state.composer.len());
+    while !state.composer.is_char_boundary(state.composer_cursor) {
+        state.composer_cursor -= 1;
+    }
 }
 
 fn load_state(config: &DaemonConnectionConfig, run_id: Option<&str>) -> TuiState {
@@ -200,6 +413,7 @@ fn load_connected_state(
 #[derive(Debug)]
 struct UiRuntime {
     active_run_id: Option<String>,
+    config_path: Option<String>,
     next_offset: u64,
     poll_in_flight: bool,
     polling: bool,
@@ -208,9 +422,10 @@ struct UiRuntime {
 }
 
 impl UiRuntime {
-    fn from_state(state: &TuiState) -> Self {
+    fn from_state(state: &TuiState, config_path: Option<String>) -> Self {
         Self {
             active_run_id: state.active_run.as_ref().map(|run| run.run_id.clone()),
+            config_path,
             next_offset: 0,
             poll_in_flight: false,
             polling: state
@@ -425,6 +640,10 @@ fn drain_client_events(
 
 fn apply_loaded_state(state: &mut TuiState, mut loaded: TuiState) {
     loaded.composer = std::mem::take(&mut state.composer);
+    loaded.composer_cursor = state.composer_cursor;
+    loaded.queued_messages = std::mem::take(&mut state.queued_messages);
+    loaded.input_history = std::mem::take(&mut state.input_history);
+    loaded.history_index = state.history_index;
     if loaded.status_message.is_none() {
         loaded.status_message = state.status_message.clone();
     }
@@ -513,6 +732,7 @@ fn apply_events_result(
             },
             state,
         );
+        start_next_queued(commands, state, runtime);
     }
 }
 
@@ -606,16 +826,42 @@ fn submit_composer(
     if message.is_empty() {
         return;
     }
-    if runtime.polling && runtime.active_run_id.is_some() {
-        state.status_message = Some("run already active".into());
+    record_input_history(state, &message);
+    clear_composer(state);
+    if runtime_is_busy(runtime) {
+        state.queued_messages.push(message);
+        state.status_message = Some("queued for next turn".into());
         return;
     }
-    state.composer.clear();
     let command = ClientCommand::RunStart {
         question: message,
         config_path,
     };
     state.status_message = Some("submitted to daemon".into());
+    send_command(commands, command, state);
+}
+
+fn runtime_is_busy(runtime: &UiRuntime) -> bool {
+    runtime.polling || runtime.poll_in_flight
+}
+
+fn start_next_queued(
+    commands: &Sender<ClientCommand>,
+    state: &mut TuiState,
+    runtime: &mut UiRuntime,
+) {
+    if runtime_is_busy(runtime) || state.queued_messages.is_empty() {
+        return;
+    }
+    let message = state.queued_messages.remove(0);
+    let command = ClientCommand::RunStart {
+        question: message,
+        config_path: runtime.config_path.clone(),
+    };
+    runtime.polling = true;
+    runtime.poll_in_flight = false;
+    runtime.active_run_id = None;
+    state.status_message = Some("submitted queued message".into());
     send_command(commands, command, state);
 }
 
@@ -673,7 +919,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.composer = "start work".into();
-        let runtime = UiRuntime::from_state(&state);
+        let runtime = UiRuntime::from_state(&state, None);
 
         submit_composer(&sender, &mut state, &runtime, Some("plato.toml".into()));
 
@@ -691,12 +937,14 @@ mod tests {
     }
 
     #[test]
-    fn submit_composer_rejects_follow_up_while_run_is_polling() {
+    fn submit_composer_queues_follow_up_while_run_is_polling() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.composer = "next turn".into();
+        state.composer_cursor = state.composer.len();
         let runtime = UiRuntime {
             active_run_id: Some("run_1".into()),
+            config_path: Some("plato.toml".into()),
             next_offset: 0,
             poll_in_flight: false,
             polling: true,
@@ -707,15 +955,21 @@ mod tests {
         submit_composer(&sender, &mut state, &runtime, None);
 
         assert!(receiver.try_recv().is_err());
-        assert_eq!(state.composer, "next turn");
-        assert_eq!(state.status_message.as_deref(), Some("run already active"));
+        assert!(state.composer.is_empty());
+        assert_eq!(state.composer_cursor, 0);
+        assert_eq!(state.queued_messages, vec!["next turn"]);
+        assert_eq!(state.input_history, vec!["next turn"]);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("queued for next turn")
+        );
     }
 
     #[test]
     fn printable_r_is_composer_text_when_connected() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        let runtime = UiRuntime::from_state(&state);
+        let runtime = UiRuntime::from_state(&state, None);
 
         for ch in "read write current target/current".chars() {
             assert!(handle_key_press(
@@ -729,6 +983,120 @@ mod tests {
         }
 
         assert_eq!(state.composer, "read write current target/current");
+        assert_eq!(state.composer_cursor, state.composer.len());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn composer_edits_at_cursor_and_supports_multiline() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+
+        for ch in "helo".chars() {
+            assert!(handle_key_press(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+                &mut state,
+                &runtime,
+                &sender,
+                None,
+                None,
+            ));
+        }
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+            None,
+            None,
+        ));
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+            None,
+            None,
+        ));
+
+        assert_eq!(state.composer, "hello");
+        assert_eq!(state.composer_cursor, 4);
+
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::End, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+            None,
+            None,
+        ));
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            &mut state,
+            &runtime,
+            &sender,
+            None,
+            None,
+        ));
+        for ch in "world".chars() {
+            assert!(handle_key_press(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+                &mut state,
+                &runtime,
+                &sender,
+                None,
+                None,
+            ));
+        }
+
+        assert_eq!(state.composer, "hello\nworld");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn history_navigation_recalls_submitted_inputs() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        let runtime = UiRuntime::from_state(&state, None);
+        state.input_history = vec!["first".into(), "second".into()];
+
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+            None,
+            None,
+        ));
+        assert_eq!(state.composer, "second");
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+            None,
+            None,
+        ));
+        assert_eq!(state.composer, "first");
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+            None,
+            None,
+        ));
+        assert_eq!(state.composer, "second");
+        assert!(handle_key_press(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &mut state,
+            &runtime,
+            &sender,
+            None,
+            None,
+        ));
+        assert!(state.composer.is_empty());
         assert!(receiver.try_recv().is_err());
     }
 
@@ -739,7 +1107,7 @@ mod tests {
         state.connection = crate::tui::ConnectionState::Disconnected {
             error: "connection closed".into(),
         };
-        let runtime = UiRuntime::from_state(&state);
+        let runtime = UiRuntime::from_state(&state, None);
 
         assert!(handle_key_press(
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()),
@@ -763,6 +1131,7 @@ mod tests {
         let mut state = test_state();
         let mut runtime = UiRuntime {
             active_run_id: Some("run_1".into()),
+            config_path: None,
             next_offset: 0,
             poll_in_flight: true,
             polling: true,
@@ -799,6 +1168,51 @@ mod tests {
     }
 
     #[test]
+    fn events_result_drains_queued_message_after_finish() {
+        let (sender, receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.queued_messages = vec!["next turn".into()];
+        let mut runtime = UiRuntime {
+            active_run_id: Some("run_1".into()),
+            config_path: Some("plato.toml".into()),
+            next_offset: 0,
+            poll_in_flight: true,
+            polling: true,
+            last_poll: Instant::now(),
+            tool_inputs: HashMap::new(),
+        };
+        let result = EventsStreamResult {
+            run_id: "run_1".into(),
+            from_offset: 0,
+            next_offset: 1,
+            status: "finished".into(),
+            events: Vec::new(),
+        };
+
+        apply_events_result(&mut state, &mut runtime, &sender, result);
+
+        match receiver.try_recv().unwrap() {
+            ClientCommand::Load { run_id } => assert_eq!(run_id.as_deref(), Some("run_1")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        match receiver.try_recv().unwrap() {
+            ClientCommand::RunStart {
+                question,
+                config_path,
+            } => {
+                assert_eq!(question, "next turn");
+                assert_eq!(config_path.as_deref(), Some("plato.toml"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(state.queued_messages.is_empty());
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("submitted queued message")
+        );
+    }
+
+    #[test]
     fn stream_connection_failure_enters_disconnected_and_stops_polling() {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
@@ -809,6 +1223,7 @@ mod tests {
         });
         let mut runtime = UiRuntime {
             active_run_id: Some("run_1".into()),
+            config_path: None,
             next_offset: 7,
             poll_in_flight: true,
             polling: true,
@@ -837,6 +1252,7 @@ mod tests {
         let mut state = test_state();
         let mut runtime = UiRuntime {
             active_run_id: Some("run_1".into()),
+            config_path: None,
             next_offset: 0,
             poll_in_flight: true,
             polling: true,

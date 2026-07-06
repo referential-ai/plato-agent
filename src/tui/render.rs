@@ -10,7 +10,7 @@ use ratatui::{
 use super::{ApprovalModalView, ConnectionState, TranscriptState, TuiState};
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
-    let [history, status, composer] = vertical(frame.area());
+    let [history, status, composer] = vertical(frame.area(), state);
     render_history(frame, history, state);
     render_status_rule(frame, status, state);
     render_composer(frame, composer, state);
@@ -92,6 +92,7 @@ fn history_lines(state: &TuiState) -> Vec<Line<'static>> {
     }
 
     append_live_activity(&mut lines, state);
+    append_queue_preview(&mut lines, state);
     lines
 }
 
@@ -178,6 +179,25 @@ fn append_live_activity(lines: &mut Vec<Line<'static>>, state: &TuiState) {
     }));
 }
 
+fn append_queue_preview(lines: &mut Vec<Line<'static>>, state: &TuiState) {
+    if state.queued_messages.is_empty() {
+        return;
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "queued",
+        Style::default().fg(Color::Yellow),
+    )]));
+    lines.extend(
+        state
+            .queued_messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| Line::from(format!("{} {}", index + 1, message))),
+    );
+}
+
 fn render_status_rule(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(Paragraph::new(status_rule(state)), area);
 }
@@ -207,8 +227,8 @@ fn status_rule(state: &TuiState) -> Line<'static> {
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let prompt = if state.composer.is_empty() {
-        Line::from(vec![
+    let mut lines = if state.composer.is_empty() {
+        vec![Line::from(vec![
             Span::styled(
                 ">",
                 Style::default()
@@ -220,28 +240,31 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 "Try \"read README.md and summarize it\"",
                 Style::default().fg(Color::DarkGray),
             ),
-        ])
+        ])]
     } else {
-        Line::from(vec![
-            Span::styled(
-                ">",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" {}", state.composer)),
-        ])
+        state
+            .composer
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                let prefix = if index == 0 { ">" } else { "|" };
+                Line::from(vec![
+                    Span::styled(
+                        prefix,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(" {line}")),
+                ])
+            })
+            .collect()
     };
-    frame.render_widget(
-        Paragraph::new(vec![
-            prompt,
-            Line::from(Span::styled(
-                "Enter submits | Ctrl-C cancels | /help coming soon",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]),
-        area,
-    );
+    lines.push(Line::from(Span::styled(
+        "Enter submits | Alt/Shift-Enter newline | Ctrl-C cancels",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn plural(count: usize) -> &'static str {
@@ -313,15 +336,25 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn vertical(area: Rect) -> [Rect; 3] {
+fn vertical(area: Rect, state: &TuiState) -> [Rect; 3] {
+    let composer_height = composer_height(state);
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(8),
             Constraint::Length(1),
-            Constraint::Length(2),
+            Constraint::Length(composer_height),
         ])
         .areas(area)
+}
+
+fn composer_height(state: &TuiState) -> u16 {
+    let draft_lines = if state.composer.is_empty() {
+        1
+    } else {
+        state.composer.lines().count().max(1)
+    };
+    (draft_lines + 1).clamp(2, 6) as u16
 }
 
 #[cfg(test)]
@@ -466,6 +499,32 @@ mod tests {
         assert!(output.contains("run_1"));
         assert!(output.contains("#2 assistant response"));
         assert!(output.contains("> summarize this file"));
+    }
+
+    #[test]
+    fn renders_queue_preview_and_multiline_composer() {
+        let mut state = TuiState::connected(
+            "/tmp/work".into(),
+            "/tmp/agent.sock".into(),
+            HelloResult {
+                daemon_version: "0.1.0".into(),
+                workspace_id: "work-1234".into(),
+                ledger_path: "/tmp/agent.db".into(),
+                capabilities: vec![],
+            },
+            Vec::new(),
+            TranscriptState::None,
+        );
+        state.queued_messages = vec!["queued next".into()];
+        state.composer = "first line\nsecond line".into();
+        state.composer_cursor = state.composer.len();
+
+        let output = render_to_text(&state);
+
+        assert!(output.contains("queued"));
+        assert!(output.contains("1 queued next"));
+        assert!(output.contains("> first line"));
+        assert!(output.contains("| second line"));
     }
 
     #[test]
