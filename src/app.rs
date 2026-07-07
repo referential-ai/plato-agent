@@ -179,6 +179,7 @@ impl ApprovalMode {
 }
 
 const SESSION_TRUNCATION_MARKER: &str = "[older session turns omitted to fit the context budget]";
+const RUN_CANCELED_REASON: &str = "run canceled";
 
 struct ActiveSessionRun {
     ledger: SqliteLedger,
@@ -368,6 +369,9 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             let delta_run_id = run_id.clone();
             let delta_turn_id = turn_id.clone();
             client.send_streaming(&request, |text| {
+                if cancel_requested(&options) {
+                    return Err(AppError::RunFailed(RUN_CANCELED_REASON.into()));
+                }
                 if text.is_empty() {
                     return Ok(());
                 }
@@ -397,7 +401,12 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         let response = match response_result {
             Ok(response) => response,
             Err(error) => {
-                let reason = error.to_string();
+                let canceled = cancel_requested(&options);
+                let reason = if canceled {
+                    RUN_CANCELED_REASON.to_string()
+                } else {
+                    error.to_string()
+                };
                 record_event(
                     &mut recorder,
                     &options,
@@ -407,7 +416,10 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     },
                 )?;
                 if let Some(session_run) = &mut session_run {
-                    session_run.fail(&reason, false)?;
+                    session_run.fail(&reason, canceled)?;
+                }
+                if canceled {
+                    return Err(AppError::RunFailed(reason));
                 }
                 return Err(error);
             }
@@ -787,12 +799,8 @@ fn check_cancel(
     options: &RunOptions,
     run_id: &RunId,
 ) -> AppResult<()> {
-    if options
-        .cancel
-        .as_ref()
-        .is_some_and(|cancel| cancel.load(Ordering::SeqCst))
-    {
-        let reason = "run canceled".to_string();
+    if cancel_requested(options) {
+        let reason = RUN_CANCELED_REASON.to_string();
         record_event(
             recorder,
             options,
@@ -804,6 +812,13 @@ fn check_cancel(
         return Err(AppError::RunFailed(reason));
     }
     Ok(())
+}
+
+fn cancel_requested(options: &RunOptions) -> bool {
+    options
+        .cancel
+        .as_ref()
+        .is_some_and(|cancel| cancel.load(Ordering::SeqCst))
 }
 
 fn execute_and_record_tool(
@@ -1385,6 +1400,100 @@ enabled = ["file.read"]
         assert!(replay.contains("assistant: Hello"));
     }
 
+    #[test]
+    fn streaming_cancel_records_terminal_failed_and_canceled_session() {
+        let (continue_sender, continue_receiver) = std::sync::mpsc::channel();
+        let server = spawn_cancelable_streaming_provider(continue_receiver);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{}"
+timeout_ms = 5000
+
+[limits]
+token_budget = 4000
+max_output_tokens = 32
+max_turns = 1
+
+[tools]
+enabled = ["file.read"]
+"#,
+                server.base_url
+            ),
+        )
+        .unwrap();
+        let ledger_path = dir.path().join("events.db");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let run_cancel = cancel.clone();
+        let run_config_path = config_path.clone();
+        let run_ledger_path = ledger_path.clone();
+        let workspace_root = dir.path().to_path_buf();
+
+        let handle = thread::spawn(move || {
+            run_question(RunOptions {
+                question: "say hello".into(),
+                config_path: Some(run_config_path),
+                ledger: RunLedger::Sqlite(run_ledger_path),
+                workspace_root,
+                approval_mode: ApprovalMode::Deny { actor: "test" },
+                run_id: Some(RunId::new("run_stream_cancel").unwrap()),
+                session: Some(RunSession::Fresh {
+                    session_id: "session_1".into(),
+                }),
+                event_sender: Some(event_sender),
+                stream_to_stderr: false,
+                cancel: Some(run_cancel),
+            })
+        });
+
+        let first_delta = loop {
+            match event_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("run should emit first streamed delta before cancel")
+            {
+                RunEvent::AssistantDelta(delta) => break delta,
+                RunEvent::Ledger(_) => {}
+            }
+        };
+        assert_eq!(first_delta.text, "Hel");
+
+        cancel.store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        continue_sender.send(()).unwrap();
+        let error = handle.join().unwrap().unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "stream cancel should not wait for provider timeout"
+        );
+        assert!(matches!(
+            error,
+            AppError::RunFailed(reason) if reason == RUN_CANCELED_REASON
+        ));
+        let _provider_request = server.handle.join().unwrap();
+
+        let records =
+            crate::ledger::read_sqlite_records(&ledger_path, Some("run_stream_cancel")).unwrap();
+        assert!(records.iter().any(|record| matches!(
+            &record.event,
+            HarnessEvent::RunFailed { reason, .. } if reason == RUN_CANCELED_REASON
+        )));
+        let readback = RunReadback::from_events(&records).unwrap();
+        assert!(matches!(readback.final_phase, RunPhase::Failed { .. }));
+        let summaries = SqliteLedger::open_readonly(&ledger_path)
+            .unwrap()
+            .session_summaries()
+            .unwrap();
+        assert_eq!(summaries[0].status, "canceled");
+    }
+
     fn write_over_budget_config(path: &Path) {
         std::fs::write(
             path,
@@ -1442,6 +1551,37 @@ enabled = ["file.read"]
                 response_body
             );
             stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+        StreamingProvider { base_url, handle }
+    }
+
+    fn spawn_cancelable_streaming_provider(
+        continue_receiver: std::sync::mpsc::Receiver<()>,
+    ) -> StreamingProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let first = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n";
+            let tail = concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                first.len() + tail.len(),
+                first
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            continue_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            let _ = stream.write_all(tail.as_bytes());
+            let _ = stream.flush();
             request
         });
         StreamingProvider { base_url, handle }
