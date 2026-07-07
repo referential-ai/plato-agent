@@ -155,6 +155,10 @@ with socket.socket(socket.AF_UNIX) as sock:
 PY
 ```
 
+NDJSON `run.start` and `message.append` default to `wait: false`, returning a
+`running` response immediately. Send `"wait": true` only when the connection can
+block until the run finishes.
+
 ## TUI
 
 `plato --tui` is the interactive local entrypoint. It attaches to the workspace

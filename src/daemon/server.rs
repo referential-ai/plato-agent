@@ -133,7 +133,12 @@ mod tests {
     };
     use platonic_core::{HarnessEvent, RunId};
     use serde_json::json;
-    use std::{io::Read, sync::Arc, thread};
+    use std::{
+        io::{BufRead, Read},
+        net::TcpListener,
+        sync::Arc,
+        thread,
+    };
 
     #[test]
     fn hello_round_trip_over_unix_socket() {
@@ -227,7 +232,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
 
         let response = server.handle_line(&format!(
-            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}"}}}}"#,
+            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"hello","config_path":"{}","wait":true}}}}"#,
             config_path.display()
         ));
         let error = response.error.unwrap();
@@ -236,6 +241,71 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(response.method.as_deref(), Some("run.start"));
         assert_eq!(error.code, ERROR_RUN_FAILED);
         assert!(error.message.contains("PLATO_AGENT_TEST_MISSING_KEY"));
+    }
+
+    #[test]
+    fn run_start_without_wait_returns_while_approval_is_pending_on_same_connection() {
+        let provider = spawn_tool_call_provider();
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_file_write_config(&config_path, &provider.base_url);
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let handle = thread::spawn(move || server.serve_next().unwrap());
+        let mut stream = UnixStream::connect(&socket_path).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+        writeln!(
+            stream,
+            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"write a file","config_path":"{}"}}}}"#,
+            config_path.display()
+        )
+        .unwrap();
+        let response = read_envelope(&mut reader);
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        let result = response.result.unwrap();
+        assert_eq!(result["status"], "running");
+        assert!(result["final_answer"].is_null());
+        let run_id = result["run_id"].as_str().unwrap().to_string();
+
+        let mut approval_seen = false;
+        let mut last_events = serde_json::Value::Null;
+        for attempt in 0..100 {
+            writeln!(
+                stream,
+                r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{}","from_offset":0,"limit":32}}}}"#,
+                run_id
+            )
+            .unwrap();
+            let response = read_envelope(&mut reader);
+            assert_eq!(response.kind, EnvelopeKind::Response);
+            let events = response.result.unwrap()["events"].clone();
+            last_events = events.clone();
+            approval_seen = events_contain_approval_request(&events);
+            if approval_seen {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            approval_seen,
+            "single connection should keep serving lines; last events: {last_events}"
+        );
+
+        writeln!(
+            stream,
+            r#"{{"v":1,"id":"deny_1","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny","reason":"test done"}}}}"#,
+            run_id
+        )
+        .unwrap();
+        let response = read_envelope(&mut reader);
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(response.result.unwrap()["status"], "running");
+
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        handle.join().unwrap();
+        let _provider_request = provider.handle.join().unwrap();
     }
 
     #[test]
@@ -574,6 +644,58 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
     }
 
     #[test]
+    fn message_append_without_wait_returns_running_by_default() {
+        let provider = spawn_tool_call_provider();
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_file_write_config(&config_path, &provider.base_url);
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let mut ledger = SqliteLedger::open_or_create(&server.paths().ledger_path).unwrap();
+        let prior_run = RunId::new("run_prior").unwrap();
+        ledger
+            .begin_session_run("session_1", &prior_run, "first question", true)
+            .unwrap();
+        ledger
+            .finish_session_run(&prior_run, "first answer")
+            .unwrap();
+        drop(ledger);
+
+        let response = server.handle_line(&format!(
+            r#"{{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{{"session_id":"session_1","message":"follow up","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        let result = response.result.unwrap();
+        assert_eq!(result["status"], "running");
+        let run_id = result["run_id"].as_str().unwrap().to_string();
+
+        let mut approval_seen = false;
+        for attempt in 0..100 {
+            let response = server.handle_line(&format!(
+                r#"{{"v":1,"id":"events_{attempt}","kind":"request","method":"events.stream","params":{{"run_id":"{}","from_offset":0,"limit":32}}}}"#,
+                run_id
+            ));
+            assert_eq!(response.kind, EnvelopeKind::Response);
+            let events = response.result.unwrap()["events"].clone();
+            approval_seen = events_contain_approval_request(&events);
+            if approval_seen {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(approval_seen);
+
+        let response = server.handle_line(&format!(
+            r#"{{"v":1,"id":"deny_1","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny","reason":"test done"}}}}"#,
+            run_id
+        ));
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        let _provider_request = provider.handle.join().unwrap();
+    }
+
+    #[test]
     fn message_append_hydrates_persisted_session_turns() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
@@ -630,5 +752,105 @@ enabled = ["file.read"]
         assert!(recent_turns.contains("first question"));
         assert!(recent_turns.contains("first answer"));
         assert!(recent_turns.contains("follow up"));
+    }
+
+    struct ToolCallProvider {
+        base_url: String,
+        handle: thread::JoinHandle<String>,
+    }
+
+    fn write_file_write_config(path: &Path, base_url: &str) {
+        std::fs::write(
+            path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{base_url}"
+timeout_ms = 5000
+
+[limits]
+token_budget = 4000
+max_output_tokens = 32
+max_turns = 2
+
+[tools]
+enabled = ["file.write"]
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn spawn_tool_call_provider() -> ToolCallProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let body = concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"file_write\",\"arguments\":\"{\\\"path\\\":\\\"out.txt\\\",\\\"content\\\":\\\"hello\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+        ToolCallProvider { base_url, handle }
+    }
+
+    fn read_envelope(reader: &mut BufReader<UnixStream>) -> Envelope {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    fn events_contain_approval_request(events: &serde_json::Value) -> bool {
+        events.as_array().unwrap().iter().any(|entry| {
+            entry["event"]["kind"] == "approval_requested"
+                && entry["event"]["tool_call_id"] == "call_1"
+        })
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0, "client closed before headers");
+            bytes.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = find_header_end(&bytes) {
+                break header_end;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length:")
+                    .or_else(|| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).unwrap();
+            assert_ne!(read, 0, "client closed before body");
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn find_header_end(bytes: &[u8]) -> Option<usize> {
+        bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
     }
 }

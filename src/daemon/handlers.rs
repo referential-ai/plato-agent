@@ -244,7 +244,7 @@ fn start_run(
         cancel: Some(record.cancel.clone()),
     };
 
-    if wait.unwrap_or(true) {
+    if wait.unwrap_or(false) {
         match run_question(options) {
             Ok(outcome) => {
                 record.set_finished(outcome.final_answer.clone());
