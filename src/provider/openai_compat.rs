@@ -64,6 +64,9 @@ impl OpenAiCompatibleClient {
     ) -> AppResult<ModelResponse> {
         let mut body = ChatCompletionRequest::from_model_request(request, self.token_limit_field)?;
         body.stream = Some(true);
+        body.stream_options = Some(ChatStreamOptions {
+            include_usage: true,
+        });
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
         let call = self.authorized_post(&agent, &url);
@@ -133,9 +136,16 @@ struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<ChatStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -288,6 +298,7 @@ impl ChatCompletionRequest {
             tool_choice: "auto",
             parallel_tool_calls: false,
             stream: None,
+            stream_options: None,
             max_tokens: matches!(token_limit_field, TokenLimitField::MaxTokens)
                 .then_some(request.max_output_tokens),
             max_completion_tokens: matches!(
@@ -728,6 +739,29 @@ mod tests {
     }
 
     #[test]
+    fn streaming_request_includes_usage_stream_options() {
+        let request = ModelRequest {
+            model: "test-model".into(),
+            system: "system".into(),
+            max_output_tokens: 32,
+            messages: vec![ModelMessage::user_text("hello")],
+            tools: Vec::new(),
+        };
+        let mut body =
+            ChatCompletionRequest::from_model_request(&request, TokenLimitField::MaxTokens)
+                .unwrap();
+
+        body.stream = Some(true);
+        body.stream_options = Some(ChatStreamOptions {
+            include_usage: true,
+        });
+
+        let value = serde_json::to_value(body).unwrap();
+        assert_eq!(value["stream"], true);
+        assert_eq!(value["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
     fn streaming_text_assembles_final_response_and_emits_deltas() {
         let raw = concat!(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
@@ -769,6 +803,8 @@ mod tests {
 
         assert!(deltas.is_empty());
         assert_eq!(response.stop, ModelStop::ToolUse);
+        assert_eq!(response.usage.input_tokens, 0);
+        assert_eq!(response.usage.output_tokens, 0);
         assert_eq!(
             response.tool_uses(),
             vec![(
