@@ -1291,6 +1291,7 @@ mod tests {
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
             "data: [DONE]\n\n",
         ));
         let dir = tempfile::tempdir().unwrap();
@@ -1334,9 +1335,11 @@ enabled = ["file.read"]
             cancel: None,
         })
         .unwrap();
-        let _ = server.handle.join().unwrap();
+        let provider_request = server.handle.join().unwrap();
 
         assert_eq!(outcome.final_answer, "Hello");
+        assert!(provider_request.contains(r#""stream":true"#));
+        assert!(provider_request.contains(r#""stream_options":{"include_usage":true}"#));
         let live_events = event_receiver.try_iter().collect::<Vec<_>>();
         let deltas = live_events
             .iter()
@@ -1361,6 +1364,15 @@ enabled = ["file.read"]
             })
             .collect::<Vec<_>>();
         assert_eq!(assistant_messages, vec!["Hello"]);
+        let usage = records
+            .iter()
+            .find_map(|record| match &record.event {
+                HarnessEvent::ModelResponded { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .expect("model response should record usage");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 3);
 
         let replay = crate::replay::replay_file(&ledger_path).unwrap();
         assert_eq!(

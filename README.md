@@ -68,6 +68,7 @@ approve `shell.exec`, or bypass workspace path checks.
 - Use `=` for explicit paths because `--db` also has a bare default form.
 - Live assistant text, `run_id`, `ledger_path`, and replay hints print to stderr. Stdout remains only the final answer.
 - Replay shows final assistant messages, not partial streaming deltas.
+- Streamed runs request provider usage chunks; providers that omit usage still record zero usage.
 - `plato replay` without arguments replays the latest session from the default XDG SQLite ledger.
 - `plato replay --run <id>` replays a single run.
 - `--events <file>` is the explicit JSONL export/debug path.
