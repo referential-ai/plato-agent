@@ -1,6 +1,6 @@
 use crate::{AppError, AppResult};
 use platonic_core::{HarnessEvent, RecordedEvent, RunId, RunState};
-use rusqlite::{Connection, OptionalExtension, params, types::Type};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
@@ -543,10 +543,10 @@ fn configure_sqlite_connection(connection: &Connection) -> AppResult<()> {
 }
 
 fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
-    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
         0 => {
-            let transaction = connection.transaction()?;
             transaction.execute_batch(
                 r#"
                 CREATE TABLE ledger_events (
@@ -561,21 +561,20 @@ fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
             )?;
             create_session_tables(&transaction)?;
             transaction.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
-            transaction.commit()?;
-            Ok(())
         }
         1 => {
-            let transaction = connection.transaction()?;
             create_session_tables(&transaction)?;
             transaction.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
-            transaction.commit()?;
-            Ok(())
         }
-        SQLITE_SCHEMA_VERSION => Ok(()),
-        _ => Err(AppError::Config(format!(
-            "unsupported sqlite schema version: {version}"
-        ))),
+        SQLITE_SCHEMA_VERSION => {}
+        _ => {
+            return Err(AppError::Config(format!(
+                "unsupported sqlite schema version: {version}"
+            )));
+        }
     }
+    transaction.commit()?;
+    Ok(())
 }
 
 fn create_session_tables(connection: &Connection) -> AppResult<()> {
