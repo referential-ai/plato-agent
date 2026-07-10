@@ -67,42 +67,23 @@ impl OpenAiCompatibleClient {
         body.stream_options = Some(ChatStreamOptions {
             include_usage: true,
         });
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
-        let call = self.authorized_post(&agent, &url);
-
-        match call.send_json(body) {
-            Ok(response) => {
-                parse_chat_completion_stream(BufReader::new(response.into_reader()), &mut on_delta)
-            }
-            Err(ureq::Error::Status(status, response)) => {
-                let body = response.into_string().unwrap_or_default();
-                Err(AppError::Provider(format!(
-                    "provider returned http {status}: {body}"
-                )))
-            }
-            Err(error) => Err(AppError::Provider(error.to_string())),
-        }
+        let response = self.post_completion(body)?;
+        parse_chat_completion_stream(BufReader::new(response.into_reader()), &mut on_delta)
     }
 
     fn send_body(&self, body: ChatCompletionRequest) -> AppResult<ModelResponse> {
+        self.post_completion(body)?
+            .into_json::<ChatCompletionResponse>()
+            .map_err(|error| AppError::Provider(error.to_string()))?
+            .into_model_response()
+    }
+
+    fn post_completion(&self, body: ChatCompletionRequest) -> AppResult<ureq::Response> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
-        let call = self.authorized_post(&agent, &url);
-
-        match call.send_json(body) {
-            Ok(response) => response
-                .into_json::<ChatCompletionResponse>()
-                .map_err(|error| AppError::Provider(error.to_string()))?
-                .into_model_response(),
-            Err(ureq::Error::Status(status, response)) => {
-                let body = response.into_string().unwrap_or_default();
-                Err(AppError::Provider(format!(
-                    "provider returned http {status}: {body}"
-                )))
-            }
-            Err(error) => Err(AppError::Provider(error.to_string())),
-        }
+        self.authorized_post(&agent, &url)
+            .send_json(body)
+            .map_err(provider_send_error)
     }
 
     fn authorized_post(&self, agent: &ureq::Agent, url: &str) -> ureq::Request {
@@ -117,6 +98,16 @@ impl OpenAiCompatibleClient {
             call = call.set("X-OpenRouter-Title", app_title);
         }
         call
+    }
+}
+
+fn provider_send_error(error: ureq::Error) -> AppError {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let body = response.into_string().unwrap_or_default();
+            AppError::Provider(format!("provider returned http {status}: {body}"))
+        }
+        error => AppError::Provider(error.to_string()),
     }
 }
 
@@ -372,43 +363,12 @@ impl StreamingAssembler {
             let id = call.id.ok_or_else(|| {
                 AppError::Provider("provider stream returned tool call without id".into())
             })?;
-            let tool_name = internal_name_for_provider(&call.name).ok_or_else(|| {
-                AppError::Provider(format!("provider returned unknown tool {}", call.name))
-            })?;
-            let input = serde_json::from_str(&call.arguments).map_err(|error| {
-                AppError::Provider(format!(
-                    "provider returned invalid JSON for {}: {error}",
-                    call.name
-                ))
-            })?;
-            content.push(ModelBlock::ToolUse {
-                id,
-                name: tool_name.into(),
-                input,
-            });
+            content.push(tool_use_from_provider(id, call.name, call.arguments)?);
         }
         let finish_reason = self.finish_reason.ok_or_else(|| {
             AppError::Provider("provider stream ended without finish_reason".into())
         })?;
-        let stop = match finish_reason {
-            ChatFinishReason::Stop => ModelStop::EndTurn,
-            ChatFinishReason::ToolCalls | ChatFinishReason::FunctionCall => ModelStop::ToolUse,
-            ChatFinishReason::Length => ModelStop::MaxOutput,
-            ChatFinishReason::ContentFilter => ModelStop::ContentFilter,
-        };
-        let usage = self.usage.unwrap_or(ChatUsage {
-            prompt_tokens: Some(0),
-            completion_tokens: Some(0),
-        });
-
-        Ok(ModelResponse {
-            content,
-            stop,
-            usage: ModelUsage {
-                input_tokens: usage.prompt_tokens.unwrap_or(0),
-                output_tokens: usage.completion_tokens.unwrap_or(0),
-            },
-        })
+        Ok(model_response(content, finish_reason, self.usage))
     }
 }
 
@@ -537,6 +497,53 @@ impl ChatMessage {
     }
 }
 
+fn tool_use_from_provider(id: String, name: String, arguments: String) -> AppResult<ModelBlock> {
+    let tool_name = internal_name_for_provider(&name)
+        .ok_or_else(|| AppError::Provider(format!("provider returned unknown tool {name}")))?;
+    let input = serde_json::from_str(&arguments).map_err(|error| {
+        AppError::Provider(format!(
+            "provider returned invalid JSON for {name}: {error}"
+        ))
+    })?;
+    Ok(ModelBlock::ToolUse {
+        id,
+        name: tool_name.into(),
+        input,
+    })
+}
+
+fn stop_from_finish(finish_reason: ChatFinishReason) -> ModelStop {
+    match finish_reason {
+        ChatFinishReason::Stop => ModelStop::EndTurn,
+        ChatFinishReason::ToolCalls | ChatFinishReason::FunctionCall => ModelStop::ToolUse,
+        ChatFinishReason::Length => ModelStop::MaxOutput,
+        ChatFinishReason::ContentFilter => ModelStop::ContentFilter,
+    }
+}
+
+fn usage_from(usage: Option<ChatUsage>) -> ModelUsage {
+    let usage = usage.unwrap_or(ChatUsage {
+        prompt_tokens: Some(0),
+        completion_tokens: Some(0),
+    });
+    ModelUsage {
+        input_tokens: usage.prompt_tokens.unwrap_or(0),
+        output_tokens: usage.completion_tokens.unwrap_or(0),
+    }
+}
+
+fn model_response(
+    content: Vec<ModelBlock>,
+    finish_reason: ChatFinishReason,
+    usage: Option<ChatUsage>,
+) -> ModelResponse {
+    ModelResponse {
+        content,
+        stop: stop_from_finish(finish_reason),
+        usage: usage_from(usage),
+    }
+}
+
 impl ChatTool {
     fn from_tool_spec(spec: &ToolSpec) -> Self {
         Self {
@@ -562,43 +569,13 @@ impl ChatCompletionResponse {
             content.push(ModelBlock::Text { text });
         }
         for call in choice.message.tool_calls.unwrap_or_default() {
-            let tool_name = internal_name_for_provider(&call.function.name).ok_or_else(|| {
-                AppError::Provider(format!(
-                    "provider returned unknown tool {}",
-                    call.function.name
-                ))
-            })?;
-            let input = serde_json::from_str(&call.function.arguments).map_err(|error| {
-                AppError::Provider(format!(
-                    "provider returned invalid JSON for {}: {error}",
-                    call.function.name
-                ))
-            })?;
-            content.push(ModelBlock::ToolUse {
-                id: call.id,
-                name: tool_name.into(),
-                input,
-            });
+            content.push(tool_use_from_provider(
+                call.id,
+                call.function.name,
+                call.function.arguments,
+            )?);
         }
-        let stop = match choice.finish_reason {
-            ChatFinishReason::Stop => ModelStop::EndTurn,
-            ChatFinishReason::ToolCalls | ChatFinishReason::FunctionCall => ModelStop::ToolUse,
-            ChatFinishReason::Length => ModelStop::MaxOutput,
-            ChatFinishReason::ContentFilter => ModelStop::ContentFilter,
-        };
-        let usage = self.usage.unwrap_or(ChatUsage {
-            prompt_tokens: Some(0),
-            completion_tokens: Some(0),
-        });
-
-        Ok(ModelResponse {
-            content,
-            stop,
-            usage: ModelUsage {
-                input_tokens: usage.prompt_tokens.unwrap_or(0),
-                output_tokens: usage.completion_tokens.unwrap_or(0),
-            },
-        })
+        Ok(model_response(content, choice.finish_reason, self.usage))
     }
 }
 
