@@ -87,7 +87,9 @@ impl DaemonServer {
             let stream = stream?;
             let runtime = self.runtime.clone();
             thread::spawn(move || {
-                let _ = handle_stream(runtime, stream);
+                if let Err(error) = handle_stream(runtime, stream) {
+                    eprintln!("daemon connection error: {error}");
+                }
             });
         }
         Ok(())
@@ -215,9 +217,9 @@ mod tests {
         daemon::{
             client::DaemonClient,
             protocol::{
-                ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_OVERLOAD, ERROR_RUN_FAILED,
-                ERROR_SESSIONS_LIST_FAILED, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind,
-                ProtocolError, RunStateName,
+                ERROR_INTERNAL, ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND,
+                ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
+                ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, ProtocolError, RunStateName,
             },
             runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord},
         },
@@ -847,6 +849,29 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         drop(client);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn transcript_read_distinguishes_missing_from_internal_failures() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let mut server =
+            DaemonServer::bind(workspace.path(), Some(socket_dir.path().join("agent.sock")))
+                .unwrap();
+        server.runtime.paths.ledger_path = workspace.path().join("agent.db");
+
+        let missing = server.handle_line(
+            r#"{"v":1,"id":"transcript_1","kind":"request","method":"transcript.read","params":{"run_id":"run_missing"}}"#,
+        );
+        assert_eq!(missing.kind, EnvelopeKind::Error);
+        assert_eq!(missing.error.unwrap().code, ERROR_NOT_FOUND);
+
+        std::fs::write(&server.paths().ledger_path, b"not a sqlite database").unwrap();
+        let corrupt = server.handle_line(
+            r#"{"v":1,"id":"transcript_2","kind":"request","method":"transcript.read","params":{"run_id":"run_missing"}}"#,
+        );
+        assert_eq!(corrupt.kind, EnvelopeKind::Error);
+        assert_eq!(corrupt.error.unwrap().code, ERROR_INTERNAL);
     }
 
     #[test]
