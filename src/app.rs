@@ -351,7 +351,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             tools: tools.clone(),
         };
         let context = context_pack(&request, config.limits.token_budget)?;
-        check_cancel(&mut recorder, &options, &run_id)?;
+        check_cancel(&mut recorder, &options, &run_id, &mut session_run)?;
         record_context_built(&mut recorder, &options, &run_id, turn_id.clone(), context)?;
         record_event(
             &mut recorder,
@@ -445,51 +445,39 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
 
         match response.stop {
             ModelStop::MaxOutput => {
-                let reason = "model reached max output tokens".to_string();
-                record_event(
+                return fail_run(
                     &mut recorder,
                     &options,
-                    HarnessEvent::RunFailed { run_id, reason },
-                )?;
-                if let Some(session_run) = &mut session_run {
-                    session_run.fail("model reached max output tokens", false)?;
-                }
-                return Err(AppError::RunFailed(
-                    "model reached max output tokens".into(),
-                ));
+                    &run_id,
+                    &mut session_run,
+                    "model reached max output tokens",
+                    false,
+                );
             }
             ModelStop::ContentFilter => {
-                let reason = "model response was stopped by content filter".to_string();
-                record_event(
+                return fail_run(
                     &mut recorder,
                     &options,
-                    HarnessEvent::RunFailed { run_id, reason },
-                )?;
-                if let Some(session_run) = &mut session_run {
-                    session_run.fail("model response was stopped by content filter", false)?;
-                }
-                return Err(AppError::RunFailed(
-                    "model response was stopped by content filter".into(),
-                ));
+                    &run_id,
+                    &mut session_run,
+                    "model response was stopped by content filter",
+                    false,
+                );
             }
             ModelStop::EndTurn | ModelStop::ToolUse => {}
         }
 
-        check_cancel(&mut recorder, &options, &run_id)?;
+        check_cancel(&mut recorder, &options, &run_id, &mut session_run)?;
         let tool_uses = response.tool_uses();
         if response.stop == ModelStop::ToolUse && tool_uses.is_empty() {
-            let reason = "provider reported tool use without tool calls".to_string();
-            record_event(
+            return fail_run(
                 &mut recorder,
                 &options,
-                HarnessEvent::RunFailed { run_id, reason },
-            )?;
-            if let Some(session_run) = &mut session_run {
-                session_run.fail("provider reported tool use without tool calls", false)?;
-            }
-            return Err(AppError::RunFailed(
-                "provider reported tool use without tool calls".into(),
-            ));
+                &run_id,
+                &mut session_run,
+                "provider reported tool use without tool calls",
+                false,
+            );
         }
         if tool_uses.is_empty() {
             let final_answer = response.text();
@@ -510,18 +498,14 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         }
 
         if tool_uses.len() > 1 {
-            let reason = "model requested multiple tools in one response".to_string();
-            record_event(
+            return fail_run(
                 &mut recorder,
                 &options,
-                HarnessEvent::RunFailed { run_id, reason },
-            )?;
-            if let Some(session_run) = &mut session_run {
-                session_run.fail("model requested multiple tools in one response", false)?;
-            }
-            return Err(AppError::RunFailed(
-                "model requested multiple tools in one response".into(),
-            ));
+                &run_id,
+                &mut session_run,
+                "model requested multiple tools in one response",
+                false,
+            );
         }
 
         if emitted_delta_count == 0 && !response.text().trim().is_empty() {
@@ -531,7 +515,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         messages.push(ModelMessage::assistant_blocks(response.content.clone()));
         let (tool_use_id, tool_name, input) = tool_uses.into_iter().next().expect("checked len");
         let call_id = ToolCallId::new(tool_use_id.clone())?;
-        let call = tool_call(call_id.clone(), &tool_name, input.clone())?;
+        let call = tool_call(call_id.clone(), &tool_name, input)?;
         record_event(
             &mut recorder,
             &options,
@@ -559,9 +543,8 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                 &options,
                 &config,
                 &run_id,
-                call_id.clone(),
-                &tool_name,
-                input,
+                &mut session_run,
+                call.clone(),
             )?,
             PolicyDecision::RequireApproval { ref reason } => {
                 if let Some(actor) = options.approval_mode.auto_grant_actor(&call, &policy) {
@@ -580,9 +563,8 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                         &options,
                         &config,
                         &run_id,
-                        call_id.clone(),
-                        &tool_name,
-                        input,
+                        &mut session_run,
+                        call.clone(),
                     )?
                 } else if let Some(actor) = options.approval_mode.deny_actor(&policy) {
                     let reason =
@@ -637,9 +619,8 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                                 &options,
                                 &config,
                                 &run_id,
-                                call_id.clone(),
-                                &tool_name,
-                                input,
+                                &mut session_run,
+                                call.clone(),
                             )?
                         }
                         ApprovalOutcome::Denied { reason } => {
@@ -682,9 +663,8 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                                 &options,
                                 &config,
                                 &run_id,
-                                call_id.clone(),
-                                &tool_name,
-                                input,
+                                &mut session_run,
+                                call.clone(),
                             )?
                         }
                         ApprovalOutcome::Denied { reason } => {
@@ -719,19 +699,14 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
         ));
     }
 
-    let reason = format!("exceeded maximum turn count of {}", config.limits.max_turns);
-    record_event(
+    fail_run(
         &mut recorder,
         &options,
-        HarnessEvent::RunFailed {
-            run_id,
-            reason: reason.clone(),
-        },
-    )?;
-    if let Some(session_run) = &mut session_run {
-        session_run.fail(&reason, false)?;
-    }
-    Err(AppError::RunFailed(reason))
+        &run_id,
+        &mut session_run,
+        format!("exceeded maximum turn count of {}", config.limits.max_turns),
+        false,
+    )
 }
 
 #[derive(Debug)]
@@ -750,6 +725,29 @@ fn record_event(
         let _ = sender.send(RunEvent::Ledger(record.clone()));
     }
     Ok(record)
+}
+
+fn fail_run<T>(
+    recorder: &mut EventRecorder,
+    options: &RunOptions,
+    run_id: &RunId,
+    session_run: &mut Option<ActiveSessionRun>,
+    reason: impl Into<String>,
+    canceled: bool,
+) -> AppResult<T> {
+    let reason = reason.into();
+    record_event(
+        recorder,
+        options,
+        HarnessEvent::RunFailed {
+            run_id: run_id.clone(),
+            reason: reason.clone(),
+        },
+    )?;
+    if let Some(session_run) = session_run.as_mut() {
+        session_run.fail(&reason, canceled)?;
+    }
+    Err(AppError::RunFailed(reason))
 }
 
 fn stream_enabled(options: &RunOptions) -> bool {
@@ -799,18 +797,17 @@ fn check_cancel(
     recorder: &mut EventRecorder,
     options: &RunOptions,
     run_id: &RunId,
+    session_run: &mut Option<ActiveSessionRun>,
 ) -> AppResult<()> {
     if cancel_requested(options) {
-        let reason = RUN_CANCELED_REASON.to_string();
-        record_event(
+        return fail_run(
             recorder,
             options,
-            HarnessEvent::RunFailed {
-                run_id: run_id.clone(),
-                reason: reason.clone(),
-            },
-        )?;
-        return Err(AppError::RunFailed(reason));
+            run_id,
+            session_run,
+            RUN_CANCELED_REASON,
+            true,
+        );
     }
     Ok(())
 }
@@ -827,11 +824,16 @@ fn execute_and_record_tool(
     options: &RunOptions,
     config: &Config,
     run_id: &RunId,
-    call_id: ToolCallId,
-    tool_name: &str,
-    input: Value,
+    session_run: &mut Option<ActiveSessionRun>,
+    call: ToolCall,
 ) -> AppResult<ToolMessage> {
-    check_cancel(recorder, options, run_id)?;
+    check_cancel(recorder, options, run_id, session_run)?;
+    let ToolCall {
+        id: call_id,
+        tool,
+        input,
+        ..
+    } = call;
     record_event(
         recorder,
         options,
@@ -846,10 +848,10 @@ fn execute_and_record_tool(
         provider_api_key_env: Some(&config.provider.api_key_env),
         cancel: options.cancel.as_deref(),
     };
-    match execute_tool_with_context(context, call_id.clone(), tool_name, input) {
+    match execute_tool_with_context(context, call_id.clone(), tool.as_str(), input) {
         Ok(result) => {
             let content = serde_json::to_string(&result.data)?;
-            let is_error = tool_result_is_error(tool_name, &result);
+            let is_error = tool_result_is_error(tool.as_str(), &result);
             record_event(
                 recorder,
                 options,
@@ -1412,6 +1414,62 @@ enabled = ["file.read"]
             1
         );
         assert!(replay.contains("assistant: Hello"));
+    }
+
+    #[test]
+    fn check_cancel_marks_session_canceled() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("events.db");
+        let run_id = RunId::new("run_check_cancel").unwrap();
+        let session = RunSession::Fresh {
+            session_id: "session_1".into(),
+        };
+        let config = Config::default();
+        let tools = tool_specs(&config.tools.enabled);
+        let (session_run, _) =
+            ActiveSessionRun::begin(&ledger_path, &session, &run_id, "hello", &config, &tools)
+                .unwrap();
+        let mut session_run = Some(session_run);
+        let mut recorder = EventRecorder::create_sqlite(&ledger_path, &run_id).unwrap();
+        let options = RunOptions {
+            question: "hello".into(),
+            config_path: None,
+            ledger: RunLedger::Sqlite(ledger_path.clone()),
+            workspace_root: dir.path().to_path_buf(),
+            approval_mode: ApprovalMode::Deny { actor: "test" },
+            run_id: Some(run_id.clone()),
+            session: Some(session),
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+        };
+        record_event(
+            &mut recorder,
+            &options,
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("plato").unwrap(),
+            },
+        )
+        .unwrap();
+
+        let error = check_cancel(&mut recorder, &options, &run_id, &mut session_run).unwrap_err();
+
+        assert!(
+            matches!(&error, AppError::RunFailed(reason) if reason == RUN_CANCELED_REASON),
+            "unexpected cancel error: {error:?}"
+        );
+        let records =
+            crate::ledger::read_sqlite_records(&ledger_path, Some("run_check_cancel")).unwrap();
+        assert!(records.iter().any(|record| matches!(
+            &record.event,
+            HarnessEvent::RunFailed { reason, .. } if reason == RUN_CANCELED_REASON
+        )));
+        let summaries = SqliteLedger::open_readonly(&ledger_path)
+            .unwrap()
+            .session_summaries()
+            .unwrap();
+        assert_eq!(summaries[0].status, "canceled");
     }
 
     #[test]
