@@ -60,12 +60,12 @@ Optional, config-off by default: `remote_deny = true` lets allowlisted owners re
 ### Q1. Platform target
 One platform for v1. Recommended default: Telegram — single bot token, outbound long-poll, numeric-uid allowlist; smallest pairing surface (verify at implementation). Alternatives: Discord, Slack, SMS.
 
-Jerome:
+Jerome: default (Telegram). Accepted 2026-07-09 by ratifying the architecture-lane recommendation; recorded on issue #93.
 
 ### Q2. Remote deny relay
 Ship v1 notify-only, or include the config-off `remote_deny` relay? Recommended default: notify-only.
 
-Jerome:
+Jerome: default (notify-only). Accepted 2026-07-09 by ratifying the architecture-lane recommendation; recorded on issue #93.
 
 ## Constraints
 - `platonic-core` unchanged; no new event variants for gateway v1.
