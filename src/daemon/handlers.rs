@@ -16,7 +16,7 @@ use crate::{
     new_run_id, new_session_id, replay_sqlite, replay_sqlite_session, run_question,
     tools::ApprovalOutcome,
 };
-use serde_json::{json, to_value};
+use serde_json::json;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering, mpsc},
@@ -36,14 +36,22 @@ pub(super) fn handle_line(runtime: &DaemonRuntime, line: &str) -> Envelope {
 
 fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
     match request.method.as_deref() {
-        Some("hello") => handle_hello(runtime, request),
-        Some("run.start") => handle_run_start(runtime, request),
-        Some("message.append") => handle_message_append(runtime, request),
-        Some("events.stream") => handle_events_stream(runtime, request),
-        Some("approval.decide") => handle_approval_decide(runtime, request),
-        Some("run.cancel") => handle_run_cancel(runtime, request),
+        Some("hello") => handle_with_params(runtime, request, "hello", handle_hello),
+        Some("run.start") => handle_with_params(runtime, request, "run.start", handle_run_start),
+        Some("message.append") => {
+            handle_with_params(runtime, request, "message.append", handle_message_append)
+        }
+        Some("events.stream") => {
+            handle_with_params(runtime, request, "events.stream", handle_events_stream)
+        }
+        Some("approval.decide") => {
+            handle_with_params(runtime, request, "approval.decide", handle_approval_decide)
+        }
+        Some("run.cancel") => handle_with_params(runtime, request, "run.cancel", handle_run_cancel),
         Some("sessions.list") => handle_sessions_list(runtime, request),
-        Some("transcript.read") => handle_transcript_read(runtime, request),
+        Some("transcript.read") => {
+            handle_with_params(runtime, request, "transcript.read", handle_transcript_read)
+        }
         Some(method) => Envelope::error(
             request.id,
             Some(method.into()),
@@ -59,29 +67,7 @@ fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
     }
 }
 
-fn handle_hello(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
-    let params = match request.params {
-        Some(params) => match serde_json::from_value::<HelloParams>(params) {
-            Ok(params) => params,
-            Err(error) => {
-                return Envelope::error(
-                    request.id,
-                    Some("hello".into()),
-                    ERROR_MALFORMED_REQUEST,
-                    format!("hello params are invalid: {error}"),
-                );
-            }
-        },
-        None => {
-            return Envelope::error(
-                request.id,
-                Some("hello".into()),
-                ERROR_MALFORMED_REQUEST,
-                "hello params are required",
-            );
-        }
-    };
-
+fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams) -> Envelope {
     if params.workspace_id != runtime.paths.workspace_id {
         return Envelope::error(
             request.id,
@@ -118,10 +104,10 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
         }
     }
 
-    Envelope::response(
+    Envelope::response_from(
         request.id,
         Some("hello".into()),
-        to_value(HelloResult {
+        HelloResult {
             daemon_version: env!("CARGO_PKG_VERSION").into(),
             workspace_id: runtime.paths.workspace_id.clone(),
             ledger_path: runtime.paths.ledger_path.to_string_lossy().into_owned(),
@@ -135,16 +121,15 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
                 "sessions.list".into(),
                 "transcript.read".into(),
             ],
-        })
-        .expect("hello result serializes"),
+        },
     )
 }
 
-fn handle_run_start(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
-    let params = match decode_params::<RunStartParams>(&request, "run.start") {
-        Ok(params) => params,
-        Err(error) => return *error,
-    };
+fn handle_run_start(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: RunStartParams,
+) -> Envelope {
     start_run(
         runtime,
         request.id,
@@ -158,11 +143,11 @@ fn handle_run_start(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
     )
 }
 
-fn handle_message_append(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
-    let params = match decode_params::<MessageAppendParams>(&request, "message.append") {
-        Ok(params) => params,
-        Err(error) => return *error,
-    };
+fn handle_message_append(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: MessageAppendParams,
+) -> Envelope {
     let session_id = match params.session_id {
         Some(session_id) => session_id,
         None => match latest_session_id(runtime) {
@@ -276,25 +261,24 @@ fn start_run(
 
 fn run_start_response(request_id: Option<String>, method: &str, record: &RunRecord) -> Envelope {
     let status = record.status();
-    Envelope::response(
+    Envelope::response_from(
         request_id,
         Some(method.into()),
-        to_value(RunStartResult {
+        RunStartResult {
             run_id: record.run_id.clone(),
             session_id: record.session_id.clone(),
             ledger_path: record.ledger_path.to_string_lossy().into_owned(),
             status: status.state,
             final_answer: status.final_answer,
-        })
-        .expect("run.start result serializes"),
+        },
     )
 }
 
-fn handle_events_stream(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
-    let params = match decode_params::<EventsStreamParams>(&request, "events.stream") {
-        Ok(params) => params,
-        Err(error) => return *error,
-    };
+fn handle_events_stream(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: EventsStreamParams,
+) -> Envelope {
     let record = match find_run(runtime, &params.run_id) {
         Ok(record) => record,
         Err(error) => return error_response(request.id, "events.stream", error),
@@ -330,25 +314,24 @@ fn handle_events_stream(runtime: &DaemonRuntime, request: Envelope) -> Envelope 
         .cloned()
         .collect::<Vec<_>>();
     let next_offset = from_offset + events.len() as u64;
-    Envelope::response(
+    Envelope::response_from(
         request.id,
         Some("events.stream".into()),
-        to_value(EventsStreamResult {
+        EventsStreamResult {
             run_id: record.run_id.clone(),
             from_offset,
             next_offset,
             status: record.status().state,
             events,
-        })
-        .expect("events.stream result serializes"),
+        },
     )
 }
 
-fn handle_approval_decide(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
-    let params = match decode_params::<ApprovalDecideParams>(&request, "approval.decide") {
-        Ok(params) => params,
-        Err(error) => return *error,
-    };
+fn handle_approval_decide(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: ApprovalDecideParams,
+) -> Envelope {
     let record = match find_run(runtime, &params.run_id) {
         Ok(record) => record,
         Err(error) => return error_response(request.id, "approval.decide", error),
@@ -383,22 +366,21 @@ fn handle_approval_decide(runtime: &DaemonRuntime, request: Envelope) -> Envelop
     });
     record.approval_changed.notify_all();
     drop(approvals);
-    Envelope::response(
+    Envelope::response_from(
         request.id,
         Some("approval.decide".into()),
-        to_value(CommandAcceptedResult {
+        CommandAcceptedResult {
             run_id: record.run_id.clone(),
             status: record.status().state,
-        })
-        .expect("approval.decide result serializes"),
+        },
     )
 }
 
-fn handle_run_cancel(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
-    let params = match decode_params::<RunCancelParams>(&request, "run.cancel") {
-        Ok(params) => params,
-        Err(error) => return *error,
-    };
+fn handle_run_cancel(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: RunCancelParams,
+) -> Envelope {
     let record = match find_run(runtime, &params.run_id) {
         Ok(record) => record,
         Err(error) => return error_response(request.id, "run.cancel", error),
@@ -411,23 +393,22 @@ fn handle_run_cancel(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
     }));
     record.approval_changed.notify_all();
     drop(approvals);
-    Envelope::response(
+    Envelope::response_from(
         request.id,
         Some("run.cancel".into()),
-        to_value(CommandAcceptedResult {
+        CommandAcceptedResult {
             run_id: record.run_id.clone(),
             status: RunStateName::CancelRequested,
-        })
-        .expect("run.cancel result serializes"),
+        },
     )
 }
 
 fn handle_sessions_list(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
     match session_summaries(runtime) {
-        Ok(sessions) => Envelope::response(
+        Ok(sessions) => Envelope::response_from(
             request.id,
             Some("sessions.list".into()),
-            to_value(SessionsListResult { sessions }).expect("sessions.list result serializes"),
+            SessionsListResult { sessions },
         ),
         Err(error) => Envelope::error(
             request.id,
@@ -511,11 +492,11 @@ fn latest_question_preview(question: &str) -> String {
     )
 }
 
-fn handle_transcript_read(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
-    let params = match decode_params::<TranscriptReadParams>(&request, "transcript.read") {
-        Ok(params) => params,
-        Err(error) => return *error,
-    };
+fn handle_transcript_read(
+    runtime: &DaemonRuntime,
+    request: Envelope,
+    params: TranscriptReadParams,
+) -> Envelope {
     let transcript = if let Some(run_id) = params.run_id {
         read_run_transcript(&runtime.paths.ledger_path, &run_id)
     } else if let Some(session_id) = params.session_id {
@@ -529,11 +510,9 @@ fn handle_transcript_read(runtime: &DaemonRuntime, request: Envelope) -> Envelop
         );
     };
     match transcript {
-        Ok(transcript) => Envelope::response(
-            request.id,
-            Some("transcript.read".into()),
-            to_value(transcript).expect("transcript.read result serializes"),
-        ),
+        Ok(transcript) => {
+            Envelope::response_from(request.id, Some("transcript.read".into()), transcript)
+        }
         Err(error) => Envelope::error(
             request.id,
             Some("transcript.read".into()),
@@ -589,26 +568,34 @@ fn latest_session_id(runtime: &DaemonRuntime) -> Result<String, String> {
     })
 }
 
-fn decode_params<T: serde::de::DeserializeOwned>(
-    request: &Envelope,
+fn handle_with_params<T: serde::de::DeserializeOwned>(
+    runtime: &DaemonRuntime,
+    request: Envelope,
     method: &'static str,
-) -> Result<T, Box<Envelope>> {
-    match &request.params {
-        Some(params) => serde_json::from_value::<T>(params.clone()).map_err(|error| {
-            Box::new(Envelope::error(
-                request.id.clone(),
+    handler: fn(&DaemonRuntime, Envelope, T) -> Envelope,
+) -> Envelope {
+    let params = match &request.params {
+        Some(params) => match serde_json::from_value::<T>(params.clone()) {
+            Ok(params) => params,
+            Err(error) => {
+                return Envelope::error(
+                    request.id,
+                    Some(method.into()),
+                    ERROR_MALFORMED_REQUEST,
+                    format!("{method} params are invalid: {error}"),
+                );
+            }
+        },
+        None => {
+            return Envelope::error(
+                request.id,
                 Some(method.into()),
                 ERROR_MALFORMED_REQUEST,
-                format!("{method} params are invalid: {error}"),
-            ))
-        }),
-        None => Err(Box::new(Envelope::error(
-            request.id.clone(),
-            Some(method.into()),
-            ERROR_MALFORMED_REQUEST,
-            format!("{method} params are required"),
-        ))),
-    }
+                format!("{method} params are required"),
+            );
+        }
+    };
+    handler(runtime, request, params)
 }
 
 fn spawn_event_collector(record: Arc<RunRecord>, receiver: mpsc::Receiver<RunEvent>) {

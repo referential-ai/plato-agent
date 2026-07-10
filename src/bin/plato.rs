@@ -303,23 +303,17 @@ fn run_session(
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ReplayLedger {
-    Jsonl(PathBuf),
-    Sqlite(PathBuf),
-}
-
 fn replay_ledger(
     db: Option<Option<PathBuf>>,
     file: Option<PathBuf>,
     workspace_root: &Path,
-) -> plato_agent::AppResult<ReplayLedger> {
+) -> plato_agent::AppResult<RunLedger> {
     match (db, file) {
         (Some(_), Some(_)) => Err(AppError::Config(
             "replay accepts either --db or a JSONL file, not both".into(),
         )),
-        (None, Some(file)) => Ok(ReplayLedger::Jsonl(file)),
-        (db, None) => sqlite_path(db, workspace_root).map(ReplayLedger::Sqlite),
+        (None, Some(file)) => Ok(RunLedger::Jsonl(file)),
+        (db, None) => sqlite_path(db, workspace_root).map(RunLedger::Sqlite),
     }
 }
 
@@ -346,16 +340,16 @@ fn write_run_success_output(
 
 fn write_replay_output(
     stdout: &mut impl Write,
-    ledger: ReplayLedger,
+    ledger: RunLedger,
     run: Option<&str>,
     workspace_root: &Path,
 ) -> plato_agent::AppResult<()> {
     match ledger {
-        ReplayLedger::Sqlite(path) => {
+        RunLedger::Sqlite(path) => {
             ensure_workspace_unlocked(workspace_root)?;
             writeln!(stdout, "{}", replay_sqlite(&path, run)?)?;
         }
-        ReplayLedger::Jsonl(file) => {
+        RunLedger::Jsonl(file) => {
             if run.is_some() {
                 return Err(AppError::Config("replay --run requires --db".into()));
             }
@@ -614,7 +608,7 @@ mod tests {
 
         assert_eq!(
             ledger,
-            ReplayLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap())
+            RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap())
         );
     }
 
@@ -625,7 +619,7 @@ mod tests {
         let ledger =
             replay_ledger(None, Some(PathBuf::from("events.jsonl")), workspace.path()).unwrap();
 
-        assert_eq!(ledger, ReplayLedger::Jsonl(PathBuf::from("events.jsonl")));
+        assert_eq!(ledger, RunLedger::Jsonl(PathBuf::from("events.jsonl")));
     }
 
     #[test]
@@ -637,7 +631,7 @@ mod tests {
             &socket,
         )
         .unwrap();
-        let ledger = ReplayLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap());
+        let ledger = RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap());
         let mut stdout = Vec::new();
 
         let error = write_replay_output(&mut stdout, ledger, None, workspace.path()).unwrap_err();
