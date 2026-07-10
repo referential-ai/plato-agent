@@ -124,7 +124,8 @@ mod tests {
         daemon::{
             protocol::{
                 ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_OVERLOAD, ERROR_RUN_FAILED,
-                ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, ProtocolError,
+                ERROR_SESSIONS_LIST_FAILED, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind,
+                ProtocolError,
             },
             runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord},
         },
@@ -140,6 +141,8 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    const FAKE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
 
     #[test]
     fn hello_round_trip_over_unix_socket() {
@@ -593,6 +596,25 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
     }
 
     #[test]
+    fn sessions_list_failure_uses_dedicated_error_code() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let ledger_path = &server.paths().ledger_path;
+        std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+        std::fs::write(ledger_path, "not a sqlite database").unwrap();
+
+        let response = server
+            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+        let error = response.error.unwrap();
+
+        assert_eq!(response.kind, EnvelopeKind::Error);
+        assert_eq!(response.method.as_deref(), Some("sessions.list"));
+        assert_eq!(error.code, ERROR_SESSIONS_LIST_FAILED);
+    }
+
+    #[test]
     fn sessions_list_marks_orphaned_running_session_interrupted_after_restart() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
@@ -829,6 +851,7 @@ enabled = ["file.read"]
     }
 
     fn write_provider_config(path: &Path, base_url: &str, enabled_tool: &str) {
+        let timeout_ms = FAKE_PROVIDER_TIMEOUT.as_millis();
         std::fs::write(
             path,
             format!(
@@ -838,7 +861,7 @@ kind = "open_ai"
 model = "test-model"
 api_key_env = "PATH"
 base_url = "{base_url}"
-timeout_ms = 5000
+timeout_ms = {timeout_ms}
 
 [limits]
 token_budget = 4000
@@ -880,7 +903,7 @@ enabled = ["{enabled_tool}"]
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
             let mut clients = Vec::new();
             while clients.len() < 2 && Instant::now() < deadline {
                 match listener.accept() {
@@ -942,7 +965,7 @@ enabled = ["{enabled_tool}"]
     }
 
     fn wait_for_finished_run(server: &DaemonServer, run_id: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
         loop {
             let response = server.handle_line(&format!(
                 r#"{{"v":1,"id":"events","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":1}}}}"#
