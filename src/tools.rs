@@ -114,8 +114,8 @@ pub fn execute_tool_with_context(
     match tool_name {
         FILE_READ => read_file(context.workspace_root, call_id, input),
         FILE_LIST => list_directory(context.workspace_root, call_id, input),
-        FILE_WRITE => write_file(context.workspace_root, call_id, input),
-        FILE_EDIT => edit_file(context.workspace_root, call_id, input),
+        FILE_WRITE => write_file(context.workspace_root, call_id, input, "wrote", "to"),
+        FILE_EDIT => write_file(context.workspace_root, call_id, input, "edited", "at"),
         SHELL_EXEC => shell_exec(context, call_id, input),
         _ => Err(AppError::Tool(format!("unknown tool: {tool_name}"))),
     }
@@ -278,6 +278,8 @@ fn write_file(
     workspace_root: &Path,
     call_id: platonic_core::ToolCallId,
     input: Value,
+    summary_verb: &str,
+    summary_preposition: &str,
 ) -> AppResult<ToolResult> {
     let input: FileContentInput = serde_json::from_value(input)?;
     let path = resolve_write_path(workspace_root, &input.path)?;
@@ -285,28 +287,11 @@ fn write_file(
 
     Ok(ToolResult {
         call_id,
-        summary: format!("wrote {} bytes to {}", input.content.len(), input.path),
-        data: json!({
-            "path": input.path,
-            "bytes": input.content.len()
-        }),
-        artifacts: vec![],
-        visibility: ResultVisibility::Both,
-    })
-}
-
-fn edit_file(
-    workspace_root: &Path,
-    call_id: platonic_core::ToolCallId,
-    input: Value,
-) -> AppResult<ToolResult> {
-    let input: FileContentInput = serde_json::from_value(input)?;
-    let path = resolve_write_path(workspace_root, &input.path)?;
-    fs::write(&path, &input.content)?;
-
-    Ok(ToolResult {
-        call_id,
-        summary: format!("edited {} bytes at {}", input.content.len(), input.path),
+        summary: format!(
+            "{summary_verb} {} bytes {summary_preposition} {}",
+            input.content.len(),
+            input.path
+        ),
         data: json!({
             "path": input.path,
             "bytes": input.content.len()
