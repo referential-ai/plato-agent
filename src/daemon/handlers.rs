@@ -199,7 +199,15 @@ fn start_run(
     wait: Option<bool>,
 ) -> Envelope {
     let session_id = session.session_id().to_string();
-    if let Some(active_run_id) = active_run_id(runtime, &session_id) {
+    let mut runs = runtime.runs.lock().expect("runs lock poisoned");
+    if let Some(active_run_id) = runs
+        .values()
+        .find(|record| {
+            record.session_id == session_id
+                && record.status().state == crate::daemon::runtime::RunStateName::Running
+        })
+        .map(|record| record.run_id.clone())
+    {
         return Envelope::error(
             request_id,
             Some(method.into()),
@@ -224,11 +232,8 @@ fn start_run(
         session_id,
         runtime.paths.ledger_path.clone(),
     ));
-    runtime
-        .runs
-        .lock()
-        .expect("runs lock poisoned")
-        .insert(run_id_string.clone(), record.clone());
+    runs.insert(run_id_string.clone(), record.clone());
+    drop(runs);
 
     let (event_sender, event_receiver) = mpsc::channel::<RunEvent>();
     spawn_event_collector(record.clone(), event_receiver);
@@ -400,12 +405,14 @@ fn handle_run_cancel(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
         Ok(record) => record,
         Err(error) => return error_response(request.id, "run.cancel", error),
     };
+    let approvals = record.approvals.lock().expect("approvals lock poisoned");
     record.cancel.store(true, Ordering::SeqCst);
     record.push_event(json!({
         "kind": "canceled",
         "run_id": record.run_id,
     }));
     record.approval_changed.notify_all();
+    drop(approvals);
     Envelope::response(
         request.id,
         Some("run.cancel".into()),
@@ -566,19 +573,6 @@ fn latest_session_id(runtime: &DaemonRuntime) -> Result<String, String> {
         }
         error => error.to_string(),
     })
-}
-
-fn active_run_id(runtime: &DaemonRuntime, session_id: &str) -> Option<String> {
-    runtime
-        .runs
-        .lock()
-        .expect("runs lock poisoned")
-        .values()
-        .find(|record| {
-            record.session_id == session_id
-                && record.status().state == crate::daemon::runtime::RunStateName::Running
-        })
-        .map(|record| record.run_id.clone())
 }
 
 fn decode_params<T: serde::de::DeserializeOwned>(
