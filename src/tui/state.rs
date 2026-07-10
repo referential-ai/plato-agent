@@ -1,4 +1,4 @@
-use crate::daemon::protocol::{HelloResult, SessionSummary, TranscriptReadResult};
+use crate::daemon::protocol::{HelloResult, RunStateName, SessionSummary, TranscriptReadResult};
 
 use super::ApprovalModalView;
 
@@ -149,7 +149,7 @@ pub enum TranscriptState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveRunView {
     pub run_id: String,
-    pub status: String,
+    pub status: RunStateName,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

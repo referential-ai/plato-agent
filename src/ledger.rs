@@ -1,4 +1,4 @@
-use crate::{AppError, AppResult};
+use crate::{AppError, AppResult, daemon::protocol::RunStateName};
 use platonic_core::{HarnessEvent, RecordedEvent, RunId, RunState};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Type};
 use serde::{Deserialize, Serialize};
@@ -12,11 +12,6 @@ use std::{
 pub const LEDGER_VERSION: u32 = 1;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_SCHEMA_VERSION: u32 = 2;
-const RUN_STATUS_RUNNING: &str = "running";
-const RUN_STATUS_FINISHED: &str = "finished";
-const RUN_STATUS_FAILED: &str = "failed";
-const RUN_STATUS_CANCELED: &str = "canceled";
-const RUN_STATUS_INTERRUPTED: &str = "interrupted";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,14 +131,14 @@ pub struct SessionRecords {
 pub struct PersistedSessionSummary {
     pub session_id: String,
     pub run_id: String,
-    pub status: String,
+    pub status: RunStateName,
     pub latest_question: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PersistedRunStatus {
     pub run_id: String,
-    pub status: String,
+    pub status: RunStateName,
     pub final_answer: Option<String>,
 }
 
@@ -265,12 +260,15 @@ impl SqliteLedger {
              ORDER BY session_index ASC",
         )?;
         Ok(statement
-            .query_map(params![session_id, RUN_STATUS_FINISHED], |row| {
-                Ok(SessionTurn {
-                    question: row.get(0)?,
-                    final_answer: row.get(1)?,
-                })
-            })?
+            .query_map(
+                params![session_id, RunStateName::Finished.as_str()],
+                |row| {
+                    Ok(SessionTurn {
+                        question: row.get(0)?,
+                        final_answer: row.get(1)?,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -316,7 +314,7 @@ impl SqliteLedger {
                 run_id.to_string(),
                 session_index,
                 question,
-                RUN_STATUS_RUNNING,
+                RunStateName::Running.as_str(),
                 now,
                 now
             ],
@@ -330,7 +328,7 @@ impl SqliteLedger {
     }
 
     pub fn finish_session_run(&mut self, run_id: &RunId, final_answer: &str) -> AppResult<()> {
-        self.update_session_run(run_id, RUN_STATUS_FINISHED, Some(final_answer), None)
+        self.update_session_run(run_id, RunStateName::Finished, Some(final_answer), None)
     }
 
     pub fn fail_session_run(
@@ -340,9 +338,9 @@ impl SqliteLedger {
         canceled: bool,
     ) -> AppResult<()> {
         let status = if canceled {
-            RUN_STATUS_CANCELED
+            RunStateName::Canceled
         } else {
-            RUN_STATUS_FAILED
+            RunStateName::Failed
         };
         self.update_session_run(run_id, status, None, Some(error))
     }
@@ -357,14 +355,21 @@ impl SqliteLedger {
                  WHERE status = ?1",
             )?;
             statement
-                .query_map(params![RUN_STATUS_RUNNING], |row| row.get::<_, String>(0))?
+                .query_map(params![RunStateName::Running.as_str()], |row| {
+                    row.get::<_, String>(0)
+                })?
                 .collect::<Result<Vec<_>, _>>()?
         };
         let updated = transaction.execute(
             "UPDATE session_runs
              SET status = ?2, error = ?3, updated_at_ms = ?4
              WHERE status = ?1",
-            params![RUN_STATUS_RUNNING, RUN_STATUS_INTERRUPTED, error, now],
+            params![
+                RunStateName::Running.as_str(),
+                RunStateName::Interrupted.as_str(),
+                error,
+                now
+            ],
         )?;
         for session_id in session_ids {
             transaction.execute(
@@ -426,7 +431,7 @@ impl SqliteLedger {
                 Ok(PersistedSessionSummary {
                     session_id: row.get(0)?,
                     run_id: row.get(1)?,
-                    status: row.get(2)?,
+                    status: status_from_row(row, 2)?,
                     latest_question: row.get(3)?,
                 })
             })?
@@ -469,7 +474,7 @@ impl SqliteLedger {
     fn update_session_run(
         &mut self,
         run_id: &RunId,
-        status: &str,
+        status: RunStateName,
         final_answer: Option<&str>,
         error: Option<&str>,
     ) -> AppResult<()> {
@@ -479,7 +484,13 @@ impl SqliteLedger {
             "UPDATE session_runs
              SET status = ?2, final_answer = ?3, error = ?4, updated_at_ms = ?5
              WHERE run_id = ?1",
-            params![run_id.to_string(), status, final_answer, error, now],
+            params![
+                run_id.to_string(),
+                status.as_str(),
+                final_answer,
+                error,
+                now
+            ],
         )?;
         if updated == 0 {
             return Err(AppError::RunNotFound(run_id.to_string()));
@@ -509,8 +520,15 @@ impl SqliteLedger {
 fn persisted_run_status(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedRunStatus> {
     Ok(PersistedRunStatus {
         run_id: row.get(0)?,
-        status: row.get(1)?,
+        status: status_from_row(row, 1)?,
         final_answer: row.get(2)?,
+    })
+}
+
+fn status_from_row(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<RunStateName> {
+    let value: String = row.get(index)?;
+    serde_json::from_value(serde_json::Value::String(value)).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
     })
 }
 
@@ -575,7 +593,7 @@ fn active_run_in(connection: &Connection, session_id: &str) -> AppResult<Option<
              WHERE session_id = ?1 AND status = ?2
              ORDER BY session_index ASC
              LIMIT 1",
-            params![session_id, RUN_STATUS_RUNNING],
+            params![session_id, RunStateName::Running.as_str()],
             |row| row.get::<_, String>(0),
         )
         .optional()?)
@@ -866,7 +884,7 @@ mod tests {
             vec![PersistedSessionSummary {
                 session_id: "session_1".into(),
                 run_id: "run_2".into(),
-                status: RUN_STATUS_RUNNING.into(),
+                status: RunStateName::Running,
                 latest_question: "second question".into(),
             }]
         );
@@ -891,7 +909,7 @@ mod tests {
         );
         assert_eq!(
             ledger.session_summaries().unwrap()[0].status,
-            RUN_STATUS_INTERRUPTED
+            RunStateName::Interrupted
         );
         ledger
             .begin_session_run(

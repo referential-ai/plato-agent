@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 use super::{ApprovalModalView, ConnectionState, LiveEventKind, TranscriptState, TuiState};
+use crate::daemon::protocol::RunStateName;
 use crate::tui::commands::{SLASH_COMMANDS, footer_command_hint, matching_slash_commands};
 
 pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
@@ -567,11 +568,11 @@ fn session_picker_row(
     ])
 }
 
-fn status_style(status: &str) -> Style {
+fn status_style(status: &RunStateName) -> Style {
     match status {
-        "running" => Style::default().fg(Color::Green),
-        "interrupted" => Style::default().fg(Color::Yellow),
-        "failed" | "canceled" => Style::default().fg(Color::Red),
+        RunStateName::Running => Style::default().fg(Color::Green),
+        RunStateName::Interrupted => Style::default().fg(Color::Yellow),
+        RunStateName::Failed | RunStateName::Canceled => Style::default().fg(Color::Red),
         _ => Style::default().fg(Color::DarkGray),
     }
 }
@@ -723,14 +724,14 @@ mod tests {
             vec![SessionSummary {
                 session_id: "run_1".into(),
                 run_id: "run_1".into(),
-                status: "finished".into(),
+                status: RunStateName::Finished,
                 latest_question: "read README".into(),
                 ledger_path: "/tmp/agent.db".into(),
             }],
             TranscriptState::Loaded(
                 TranscriptReadResult {
                     run_id: "run_1".into(),
-                    status: "finished".into(),
+                    status: RunStateName::Finished,
                     final_answer: Some("README summary".into()),
                     transcript:
                         "final_phase: Finished\nnext_seq: 5\n[turn_1] context ToolSchemas model.tools: [{\"name\":\"file_read\"}]\n[turn_1] user: read README\n[turn_1] assistant: README summary\n"
@@ -768,7 +769,7 @@ mod tests {
             vec![SessionSummary {
                 session_id: "run_1".into(),
                 run_id: "run_1".into(),
-                status: "failed".into(),
+                status: RunStateName::Failed,
                 latest_question: "read README".into(),
                 ledger_path: "/tmp/agent.db".into(),
             }],
@@ -816,7 +817,7 @@ mod tests {
         );
         state.active_run = Some(ActiveRunView {
             run_id: "run_1".into(),
-            status: "running".into(),
+            status: RunStateName::Running,
         });
         state.composer = "summarize this file".into();
         state.composer_cursor = "summarize".len();
@@ -1010,14 +1011,14 @@ mod tests {
                 SessionSummary {
                     session_id: "session_1".into(),
                     run_id: "run_1".into(),
-                    status: "finished".into(),
+                    status: RunStateName::Finished,
                     latest_question: "read README".into(),
                     ledger_path: "/tmp/agent.db".into(),
                 },
                 SessionSummary {
                     session_id: "session_2".into(),
                     run_id: "run_2".into(),
-                    status: "interrupted".into(),
+                    status: RunStateName::Interrupted,
                     latest_question: "continue docs".into(),
                     ledger_path: "/tmp/agent.db".into(),
                 },

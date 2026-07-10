@@ -1469,7 +1469,10 @@ enabled = ["file.read"]
             .unwrap()
             .session_summaries()
             .unwrap();
-        assert_eq!(summaries[0].status, "canceled");
+        assert_eq!(
+            summaries[0].status,
+            crate::daemon::protocol::RunStateName::Canceled
+        );
     }
 
     #[test]
@@ -1563,7 +1566,10 @@ enabled = ["file.read"]
             .unwrap()
             .session_summaries()
             .unwrap();
-        assert_eq!(summaries[0].status, "canceled");
+        assert_eq!(
+            summaries[0].status,
+            crate::daemon::protocol::RunStateName::Canceled
+        );
     }
 
     fn write_over_budget_config(path: &Path) {
