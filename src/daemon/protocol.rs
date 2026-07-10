@@ -9,6 +9,7 @@ pub const ERROR_INTERNAL: &str = "internal_error";
 pub const ERROR_NOT_FOUND: &str = "not_found";
 pub const ERROR_OVERLOAD: &str = "overload";
 pub const ERROR_RUN_FAILED: &str = "run_failed";
+pub const ERROR_SESSIONS_LIST_FAILED: &str = "sessions_list_failed";
 pub const ERROR_UNSUPPORTED_METHOD: &str = "unsupported_method";
 pub const ERROR_UNSUPPORTED_VERSION: &str = "unsupported_version";
 pub const ERROR_WORKSPACE_MISMATCH: &str = "workspace_mismatch";

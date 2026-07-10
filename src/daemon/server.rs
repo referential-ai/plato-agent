@@ -124,7 +124,8 @@ mod tests {
         daemon::{
             protocol::{
                 ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_OVERLOAD, ERROR_RUN_FAILED,
-                ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, ProtocolError,
+                ERROR_SESSIONS_LIST_FAILED, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind,
+                ProtocolError,
             },
             runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord},
         },
@@ -590,6 +591,25 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
         assert!(!ledger_path.exists());
+    }
+
+    #[test]
+    fn sessions_list_failure_uses_dedicated_error_code() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let ledger_path = &server.paths().ledger_path;
+        std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+        std::fs::write(ledger_path, "not a sqlite database").unwrap();
+
+        let response = server
+            .handle_line(r#"{"v":1,"id":"sessions_1","kind":"request","method":"sessions.list"}"#);
+        let error = response.error.unwrap();
+
+        assert_eq!(response.kind, EnvelopeKind::Error);
+        assert_eq!(response.method.as_deref(), Some("sessions.list"));
+        assert_eq!(error.code, ERROR_SESSIONS_LIST_FAILED);
     }
 
     #[test]

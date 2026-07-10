@@ -27,6 +27,7 @@ use std::{
 
 const EMBEDDED_DAEMON_TIMEOUT: Duration = Duration::from_secs(3);
 const EMBEDDED_DAEMON_POLL: Duration = Duration::from_millis(50);
+const EMBEDDED_DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Parser)]
 #[command(name = "plato")]
@@ -237,7 +238,13 @@ impl Drop for EmbeddedDaemon {
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = UnixStream::connect(&self.socket_path);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            let deadline = Instant::now() + EMBEDDED_DAEMON_SHUTDOWN_TIMEOUT;
+            while !handle.is_finished() && Instant::now() < deadline {
+                thread::sleep(EMBEDDED_DAEMON_POLL);
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -463,6 +470,42 @@ mod tests {
             error,
             AppError::Config(message) if message == "plato --tui cannot be combined with a question"
         ));
+    }
+
+    #[test]
+    fn embedded_daemon_drop_is_bounded_when_wake_connect_fails() {
+        let workspace = tempfile::tempdir().unwrap();
+        let release = Arc::new(AtomicBool::new(false));
+        let worker_release = release.clone();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || -> plato_agent::AppResult<()> {
+            started_sender.send(()).unwrap();
+            while !worker_release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            finished_sender.send(()).unwrap();
+            Ok(())
+        });
+        started_receiver.recv().unwrap();
+        let daemon = EmbeddedDaemon {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            socket_path: workspace.path().join("missing.sock"),
+            handle: Some(handle),
+        };
+
+        let started = Instant::now();
+        drop(daemon);
+        let elapsed = started.elapsed();
+        release.store(true, Ordering::SeqCst);
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "embedded daemon drop took {elapsed:?}"
+        );
     }
 
     #[test]

@@ -2,8 +2,8 @@ use crate::{
     ApprovalMode, RunEvent, RunLedger, RunOptions, RunSession,
     daemon::{
         protocol::{
-            ApprovalDecideParams, CommandAcceptedResult, ERROR_INTERNAL, ERROR_LAGGED,
-            ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
+            ApprovalDecideParams, CommandAcceptedResult, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
+            ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
             ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams,
             EventsStreamResult, HelloParams, HelloResult, MessageAppendParams, RunCancelParams,
             RunStartParams, RunStartResult, SessionSummary, SessionsListResult,
@@ -426,7 +426,7 @@ fn handle_sessions_list(runtime: &DaemonRuntime, request: Envelope) -> Envelope 
         Err(error) => Envelope::error(
             request.id,
             Some("sessions.list".into()),
-            ERROR_INTERNAL,
+            ERROR_SESSIONS_LIST_FAILED,
             error.to_string(),
         ),
     }
