@@ -34,8 +34,9 @@ const EVENT_PAGE_LIMIT: usize = 64;
 const EVENT_POLL_DELAY: Duration = Duration::from_millis(100);
 const RECONNECT_ATTEMPTS: usize = 40;
 const RECONNECT_DELAY: Duration = Duration::from_millis(50);
-const REQUIRED_CAPABILITIES: [&str; 5] = [
+const REQUIRED_CAPABILITIES: [&str; 6] = [
     "hello",
+    "run.start",
     "message.append",
     "events.stream",
     "sessions.list",
@@ -147,9 +148,15 @@ impl DiscordGateway {
 
     fn handle_message(&mut self, channel_id: u64, text: String) -> AppResult<()> {
         let mut daemon = self.connect_daemon()?;
-        let session_id = self.sessions.get(&channel_id).cloned();
-        let run =
-            daemon.message_append_to_session(text, session_id, self.config_path.clone(), false)?;
+        let run = match self.sessions.get(&channel_id).cloned() {
+            Some(session_id) => daemon.message_append_to_session(
+                text,
+                Some(session_id),
+                self.config_path.clone(),
+                false,
+            ),
+            None => daemon.run_start(text, self.config_path.clone(), false),
+        }?;
         self.sessions.insert(channel_id, run.session_id.clone());
         let answer = self.wait_for_run(&mut daemon, &run.run_id, &run.session_id)?;
         self.platform.send_message(channel_id, &answer)
@@ -812,23 +819,50 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("daemon.sock");
-        let daemon = spawn_finished_daemon(&socket_path, "final answer");
+        let daemon = spawn_finished_daemon(&socket_path, "run.start", "session_1", "final answer");
         let rest = spawn_fake_rest(1, 200, None);
         let platform = test_platform(&rest.base_url, discord_message(42, 200, "hello"));
         let mut gateway = test_gateway(&workspace, socket_path, platform);
 
         gateway.poll_once().unwrap();
 
-        let append_params = daemon.join().unwrap();
-        assert_eq!(append_params["message"], "hello");
-        assert!(append_params["session_id"].is_null());
-        assert_eq!(append_params["wait"], false);
+        let start_params = daemon.join().unwrap();
+        assert_eq!(start_params["question"], "hello");
+        assert!(start_params.get("session_id").is_none());
+        assert_eq!(start_params["wait"], false);
         let requests = rest.handle.join().unwrap();
         assert_eq!(requests[0].path, "/channels/200/messages");
         assert_eq!(requests[0].authorization, "Bot test-token");
         assert_eq!(requests[0].body["content"], "final answer");
         assert_eq!(requests[0].body["allowed_mentions"]["parse"], json!([]));
         assert_eq!(gateway.sessions[&200], "session_1");
+    }
+
+    #[test]
+    fn owner_followup_appends_to_channel_session() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_finished_daemon(
+            &socket_path,
+            "message.append",
+            "session_existing",
+            "next answer",
+        );
+        let rest = spawn_fake_rest(1, 200, None);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "follow up"));
+        let mut gateway = test_gateway(&workspace, socket_path, platform);
+        gateway.sessions.insert(200, "session_existing".into());
+
+        gateway.poll_once().unwrap();
+
+        let append_params = daemon.join().unwrap();
+        assert_eq!(append_params["message"], "follow up");
+        assert_eq!(append_params["session_id"], "session_existing");
+        assert_eq!(append_params["wait"], false);
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests[0].body["content"], "next answer");
+        assert_eq!(gateway.sessions[&200], "session_existing");
     }
 
     #[test]
@@ -1092,23 +1126,30 @@ mod tests {
             .unwrap();
     }
 
-    fn spawn_finished_daemon(socket_path: &Path, answer: &str) -> thread::JoinHandle<Value> {
+    fn spawn_finished_daemon(
+        socket_path: &Path,
+        method: &str,
+        session_id: &str,
+        answer: &str,
+    ) -> thread::JoinHandle<Value> {
         let listener = UnixListener::bind(socket_path).unwrap();
+        let method = method.to_owned();
+        let session_id = session_id.to_owned();
         let answer = answer.to_owned();
         thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut writer = stream.try_clone().unwrap();
             let mut reader = BufReader::new(stream);
             respond_hello(&mut reader, &mut writer);
-            let append = read_daemon_request(&mut reader);
-            assert_eq!(append.method.as_deref(), Some("message.append"));
+            let request = read_daemon_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some(method.as_str()));
             write_daemon_response(
                 &mut writer,
-                append.id,
-                "message.append",
+                request.id,
+                &method,
                 json!({
                     "run_id": "run_1",
-                    "session_id": "session_1",
+                    "session_id": session_id,
                     "ledger_path": "/tmp/agent.db",
                     "status": "running",
                     "final_answer": null
@@ -1141,7 +1182,7 @@ mod tests {
                     "transcript": "rendered text must not be parsed"
                 }),
             );
-            append.params.unwrap()
+            request.params.unwrap()
         })
     }
 
@@ -1155,11 +1196,12 @@ mod tests {
                 let mut writer = stream.try_clone().unwrap();
                 let mut reader = BufReader::new(stream);
                 respond_hello(&mut reader, &mut writer);
-                let append = read_daemon_request(&mut reader);
+                let start = read_daemon_request(&mut reader);
+                assert_eq!(start.method.as_deref(), Some("run.start"));
                 write_daemon_response(
                     &mut writer,
-                    append.id,
-                    "message.append",
+                    start.id,
+                    "run.start",
                     json!({
                         "run_id": "run_1",
                         "session_id": "session_1",
@@ -1218,11 +1260,12 @@ mod tests {
             let mut writer = stream.try_clone().unwrap();
             let mut reader = BufReader::new(stream);
             respond_hello(&mut reader, &mut writer);
-            let append = read_daemon_request(&mut reader);
+            let start = read_daemon_request(&mut reader);
+            assert_eq!(start.method.as_deref(), Some("run.start"));
             write_daemon_response(
                 &mut writer,
-                append.id,
-                "message.append",
+                start.id,
+                "run.start",
                 json!({
                     "run_id": "run_1",
                     "session_id": "session_1",
