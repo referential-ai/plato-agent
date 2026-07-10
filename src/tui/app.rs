@@ -1026,7 +1026,7 @@ enum ClientCommand {
     },
     PollEvents {
         run_id: String,
-        from_offset: u64,
+        from_offset: Option<u64>,
     },
     ApprovalGrant {
         run_id: String,
@@ -1051,7 +1051,7 @@ enum ClientEvent {
     RunCanceled(CommandAcceptedResult),
     Failed {
         context: &'static str,
-        error: String,
+        error: crate::AppError,
     },
 }
 
@@ -1139,10 +1139,7 @@ fn with_client<T>(
 }
 
 fn failed_event(context: &'static str) -> impl FnOnce(crate::AppError) -> ClientEvent {
-    move |error| ClientEvent::Failed {
-        context,
-        error: error.to_string(),
-    }
+    move |error| ClientEvent::Failed { context, error }
 }
 
 fn drain_client_events(
@@ -1190,30 +1187,29 @@ fn drain_client_events(
             }
             ClientEvent::Failed { context, error } => {
                 runtime.poll_in_flight = false;
-                if context == "events.stream" && error.starts_with("lagged:") {
-                    state.stream_warning = Some(format!("{error}; transcript refresh requested"));
-                    if let Some(run_id) = &runtime.active_run_id {
-                        send_command(
-                            commands,
-                            ClientCommand::Load {
-                                run_id: Some(run_id.clone()),
-                            },
-                            state,
-                        );
+                let protocol_code = match &error {
+                    crate::AppError::DaemonResponse(error) => Some(error.code.as_str()),
+                    _ => None,
+                };
+                let message = error.to_string();
+                if context == "events.stream" && protocol_code == Some("lagged") {
+                    state.stream_warning = Some(format!("{message}; resuming at current tip"));
+                    if let Some(run_id) = runtime.active_run_id.clone() {
+                        poll_events_from(runtime, commands, run_id, None);
                     }
-                } else if context == "events.stream" && error.starts_with("overload:") {
-                    state.stream_warning = Some(error);
+                } else if context == "events.stream" && protocol_code == Some("overload") {
+                    state.stream_warning = Some(message);
                 } else {
-                    if is_connection_error(&error) {
+                    if is_connection_error(&message) {
                         runtime.polling = false;
                         state.connection = crate::tui::ConnectionState::Disconnected {
-                            error: error.clone(),
+                            error: message.clone(),
                         };
                     }
                     if context == "run.cancel" {
                         state.cancel_requested = false;
                     }
-                    state.status_message = Some(format!("{context} failed: {error}"));
+                    state.status_message = Some(format!("{context} failed: {message}"));
                 }
             }
         }
@@ -1356,10 +1352,19 @@ fn maybe_poll_events_now(runtime: &mut UiRuntime, commands: &Sender<ClientComman
     let Some(run_id) = runtime.active_run_id.clone() else {
         return;
     };
+    poll_events_from(runtime, commands, run_id, Some(runtime.next_offset));
+}
+
+fn poll_events_from(
+    runtime: &mut UiRuntime,
+    commands: &Sender<ClientCommand>,
+    run_id: String,
+    from_offset: Option<u64>,
+) {
     if commands
         .send(ClientCommand::PollEvents {
             run_id,
-            from_offset: runtime.next_offset,
+            from_offset,
         })
         .is_ok()
     {
@@ -1655,7 +1660,7 @@ impl Drop for TerminalSession {
 mod tests {
     use super::*;
     use crate::{
-        daemon::protocol::{HelloResult, SessionSummary},
+        daemon::protocol::{HelloResult, ProtocolError, SessionSummary},
         tui::TranscriptState,
     };
     use serde_json::json;
@@ -2481,7 +2486,7 @@ mod tests {
                 from_offset,
             } => {
                 assert_eq!(run_id, "run_1");
-                assert_eq!(from_offset, EVENT_LIMIT as u64);
+                assert_eq!(from_offset, Some(EVENT_LIMIT as u64));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -2670,6 +2675,54 @@ mod tests {
     }
 
     #[test]
+    fn lagged_stream_resumes_at_current_tip() {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut state = test_state();
+        state.active_run = Some(crate::tui::ActiveRunView {
+            run_id: "run_1".into(),
+            status: "running".into(),
+        });
+        let mut runtime = UiRuntime {
+            active_run_id: Some("run_1".into()),
+            config_path: None,
+            next_offset: 7,
+            poll_in_flight: true,
+            polling: true,
+            last_poll: Instant::now(),
+            tool_inputs: HashMap::new(),
+            active_since: Some(Instant::now()),
+        };
+        event_sender
+            .send(ClientEvent::Failed {
+                context: "events.stream",
+                error: crate::AppError::DaemonResponse(ProtocolError {
+                    code: "lagged".into(),
+                    message: "offset is no longer buffered".into(),
+                }),
+            })
+            .unwrap();
+
+        drain_client_events(&mut state, &mut runtime, &event_receiver, &command_sender);
+
+        assert!(
+            state
+                .stream_warning
+                .as_deref()
+                .unwrap()
+                .contains("current tip")
+        );
+        assert!(runtime.poll_in_flight);
+        assert!(matches!(
+            command_receiver.try_recv().unwrap(),
+            ClientCommand::PollEvents {
+                run_id,
+                from_offset: None,
+            } if run_id == "run_1"
+        ));
+    }
+
+    #[test]
     fn stream_connection_failure_enters_disconnected_and_stops_polling() {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
@@ -2691,7 +2744,10 @@ mod tests {
         event_sender
             .send(ClientEvent::Failed {
                 context: "events.stream",
-                error: "io error: Connection refused (os error 111)".into(),
+                error: crate::AppError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "Connection refused",
+                )),
             })
             .unwrap();
 

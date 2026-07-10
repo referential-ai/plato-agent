@@ -730,6 +730,8 @@ mod tests {
             TranscriptState::Loaded(
                 TranscriptReadResult {
                     run_id: "run_1".into(),
+                    status: "finished".into(),
+                    final_answer: Some("README summary".into()),
                     transcript:
                         "final_phase: Finished\nnext_seq: 5\n[turn_1] context ToolSchemas model.tools: [{\"name\":\"file_read\"}]\n[turn_1] user: read README\n[turn_1] assistant: README summary\n"
                             .into(),

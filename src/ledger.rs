@@ -140,6 +140,13 @@ pub struct PersistedSessionSummary {
     pub latest_question: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PersistedRunStatus {
+    pub run_id: String,
+    pub status: String,
+    pub final_answer: Option<String>,
+}
+
 impl SqliteLedger {
     pub fn open_or_create(path: &Path) -> AppResult<Self> {
         if path.as_os_str().is_empty() {
@@ -426,6 +433,35 @@ impl SqliteLedger {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub(crate) fn run_status(&self, run_id: &str) -> AppResult<PersistedRunStatus> {
+        self.connection
+            .query_row(
+                "SELECT run_id, status, final_answer FROM session_runs WHERE run_id = ?1",
+                params![run_id],
+                persisted_run_status,
+            )
+            .optional()?
+            .ok_or_else(|| AppError::RunNotFound(run_id.into()))
+    }
+
+    pub(crate) fn latest_session_run_status(
+        &self,
+        session_id: &str,
+    ) -> AppResult<PersistedRunStatus> {
+        self.connection
+            .query_row(
+                "SELECT run_id, status, final_answer
+                 FROM session_runs
+                 WHERE session_id = ?1
+                 ORDER BY session_index DESC
+                 LIMIT 1",
+                params![session_id],
+                persisted_run_status,
+            )
+            .optional()?
+            .ok_or_else(|| AppError::SessionNotFound(session_id.into()))
+    }
+
     fn session_exists(&self, session_id: &str) -> AppResult<bool> {
         session_exists_in(&self.connection, session_id)
     }
@@ -468,6 +504,14 @@ impl SqliteLedger {
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
         Ok(version)
     }
+}
+
+fn persisted_run_status(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedRunStatus> {
+    Ok(PersistedRunStatus {
+        run_id: row.get(0)?,
+        status: row.get(1)?,
+        final_answer: row.get(2)?,
+    })
 }
 
 struct ExistingEvent {

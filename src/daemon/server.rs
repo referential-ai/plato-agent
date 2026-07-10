@@ -211,7 +211,9 @@ impl Drop for DaemonServer {
 mod tests {
     use super::*;
     use crate::{
+        AppError,
         daemon::{
+            client::DaemonClient,
             protocol::{
                 ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_OVERLOAD, ERROR_RUN_FAILED,
                 ERROR_SESSIONS_LIST_FAILED, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind,
@@ -222,7 +224,10 @@ mod tests {
         ledger::SqliteLedger,
         tools::ApprovalOutcome,
     };
-    use platonic_core::{HarnessEvent, RunId};
+    use platonic_core::{
+        AgentId, ContextPack, HarnessEvent, Message, MessageRole, ModelName, ModelUsage,
+        RecordedEvent, RunId, TurnId,
+    };
     use serde_json::json;
     use std::{
         io::{BufRead, Read},
@@ -639,6 +644,84 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         assert_eq!(response.kind, EnvelopeKind::Error);
         assert_eq!(error.code, ERROR_LAGGED);
+    }
+
+    #[test]
+    fn client_recovers_from_lag_at_tip_with_typed_final_state() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        seed_finished_session(&server.paths().ledger_path, "run_1", "session_1", "done");
+        let record = Arc::new(RunRecord::new(
+            "run_1".into(),
+            "session_1".into(),
+            server.paths().ledger_path.clone(),
+        ));
+        record.set_finished("done".into());
+        for index in 0..(MAX_EVENT_BUFFER + 1) {
+            record.push_event(json!({"index": index}));
+        }
+        server
+            .runtime
+            .runs
+            .lock()
+            .unwrap()
+            .insert("run_1".into(), record);
+        let handle = thread::spawn(move || server.serve_next().unwrap());
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+
+        let error = client.events_stream("run_1", Some(0), 16).unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::DaemonResponse(ProtocolError { code, .. }) if code == ERROR_LAGGED
+        ));
+
+        let tail = client.events_stream("run_1", None, 16).unwrap();
+        assert_eq!(tail.from_offset, (MAX_EVENT_BUFFER + 1) as u64);
+        assert_eq!(tail.next_offset, tail.from_offset);
+        assert!(tail.events.is_empty());
+        assert_eq!(tail.status, "finished");
+
+        let transcript = client.transcript_read("run_1").unwrap();
+        assert_eq!(transcript.status, "finished");
+        assert_eq!(transcript.final_answer.as_deref(), Some("done"));
+
+        drop(client);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn client_recovers_typed_final_answer_after_daemon_restart() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let first_socket = socket_dir.path().join("agent-1.sock");
+        let first_server = DaemonServer::bind(workspace.path(), Some(first_socket)).unwrap();
+        seed_finished_session(
+            &first_server.paths().ledger_path,
+            "run_1",
+            "session_1",
+            "persisted answer",
+        );
+        drop(first_server);
+
+        let second_socket = socket_dir.path().join("agent-2.sock");
+        let second_server =
+            DaemonServer::bind(workspace.path(), Some(second_socket.clone())).unwrap();
+        let handle = thread::spawn(move || second_server.serve_next().unwrap());
+        let mut client = DaemonClient::connect(&second_socket).unwrap();
+
+        let sessions = client.sessions_list().unwrap();
+        assert_eq!(sessions[0].session_id, "session_1");
+        assert_eq!(sessions[0].status, "finished");
+
+        let transcript = client.transcript_read_session("session_1").unwrap();
+        assert_eq!(transcript.run_id, "run_1");
+        assert_eq!(transcript.status, "finished");
+        assert_eq!(transcript.final_answer.as_deref(), Some("persisted answer"));
+
+        drop(client);
+        handle.join().unwrap();
     }
 
     #[test]
@@ -1141,6 +1224,65 @@ enabled = ["{enabled_tool}"]
             assert!(Instant::now() < deadline, "run {run_id} did not finish");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn seed_finished_session(path: &Path, run_id: &str, session_id: &str, answer: &str) {
+        let run_id = RunId::new(run_id).unwrap();
+        let turn_id = TurnId::new("turn_1").unwrap();
+        let mut ledger = SqliteLedger::open_or_create(path).unwrap();
+        ledger
+            .begin_session_run(session_id, &run_id, "question", true)
+            .unwrap();
+        let events = vec![
+            HarnessEvent::RunStarted {
+                run_id: run_id.clone(),
+                agent_id: AgentId::new("agent_1").unwrap(),
+            },
+            HarnessEvent::ContextBuilt {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                context: ContextPack {
+                    token_budget: 0,
+                    fragments: vec![],
+                },
+            },
+            HarnessEvent::ModelRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                step: 0,
+                model: ModelName::new("model_1").unwrap(),
+            },
+            HarnessEvent::ModelResponded {
+                run_id: run_id.clone(),
+                turn_id,
+                step: 0,
+                output: Message {
+                    role: MessageRole::Assistant,
+                    content: answer.into(),
+                },
+                proposed_calls: vec![],
+                usage: ModelUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                },
+            },
+            HarnessEvent::RunFinished {
+                run_id: run_id.clone(),
+            },
+        ];
+        for (seq, event) in events.into_iter().enumerate() {
+            ledger
+                .append(
+                    run_id.as_str(),
+                    &RecordedEvent {
+                        seq: seq as u64,
+                        occurred_at_ms: seq as u64,
+                        event,
+                    },
+                )
+                .unwrap();
+        }
+        ledger.finish_session_run(&run_id, answer).unwrap();
     }
 
     fn read_envelope(reader: &mut BufReader<UnixStream>) -> Envelope {

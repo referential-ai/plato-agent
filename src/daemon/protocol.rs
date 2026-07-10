@@ -130,7 +130,7 @@ pub struct MessageAppendParams {
 #[serde(deny_unknown_fields)]
 pub struct EventsStreamParams {
     pub run_id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_offset: Option<u64>,
     #[serde(default)]
     pub limit: Option<usize>,
@@ -193,6 +193,8 @@ pub struct TranscriptReadParams {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptReadResult {
     pub run_id: String,
+    pub status: String,
+    pub final_answer: Option<String>,
     pub transcript: String,
 }
 

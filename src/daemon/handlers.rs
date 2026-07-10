@@ -1,5 +1,5 @@
 use crate::{
-    ApprovalMode, RunEvent, RunLedger, RunOptions, RunSession,
+    AppResult, ApprovalMode, RunEvent, RunLedger, RunOptions, RunSession,
     daemon::{
         protocol::{
             ApprovalDecideParams, CommandAcceptedResult, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
@@ -11,12 +11,13 @@ use crate::{
         },
         runtime::{DaemonRuntime, RunRecord, approval_handler},
     },
+    ledger::SqliteLedger,
     new_run_id, new_session_id, replay_sqlite, replay_sqlite_session, run_question,
     tools::ApprovalOutcome,
 };
 use serde_json::{json, to_value};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering, mpsc},
     thread,
 };
@@ -304,8 +305,8 @@ fn handle_events_stream(runtime: &DaemonRuntime, request: Envelope) -> Envelope 
             format!("event stream limit exceeds maximum {MAX_EVENT_LIMIT}: {limit}"),
         );
     }
-    let from_offset = params.from_offset.unwrap_or(0);
     let buffer = record.events.lock().expect("event buffer lock poisoned");
+    let from_offset = params.from_offset.unwrap_or(buffer.next_offset);
     if from_offset < buffer.first_offset {
         return Envelope::error(
             request.id,
@@ -510,16 +511,10 @@ fn handle_transcript_read(runtime: &DaemonRuntime, request: Envelope) -> Envelop
         Ok(params) => params,
         Err(error) => return *error,
     };
-    let (transcript_id, transcript) = if let Some(run_id) = params.run_id {
-        (
-            run_id.clone(),
-            replay_sqlite(&runtime.paths.ledger_path, Some(&run_id)),
-        )
+    let transcript = if let Some(run_id) = params.run_id {
+        read_run_transcript(&runtime.paths.ledger_path, &run_id)
     } else if let Some(session_id) = params.session_id {
-        (
-            session_id.clone(),
-            replay_sqlite_session(&runtime.paths.ledger_path, &session_id),
-        )
+        read_session_transcript(&runtime.paths.ledger_path, &session_id)
     } else {
         return Envelope::error(
             request.id,
@@ -532,11 +527,7 @@ fn handle_transcript_read(runtime: &DaemonRuntime, request: Envelope) -> Envelop
         Ok(transcript) => Envelope::response(
             request.id,
             Some("transcript.read".into()),
-            to_value(TranscriptReadResult {
-                run_id: transcript_id,
-                transcript,
-            })
-            .expect("transcript.read result serializes"),
+            to_value(transcript).expect("transcript.read result serializes"),
         ),
         Err(error) => Envelope::error(
             request.id,
@@ -545,6 +536,26 @@ fn handle_transcript_read(runtime: &DaemonRuntime, request: Envelope) -> Envelop
             error.to_string(),
         ),
     }
+}
+
+fn read_run_transcript(path: &Path, run_id: &str) -> AppResult<TranscriptReadResult> {
+    let status = SqliteLedger::open_readonly(path)?.run_status(run_id)?;
+    Ok(TranscriptReadResult {
+        run_id: status.run_id,
+        status: status.status,
+        final_answer: status.final_answer,
+        transcript: replay_sqlite(path, Some(run_id))?,
+    })
+}
+
+fn read_session_transcript(path: &Path, session_id: &str) -> AppResult<TranscriptReadResult> {
+    let status = SqliteLedger::open_readonly(path)?.latest_session_run_status(session_id)?;
+    Ok(TranscriptReadResult {
+        run_id: status.run_id,
+        status: status.status,
+        final_answer: status.final_answer,
+        transcript: replay_sqlite_session(path, session_id)?,
+    })
 }
 
 fn latest_session_id(runtime: &DaemonRuntime) -> Result<String, String> {

@@ -117,7 +117,8 @@ The daemon holds the lock while it is active. SIGINT and SIGTERM trigger
 a graceful shutdown: the daemon stops accepting new connections, then removes
 the socket and lock before exiting. Do not remove a lock for a live daemon.
 Live assistant deltas are transient `events.stream` events and are not written
-to the ledger.
+to the ledger. After a `lagged` response, omitting `from_offset` resumes at the
+current tip; `transcript.read` returns ledger-backed status and final answer.
 
 Minimal NDJSON-over-Unix-socket check, using the `workspace_id` and
 `socket_path` printed by the daemon:
