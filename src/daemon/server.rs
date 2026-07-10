@@ -219,7 +219,7 @@ mod tests {
                 ERROR_SESSIONS_LIST_FAILED, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind,
                 ProtocolError,
             },
-            runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord},
+            runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord, RunStateName},
         },
         ledger::SqliteLedger,
         tools::ApprovalOutcome,
@@ -233,7 +233,7 @@ mod tests {
         io::{BufRead, Read},
         net::TcpListener,
         os::unix::fs::PermissionsExt,
-        sync::Arc,
+        sync::{Arc, Barrier, mpsc},
         thread,
         time::{Duration, Instant},
     };
@@ -473,6 +473,48 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
     }
 
     #[test]
+    fn run_cancel_unblocks_pending_approval_within_bound() {
+        let provider = spawn_tool_call_provider();
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_provider_config(&config_path, &provider.base_url, "file.write");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+
+        let response = server.handle_line(&format!(
+            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"write a file","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        let run_id = response.result.unwrap()["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let record = server.runtime.runs.lock().unwrap()[&run_id].clone();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !record.approvals.lock().unwrap().contains_key("call_1") {
+            assert!(Instant::now() < deadline, "approval did not become pending");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let response = server.handle_line(&format!(
+            r#"{{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
+        ));
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while record.status().state == RunStateName::Running {
+            assert!(
+                Instant::now() < deadline,
+                "canceled approval worker did not exit"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(record.status().state, RunStateName::Canceled);
+        provider.handle.join().unwrap();
+    }
+
+    #[test]
     fn different_sessions_run_concurrently_with_separate_ledgers() {
         let provider = spawn_concurrent_text_provider();
         let workspace = tempfile::tempdir().unwrap();
@@ -533,6 +575,89 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             assert_eq!(turns[0].question, question);
             assert_eq!(turns[0].final_answer, answer);
         }
+    }
+
+    #[test]
+    fn concurrent_message_append_reserves_only_one_session_run() {
+        const CLIENTS: usize = 64;
+
+        let provider = spawn_tool_call_provider();
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_provider_config(&config_path, &provider.base_url, "file.write");
+        let server = Arc::new(DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap());
+        seed_finished_session(
+            &server.paths().ledger_path,
+            "seed_run",
+            "shared_session",
+            "seed answer",
+        );
+        let barrier = Arc::new(Barrier::new(CLIENTS + 1));
+        let mut clients = Vec::new();
+        for index in 0..CLIENTS {
+            let server = Arc::clone(&server);
+            let barrier = Arc::clone(&barrier);
+            let config_path = config_path.clone();
+            clients.push(thread::spawn(move || {
+                barrier.wait();
+                server.handle_line(&format!(
+                    r#"{{"v":1,"id":"append_{index}","kind":"request","method":"message.append","params":{{"message":"write a file","session_id":"shared_session","config_path":"{}"}}}}"#,
+                    config_path.display()
+                ))
+            }));
+        }
+        barrier.wait();
+        let responses = clients
+            .into_iter()
+            .map(|client| client.join().unwrap())
+            .collect::<Vec<_>>();
+        let admitted_run_ids = responses
+            .iter()
+            .filter(|response| response.kind == EnvelopeKind::Response)
+            .filter_map(|response| response.result.as_ref())
+            .filter_map(|result| result["run_id"].as_str())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let pending = admitted_run_ids.iter().any(|run_id| {
+                server.runtime.runs.lock().unwrap()[run_id]
+                    .approvals
+                    .lock()
+                    .unwrap()
+                    .contains_key("call_1")
+            });
+            if pending {
+                break;
+            }
+            assert!(Instant::now() < deadline, "approval did not become pending");
+            thread::sleep(Duration::from_millis(5));
+        }
+        for run_id in &admitted_run_ids {
+            server.handle_line(&format!(
+                r#"{{"v":1,"id":"cancel","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
+            ));
+        }
+        provider.handle.join().unwrap();
+
+        assert_eq!(
+            admitted_run_ids.len(),
+            1,
+            "one session admitted multiple concurrent runs: {admitted_run_ids:?}"
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.kind == EnvelopeKind::Error)
+                .filter(|response| {
+                    response.error.as_ref().map(|error| error.code.as_str()) == Some(ERROR_OVERLOAD)
+                })
+                .count(),
+            CLIENTS - 1
+        );
     }
 
     #[test]
@@ -756,6 +881,50 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             record.approvals.lock().unwrap()["call_1"].decision,
             Some(ApprovalOutcome::Granted)
         );
+    }
+
+    #[test]
+    fn run_cancel_synchronizes_with_pending_approval() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let server = Arc::new(DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap());
+        let record = Arc::new(RunRecord::new(
+            "run_1".into(),
+            "session_1".into(),
+            server.paths().ledger_path.clone(),
+        ));
+        server
+            .runtime
+            .runs
+            .lock()
+            .unwrap()
+            .insert("run_1".into(), record.clone());
+        let mut approvals = record.approvals.lock().unwrap();
+        approvals.insert("call_1".into(), PendingApproval::new());
+        let (sender, receiver) = mpsc::channel();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let cancel_server = Arc::clone(&server);
+        let cancel = thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            sender
+                .send(cancel_server.handle_line(
+                    r#"{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{"run_id":"run_1"}}"#,
+                ))
+                .unwrap();
+        });
+
+        started_receiver.recv().unwrap();
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(100)).is_err(),
+            "run.cancel must synchronize with the approval waiter mutex"
+        );
+        drop(approvals);
+        let response = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancel.join().unwrap();
+
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert!(record.cancel.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
