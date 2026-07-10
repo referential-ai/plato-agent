@@ -34,4 +34,5 @@ toml = "0.9"
 ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
+temp-env = "0.3"
 tempfile = "3"

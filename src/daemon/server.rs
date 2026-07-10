@@ -52,6 +52,17 @@ pub struct DaemonServer {
 
 impl DaemonServer {
     pub fn bind(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
+        #[cfg(test)]
+        {
+            paths::with_test_xdg(workspace_root, || {
+                Self::bind_inner(workspace_root, socket_path)
+            })
+        }
+        #[cfg(not(test))]
+        Self::bind_inner(workspace_root, socket_path)
+    }
+
+    fn bind_inner(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
         let runtime_home = paths::runtime_home()?;
         let paths = DaemonPaths::resolve(workspace_root, socket_path)?;
         prepare_runtime_path(&runtime_home, &paths.lock_path)?;
@@ -253,6 +264,18 @@ mod tests {
 
         assert_eq!(mode(&parent), PRIVATE_DIRECTORY_MODE);
         assert_eq!(mode(&socket_path), SOCKET_MODE);
+        assert!(
+            server
+                .paths()
+                .ledger_path
+                .starts_with(workspace.path().join("xdg-state"))
+        );
+        assert!(
+            server
+                .paths()
+                .lock_path
+                .starts_with(workspace.path().join("xdg-runtime"))
+        );
         drop(server);
     }
 
