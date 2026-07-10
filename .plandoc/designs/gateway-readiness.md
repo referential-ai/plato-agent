@@ -70,6 +70,7 @@ Optional, config-off by default: `remote_deny = true` lets allowlisted owners re
 One platform for v1. Recommended default: Telegram — single bot token, outbound long-poll, numeric-uid allowlist; smallest pairing surface (verify at implementation). Alternatives: Discord, Slack, SMS.
 
 Jerome: default (Telegram). Accepted 2026-07-09 by ratifying the architecture-lane recommendation; recorded on issue #93.
+Superseded 2026-07-10 by direct human choice: **Discord** — outbound websocket receive + REST send, still no inbound listener (D1 unchanged). Telegram skeleton PR #105 closed unmerged; Discord implementation is #106.
 
 ### Q2. Remote deny relay
 Ship v1 notify-only, or include the config-off `remote_deny` relay? Recommended default: notify-only.
