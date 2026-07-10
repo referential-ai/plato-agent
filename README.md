@@ -163,6 +163,31 @@ NDJSON `run.start` and `message.append` default to `wait: false`, returning a
 `running` response immediately. Send `"wait": true` only when the connection can
 block until the run finishes.
 
+## Telegram Gateway
+
+`plato-gateway-telegram` long-polls Telegram and forwards allowlisted text
+messages to a running workspace daemon. Add the bot token variable name and
+numeric owner user ids to `plato.toml`:
+
+```toml
+[gateway.telegram]
+api_key_env = "TELEGRAM_BOT_TOKEN"
+owner_user_ids = [123456789]
+```
+
+Run the gateway in an environment that contains the bot token but no provider
+credentials:
+
+```bash
+unset OPENAI_API_KEY OPENROUTER_API_KEY
+export TELEGRAM_BOT_TOKEN="$(cat /path/to/telegram-bot-token)"
+cargo run --bin plato-gateway-telegram -- --workspace "$PWD"
+```
+
+Messages from other user ids are ignored. Each allowed chat or topic continues
+one daemon session; final answers are recovered from the ledger after daemon
+reconnects. Remote approval notifications are not part of this binary yet.
+
 ## TUI
 
 `plato --tui` is the interactive local entrypoint. It attaches to the workspace

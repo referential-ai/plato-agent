@@ -9,6 +9,7 @@ pub mod model;
 pub mod paths;
 pub mod provider;
 pub mod replay;
+pub mod telegram_gateway;
 pub mod tool_catalog;
 pub mod tools;
 pub mod tui;

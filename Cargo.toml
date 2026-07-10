@@ -18,6 +18,10 @@ path = "src/bin/plato-agentd.rs"
 name = "plato-tui"
 path = "src/bin/plato-tui.rs"
 
+[[bin]]
+name = "plato-gateway-telegram"
+path = "src/bin/plato-gateway-telegram.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28.1"
