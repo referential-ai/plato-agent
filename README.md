@@ -110,6 +110,9 @@ Default paths are keyed by the workspace id:
 - lock: `${XDG_RUNTIME_DIR:-/tmp/plato-agent/$USER}/plato-agent/workspaces/<workspace-id>/agent.lock`
 - ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/plato-agent/workspaces/<workspace-id>/agent.db`
 
+Runtime directories are restricted to `0700` and the daemon socket to `0600`.
+A custom `--socket` parent is restricted to `0700` at startup.
+
 The daemon holds the lock while it is active. SIGINT and SIGTERM trigger
 a graceful shutdown: the daemon stops accepting new connections, then removes
 the socket and lock before exiting. Do not remove a lock for a live daemon.

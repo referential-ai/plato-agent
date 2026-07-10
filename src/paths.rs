@@ -91,7 +91,7 @@ fn state_home() -> AppResult<PathBuf> {
     Ok(PathBuf::from(home).join(".local").join("state"))
 }
 
-fn runtime_home() -> AppResult<PathBuf> {
+pub(crate) fn runtime_home() -> AppResult<PathBuf> {
     if let Some(value) = std::env::var_os("XDG_RUNTIME_DIR")
         && !value.is_empty()
     {
