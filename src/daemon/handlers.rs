@@ -1,13 +1,14 @@
 use crate::{
-    AppResult, ApprovalMode, RunEvent, RunLedger, RunOptions, RunSession,
+    AppError, AppResult, ApprovalMode, RunEvent, RunLedger, RunOptions, RunSession,
     daemon::{
         protocol::{
-            ApprovalDecideParams, CommandAcceptedResult, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
-            ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
-            ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams,
-            EventsStreamResult, HelloParams, HelloResult, MessageAppendParams, RunCancelParams,
-            RunStartParams, RunStartResult, RunStateName, SessionSummary, SessionsListResult,
-            TranscriptReadParams, TranscriptReadResult, decode_request,
+            ApprovalDecideParams, CommandAcceptedResult, ERROR_INTERNAL, ERROR_LAGGED,
+            ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
+            ERROR_SESSIONS_LIST_FAILED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH,
+            Envelope, EventsStreamParams, EventsStreamResult, HelloParams, HelloResult,
+            MessageAppendParams, RunCancelParams, RunStartParams, RunStartResult, RunStateName,
+            SessionSummary, SessionsListResult, TranscriptReadParams, TranscriptReadResult,
+            decode_request,
         },
         runtime::{DaemonRuntime, RunRecord, approval_handler},
     },
@@ -536,13 +537,16 @@ fn handle_transcript_read(runtime: &DaemonRuntime, request: Envelope) -> Envelop
         Err(error) => Envelope::error(
             request.id,
             Some("transcript.read".into()),
-            ERROR_NOT_FOUND,
+            transcript_error_code(&error),
             error.to_string(),
         ),
     }
 }
 
 fn read_run_transcript(path: &Path, run_id: &str) -> AppResult<TranscriptReadResult> {
+    if !path.exists() {
+        return Err(AppError::RunNotFound(run_id.into()));
+    }
     let status = SqliteLedger::open_readonly(path)?.run_status(run_id)?;
     Ok(TranscriptReadResult {
         run_id: status.run_id,
@@ -553,6 +557,9 @@ fn read_run_transcript(path: &Path, run_id: &str) -> AppResult<TranscriptReadRes
 }
 
 fn read_session_transcript(path: &Path, session_id: &str) -> AppResult<TranscriptReadResult> {
+    if !path.exists() {
+        return Err(AppError::SessionNotFound(session_id.into()));
+    }
     let status = SqliteLedger::open_readonly(path)?.latest_session_run_status(session_id)?;
     Ok(TranscriptReadResult {
         run_id: status.run_id,
@@ -560,6 +567,16 @@ fn read_session_transcript(path: &Path, session_id: &str) -> AppResult<Transcrip
         final_answer: status.final_answer,
         transcript: replay_sqlite_session(path, session_id)?,
     })
+}
+
+fn transcript_error_code(error: &AppError) -> &'static str {
+    match error {
+        AppError::RunNotFound(_)
+        | AppError::SessionNotFound(_)
+        | AppError::NoSqliteRuns
+        | AppError::NoSqliteSessions => ERROR_NOT_FOUND,
+        _ => ERROR_INTERNAL,
+    }
 }
 
 fn latest_session_id(runtime: &DaemonRuntime) -> Result<String, String> {

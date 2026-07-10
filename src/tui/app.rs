@@ -1,7 +1,10 @@
 use crate::{
-    AppResult,
+    AppError, AppResult,
     daemon::client::{DaemonClient, DaemonConnectionConfig},
-    daemon::protocol::{CommandAcceptedResult, EventsStreamResult, RunStartResult, RunStateName},
+    daemon::protocol::{
+        CommandAcceptedResult, ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
+        ERROR_WORKSPACE_MISMATCH, EventsStreamResult, RunStartResult, RunStateName,
+    },
     tui::{TranscriptState, TranscriptView, TuiState, render, render_snapshot},
 };
 use crossterm::{
@@ -1186,20 +1189,24 @@ fn drain_client_events(
             }
             ClientEvent::Failed { context, error } => {
                 runtime.poll_in_flight = false;
-                let protocol_code = match &error {
-                    crate::AppError::DaemonResponse(error) => Some(error.code.as_str()),
-                    _ => None,
-                };
+                let lagged = matches!(
+                    &error,
+                    AppError::DaemonResponse(error) if error.code == ERROR_LAGGED
+                );
+                let overloaded = matches!(
+                    &error,
+                    AppError::DaemonResponse(error) if error.code == ERROR_OVERLOAD
+                );
                 let message = error.to_string();
-                if context == "events.stream" && protocol_code == Some("lagged") {
+                if context == "events.stream" && lagged {
                     state.stream_warning = Some(format!("{message}; resuming at current tip"));
                     if let Some(run_id) = runtime.active_run_id.clone() {
                         poll_events_from(runtime, commands, run_id, None);
                     }
-                } else if context == "events.stream" && protocol_code == Some("overload") {
+                } else if context == "events.stream" && overloaded {
                     state.stream_warning = Some(message);
                 } else {
-                    if is_connection_error(&message) {
+                    if is_connection_error(&error) {
                         runtime.polling = false;
                         state.connection = crate::tui::ConnectionState::Disconnected {
                             error: message.clone(),
@@ -1421,13 +1428,15 @@ fn request_cancel(commands: &Sender<ClientCommand>, state: &mut TuiState) -> boo
     true
 }
 
-fn is_connection_error(error: &str) -> bool {
-    error.contains("Connection refused")
-        || error.contains("No such file")
-        || error.contains("connection closed")
-        || error.contains("unsupported_version")
-        || error.contains("workspace_mismatch")
-        || error.contains("DaemonLockHeld")
+fn is_connection_error(error: &AppError) -> bool {
+    match error {
+        AppError::Io(_) | AppError::DaemonLockHeld { .. } | AppError::DaemonProtocol(_) => true,
+        AppError::DaemonResponse(error) => matches!(
+            error.code.as_str(),
+            ERROR_UNSUPPORTED_VERSION | ERROR_WORKSPACE_MISMATCH
+        ),
+        _ => false,
+    }
 }
 
 fn submit_composer(
@@ -2762,6 +2771,38 @@ mod tests {
         assert!(!runtime.poll_in_flight);
         assert!(is_disconnected(&state));
         assert!(command_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn connection_error_classification_uses_typed_errors() {
+        assert!(is_connection_error(&AppError::DaemonLockHeld {
+            path: PathBuf::from("/tmp/agent.lock"),
+            owner: "pid 1".into(),
+        }));
+        assert!(is_connection_error(&AppError::DaemonProtocol(
+            "response id mismatch".into()
+        )));
+        assert!(is_connection_error(&AppError::Io(std::io::Error::other(
+            "socket failed"
+        ))));
+        assert!(is_connection_error(&AppError::DaemonResponse(
+            ProtocolError {
+                code: ERROR_UNSUPPORTED_VERSION.into(),
+                message: "unsupported".into(),
+            }
+        )));
+        assert!(is_connection_error(&AppError::DaemonResponse(
+            ProtocolError {
+                code: ERROR_WORKSPACE_MISMATCH.into(),
+                message: "wrong workspace".into(),
+            }
+        )));
+        assert!(!is_connection_error(&AppError::DaemonResponse(
+            ProtocolError {
+                code: ERROR_OVERLOAD.into(),
+                message: "busy".into(),
+            }
+        )));
     }
 
     #[test]

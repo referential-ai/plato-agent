@@ -710,7 +710,10 @@ pub fn read_sqlite_records(path: &Path, run_id: Option<&str>) -> AppResult<Vec<R
 }
 
 pub fn latest_sqlite_session_id(path: &Path) -> AppResult<String> {
-    SqliteLedger::open_or_create(path)?.latest_session_id()
+    if !path.exists() {
+        return Err(AppError::NoSqliteSessions);
+    }
+    SqliteLedger::open_readonly(path)?.latest_session_id()
 }
 
 pub fn read_latest_sqlite_session(path: &Path) -> AppResult<SessionRecords> {
@@ -888,6 +891,17 @@ mod tests {
                 latest_question: "second question".into(),
             }]
         );
+    }
+
+    #[test]
+    fn latest_session_id_read_does_not_create_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.db");
+
+        let error = latest_sqlite_session_id(&path).unwrap_err();
+
+        assert!(matches!(error, AppError::NoSqliteSessions));
+        assert!(!path.exists());
     }
 
     #[test]

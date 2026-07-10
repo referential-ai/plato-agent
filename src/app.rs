@@ -294,7 +294,10 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
     }
 
     let config = Config::load(&options.workspace_root, options.config_path.as_deref())?;
-    let run_id = options.run_id.clone().unwrap_or(new_run_id()?);
+    let run_id = match options.run_id.clone() {
+        Some(run_id) => run_id,
+        None => new_run_id()?,
+    };
     let client = OpenAiCompatibleClient::from_config(
         &config.provider.api_key_env,
         config.provider.base_url.clone(),

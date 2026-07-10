@@ -381,7 +381,6 @@ fn shell_exec(
             "command": input.command,
             "cwd": cwd.to_string_lossy(),
             "exit_code": exit_code,
-            "timed_out": false,
             "duration_ms": duration_ms,
             "stdout": stdout.text,
             "stderr": stderr.text,
@@ -1184,7 +1183,7 @@ mod tests {
 
         assert_eq!(result.data["exit_code"], 7);
         assert_eq!(result.data["stderr"], "fail");
-        assert_eq!(result.data["timed_out"], false);
+        assert!(result.data.get("timed_out").is_none());
     }
 
     #[cfg(unix)]
