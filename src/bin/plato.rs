@@ -514,54 +514,61 @@ mod tests {
     #[test]
     fn default_run_uses_default_sqlite_path() {
         let workspace = tempfile::tempdir().unwrap();
+        with_test_xdg(workspace.path(), || {
+            let ledger = run_ledger(None, None, workspace.path()).unwrap();
 
-        let ledger = run_ledger(None, None, workspace.path()).unwrap();
-
-        assert_eq!(
-            ledger,
-            RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap())
-        );
+            assert_eq!(
+                ledger,
+                RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap())
+            );
+        });
     }
 
     #[test]
     fn default_sqlite_run_fails_closed_when_daemon_lock_exists() {
         let workspace = tempfile::tempdir().unwrap();
-        let socket = workspace.path().join("agent.sock");
-        let _lock = plato_agent::daemon::lock::WorkspaceLock::acquire_for_workspace(
-            workspace.path(),
-            &socket,
-        )
-        .unwrap();
+        with_test_xdg(workspace.path(), || {
+            let socket = workspace.path().join("agent.sock");
+            let _lock = plato_agent::daemon::lock::WorkspaceLock::acquire_for_workspace(
+                workspace.path(),
+                &socket,
+            )
+            .unwrap();
 
-        let error = run_ledger(None, None, workspace.path()).unwrap_err();
+            let error = run_ledger(None, None, workspace.path()).unwrap_err();
 
-        assert!(matches!(error, AppError::DaemonLockHeld { .. }));
+            assert!(matches!(error, AppError::DaemonLockHeld { .. }));
+        });
     }
 
     #[test]
     fn jsonl_run_does_not_check_daemon_lock() {
         let workspace = tempfile::tempdir().unwrap();
-        let socket = workspace.path().join("agent.sock");
-        let _lock = plato_agent::daemon::lock::WorkspaceLock::acquire_for_workspace(
-            workspace.path(),
-            &socket,
-        )
-        .unwrap();
+        with_test_xdg(workspace.path(), || {
+            let socket = workspace.path().join("agent.sock");
+            let _lock = plato_agent::daemon::lock::WorkspaceLock::acquire_for_workspace(
+                workspace.path(),
+                &socket,
+            )
+            .unwrap();
 
-        let ledger =
-            run_ledger(Some(PathBuf::from("events.jsonl")), None, workspace.path()).unwrap();
+            let ledger =
+                run_ledger(Some(PathBuf::from("events.jsonl")), None, workspace.path()).unwrap();
 
-        assert_eq!(ledger, RunLedger::Jsonl(PathBuf::from("events.jsonl")));
+            assert_eq!(ledger, RunLedger::Jsonl(PathBuf::from("events.jsonl")));
+        });
     }
 
     #[test]
     fn default_sqlite_run_starts_fresh_session() {
         let workspace = tempfile::tempdir().unwrap();
-        let ledger = RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap());
+        with_test_xdg(workspace.path(), || {
+            let ledger = RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap());
 
-        let session = run_session(false, &ledger).unwrap().unwrap();
+            let session = run_session(false, &ledger).unwrap().unwrap();
 
-        assert!(matches!(session, RunSession::Fresh { .. }));
+            assert!(matches!(session, RunSession::Fresh { .. }));
+        });
     }
 
     #[test]
@@ -603,13 +610,14 @@ mod tests {
     #[test]
     fn bare_replay_uses_default_sqlite_path() {
         let workspace = tempfile::tempdir().unwrap();
+        with_test_xdg(workspace.path(), || {
+            let ledger = replay_ledger(None, None, workspace.path()).unwrap();
 
-        let ledger = replay_ledger(None, None, workspace.path()).unwrap();
-
-        assert_eq!(
-            ledger,
-            RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap())
-        );
+            assert_eq!(
+                ledger,
+                RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap())
+            );
+        });
     }
 
     #[test]
@@ -625,18 +633,33 @@ mod tests {
     #[test]
     fn default_sqlite_replay_fails_closed_when_daemon_lock_exists() {
         let workspace = tempfile::tempdir().unwrap();
-        let socket = workspace.path().join("agent.sock");
-        let _lock = plato_agent::daemon::lock::WorkspaceLock::acquire_for_workspace(
-            workspace.path(),
-            &socket,
+        with_test_xdg(workspace.path(), || {
+            let socket = workspace.path().join("agent.sock");
+            let _lock = plato_agent::daemon::lock::WorkspaceLock::acquire_for_workspace(
+                workspace.path(),
+                &socket,
+            )
+            .unwrap();
+            let ledger = RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap());
+            let mut stdout = Vec::new();
+
+            let error =
+                write_replay_output(&mut stdout, ledger, None, workspace.path()).unwrap_err();
+
+            assert!(matches!(error, AppError::DaemonLockHeld { .. }));
+            assert!(stdout.is_empty());
+        });
+    }
+
+    fn with_test_xdg<T>(root: &Path, run: impl FnOnce() -> T) -> T {
+        let state_home = root.join("xdg-state");
+        let runtime_home = root.join("xdg-runtime");
+        temp_env::with_vars(
+            [
+                ("XDG_STATE_HOME", Some(state_home.as_os_str())),
+                ("XDG_RUNTIME_DIR", Some(runtime_home.as_os_str())),
+            ],
+            run,
         )
-        .unwrap();
-        let ledger = RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap());
-        let mut stdout = Vec::new();
-
-        let error = write_replay_output(&mut stdout, ledger, None, workspace.path()).unwrap_err();
-
-        assert!(matches!(error, AppError::DaemonLockHeld { .. }));
-        assert!(stdout.is_empty());
     }
 }

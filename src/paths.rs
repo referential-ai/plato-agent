@@ -102,6 +102,19 @@ pub(crate) fn runtime_home() -> AppResult<PathBuf> {
 }
 
 #[cfg(test)]
+pub(crate) fn with_test_xdg<T>(root: &Path, run: impl FnOnce() -> T) -> T {
+    let state_home = root.join("xdg-state");
+    let runtime_home = root.join("xdg-runtime");
+    temp_env::with_vars(
+        [
+            ("XDG_STATE_HOME", Some(state_home.as_os_str())),
+            ("XDG_RUNTIME_DIR", Some(runtime_home.as_os_str())),
+        ],
+        run,
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -116,39 +129,41 @@ mod tests {
     #[test]
     fn default_sqlite_path_uses_workspace_directory() {
         let dir = tempfile::tempdir().unwrap();
+        with_test_xdg(dir.path(), || {
+            let path = default_sqlite_path(dir.path()).unwrap();
 
-        let path = default_sqlite_path(dir.path()).unwrap();
-
-        assert!(
-            path.components()
-                .any(|component| component.as_os_str() == "plato-agent")
-        );
-        assert!(
-            path.components()
-                .any(|component| component.as_os_str() == "workspaces")
-        );
-        assert_eq!(path.file_name().unwrap(), "agent.db");
+            assert!(
+                path.components()
+                    .any(|component| component.as_os_str() == "plato-agent")
+            );
+            assert!(
+                path.components()
+                    .any(|component| component.as_os_str() == "workspaces")
+            );
+            assert_eq!(path.file_name().unwrap(), "agent.db");
+        });
     }
 
     #[test]
     fn default_socket_and_lock_paths_use_workspace_directory() {
         let dir = tempfile::tempdir().unwrap();
+        with_test_xdg(dir.path(), || {
+            let socket_path = default_socket_path(dir.path()).unwrap();
+            let lock_path = default_lock_path(dir.path()).unwrap();
 
-        let socket_path = default_socket_path(dir.path()).unwrap();
-        let lock_path = default_lock_path(dir.path()).unwrap();
-
-        assert!(
-            socket_path
-                .components()
-                .any(|component| component.as_os_str() == "plato-agent")
-        );
-        assert!(
-            socket_path
-                .components()
-                .any(|component| component.as_os_str() == "workspaces")
-        );
-        assert_eq!(socket_path.file_name().unwrap(), "agent.sock");
-        assert_eq!(lock_path.file_name().unwrap(), "agent.lock");
-        assert_eq!(socket_path.parent(), lock_path.parent());
+            assert!(
+                socket_path
+                    .components()
+                    .any(|component| component.as_os_str() == "plato-agent")
+            );
+            assert!(
+                socket_path
+                    .components()
+                    .any(|component| component.as_os_str() == "workspaces")
+            );
+            assert_eq!(socket_path.file_name().unwrap(), "agent.sock");
+            assert_eq!(lock_path.file_name().unwrap(), "agent.lock");
+            assert_eq!(socket_path.parent(), lock_path.parent());
+        });
     }
 }
