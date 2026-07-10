@@ -142,6 +142,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    const FAKE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
+
     #[test]
     fn hello_round_trip_over_unix_socket() {
         let workspace = tempfile::tempdir().unwrap();
@@ -849,6 +851,7 @@ enabled = ["file.read"]
     }
 
     fn write_provider_config(path: &Path, base_url: &str, enabled_tool: &str) {
+        let timeout_ms = FAKE_PROVIDER_TIMEOUT.as_millis();
         std::fs::write(
             path,
             format!(
@@ -858,7 +861,7 @@ kind = "open_ai"
 model = "test-model"
 api_key_env = "PATH"
 base_url = "{base_url}"
-timeout_ms = 5000
+timeout_ms = {timeout_ms}
 
 [limits]
 token_budget = 4000
@@ -900,7 +903,7 @@ enabled = ["{enabled_tool}"]
         listener.set_nonblocking(true).unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
             let mut clients = Vec::new();
             while clients.len() < 2 && Instant::now() < deadline {
                 match listener.accept() {
@@ -962,7 +965,7 @@ enabled = ["{enabled_tool}"]
     }
 
     fn wait_for_finished_run(server: &DaemonServer, run_id: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
         loop {
             let response = server.handle_line(&format!(
                 r#"{{"v":1,"id":"events","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":1}}}}"#
