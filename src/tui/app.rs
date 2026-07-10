@@ -1,7 +1,7 @@
 use crate::{
     AppResult,
     daemon::client::{DaemonClient, DaemonConnectionConfig},
-    daemon::protocol::{CommandAcceptedResult, EventsStreamResult, RunStartResult},
+    daemon::protocol::{CommandAcceptedResult, EventsStreamResult, RunStartResult, RunStateName},
     tui::{TranscriptState, TranscriptView, TuiState, render, render_snapshot},
 };
 use crossterm::{
@@ -933,21 +933,20 @@ fn load_connected_state(
         .selected_session_id
         .as_deref()
         .and_then(|session_id| {
-            state
-                .sessions
-                .iter()
-                .find(|session| session.session_id == session_id && session.status == "running")
+            state.sessions.iter().find(|session| {
+                session.session_id == session_id && session.status == RunStateName::Running
+            })
         })
         .or_else(|| {
             state
                 .sessions
                 .iter()
-                .find(|session| session.status == "running")
+                .find(|session| session.status == RunStateName::Running)
         });
     if let Some(session) = active_session {
         state.active_run = Some(crate::tui::ActiveRunView {
             run_id: session.run_id.clone(),
-            status: session.status.clone(),
+            status: session.status,
         });
     }
     Ok(state)
@@ -986,7 +985,7 @@ impl UiRuntime {
             polling: state
                 .active_run
                 .as_ref()
-                .is_some_and(|run| run.status == "running"),
+                .is_some_and(|run| run.status == RunStateName::Running),
             last_poll: Instant::now(),
             tool_inputs: HashMap::new(),
             active_since: state.active_run.as_ref().map(|_| Instant::now()),
@@ -998,7 +997,7 @@ impl UiRuntime {
         self.polling = state
             .active_run
             .as_ref()
-            .is_some_and(|run| run.status == "running");
+            .is_some_and(|run| run.status == RunStateName::Running);
         self.next_offset = 0;
         self.poll_in_flight = false;
         self.last_poll = Instant::now();
@@ -1256,7 +1255,7 @@ fn apply_run_response(
     message: &'static str,
 ) {
     let run_id = result.run_id.clone();
-    let status = result.status.clone();
+    let status = result.status;
     state.selected_session_id = Some(result.session_id.clone());
     state.status_message = Some(format!("{message}: {run_id}"));
     state.stream_warning = None;
@@ -1264,7 +1263,7 @@ fn apply_run_response(
     state.approval = None;
     state.active_run = Some(crate::tui::ActiveRunView {
         run_id: run_id.clone(),
-        status: status.clone(),
+        status,
     });
     push_live_event(
         state,
@@ -1274,7 +1273,7 @@ fn apply_run_response(
     runtime.active_run_id = Some(run_id);
     runtime.next_offset = 0;
     runtime.poll_in_flight = false;
-    runtime.polling = status == "running";
+    runtime.polling = status == RunStateName::Running;
     runtime.last_poll = Instant::now() - ACTIVE_POLL_INTERVAL;
     runtime.tool_inputs.clear();
     runtime.active_since = Some(Instant::now());
@@ -1290,11 +1289,11 @@ fn apply_events_result(
     runtime.next_offset = result.next_offset;
     let needs_catch_up =
         result.events.len() == EVENT_LIMIT && result.next_offset > result.from_offset;
-    runtime.polling = result.status == "running" || needs_catch_up;
+    runtime.polling = result.status == RunStateName::Running || needs_catch_up;
     state.stream_warning = None;
     state.active_run = Some(crate::tui::ActiveRunView {
         run_id: result.run_id.clone(),
-        status: result.status.clone(),
+        status: result.status,
     });
     for event in result.events {
         if let Some(model) = crate::tui::model_from_event(&event) {
@@ -1325,7 +1324,7 @@ fn apply_events_result(
     }
     if needs_catch_up {
         maybe_poll_events_now(runtime, commands);
-    } else if result.status != "running" {
+    } else if result.status != RunStateName::Running {
         runtime.active_since = None;
         send_command(
             commands,
@@ -1407,7 +1406,7 @@ fn request_cancel(commands: &Sender<ClientCommand>, state: &mut TuiState) -> boo
     let Some(active) = state.active_run.clone() else {
         return false;
     };
-    if active.status != "running" || state.cancel_requested {
+    if active.status != RunStateName::Running || state.cancel_requested {
         return false;
     }
     state.cancel_requested = true;
@@ -1928,7 +1927,12 @@ mod tests {
     fn sessions_command_opens_picker_without_daemon_command() {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
-        state.sessions = vec![test_session("session_1", "run_1", "finished", "first")];
+        state.sessions = vec![test_session(
+            "session_1",
+            "run_1",
+            RunStateName::Finished,
+            "first",
+        )];
         state.composer = "/sessions".into();
         state.composer_cursor = state.composer.len();
         let runtime = UiRuntime::from_state(&state, None);
@@ -1951,8 +1955,8 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut state = test_state();
         state.sessions = vec![
-            test_session("session_1", "run_1", "finished", "first"),
-            test_session("session_2", "run_2", "interrupted", "second"),
+            test_session("session_1", "run_1", RunStateName::Finished, "first"),
+            test_session("session_2", "run_2", RunStateName::Interrupted, "second"),
         ];
         state.session_picker = Some(SessionPickerView { selected: 0 });
         let runtime = UiRuntime::from_state(&state, None);
@@ -2363,7 +2367,7 @@ mod tests {
             run_id: "run_1".into(),
             from_offset: 0,
             next_offset: 2,
-            status: "finished".into(),
+            status: RunStateName::Finished,
             events: vec![json!({
                 "offset": 1,
                 "event": {
@@ -2426,7 +2430,7 @@ mod tests {
                 run_id: "run_1".into(),
                 from_offset: 0,
                 next_offset: 500,
-                status: "running".into(),
+                status: RunStateName::Running,
                 events,
             },
         );
@@ -2475,7 +2479,7 @@ mod tests {
                 run_id: "run_1".into(),
                 from_offset: 0,
                 next_offset: EVENT_LIMIT as u64,
-                status: "running".into(),
+                status: RunStateName::Running,
                 events,
             },
         );
@@ -2517,7 +2521,7 @@ mod tests {
                 run_id: "run_1".into(),
                 from_offset: 0,
                 next_offset: 1,
-                status: "running".into(),
+                status: RunStateName::Running,
                 events: vec![json!({
                     "offset": 0,
                     "event": {
@@ -2548,7 +2552,7 @@ mod tests {
                 run_id: "run_1".into(),
                 session_id: "session_1".into(),
                 ledger_path: "/tmp/agent.db".into(),
-                status: "running".into(),
+                status: RunStateName::Running,
                 final_answer: None,
             },
             "run started",
@@ -2605,7 +2609,7 @@ mod tests {
             run_id: "run_1".into(),
             from_offset: 0,
             next_offset: 1,
-            status: "finished".into(),
+            status: RunStateName::Finished,
             events: Vec::new(),
         };
 
@@ -2652,7 +2656,7 @@ mod tests {
             run_id: "run_1".into(),
             from_offset: 0,
             next_offset: 1,
-            status: "finished".into(),
+            status: RunStateName::Finished,
             events: Vec::new(),
         };
 
@@ -2681,7 +2685,7 @@ mod tests {
         let mut state = test_state();
         state.active_run = Some(crate::tui::ActiveRunView {
             run_id: "run_1".into(),
-            status: "running".into(),
+            status: RunStateName::Running,
         });
         let mut runtime = UiRuntime {
             active_run_id: Some("run_1".into()),
@@ -2729,7 +2733,7 @@ mod tests {
         let mut state = test_state();
         state.active_run = Some(crate::tui::ActiveRunView {
             run_id: "run_1".into(),
-            status: "running".into(),
+            status: RunStateName::Running,
         });
         let mut runtime = UiRuntime {
             active_run_id: Some("run_1".into()),
@@ -2778,7 +2782,7 @@ mod tests {
             run_id: "run_1".into(),
             from_offset: 0,
             next_offset: 2,
-            status: "running".into(),
+            status: RunStateName::Running,
             events: vec![
                 json!({
                     "offset": 1,
@@ -2884,7 +2888,7 @@ mod tests {
         let mut state = test_state();
         state.active_run = Some(crate::tui::ActiveRunView {
             run_id: "run_1".into(),
-            status: "running".into(),
+            status: RunStateName::Running,
         });
 
         assert!(request_cancel(&sender, &mut state));
@@ -2915,13 +2919,13 @@ mod tests {
     fn test_session(
         session_id: &str,
         run_id: &str,
-        status: &str,
+        status: RunStateName,
         latest_question: &str,
     ) -> SessionSummary {
         SessionSummary {
             session_id: session_id.into(),
             run_id: run_id.into(),
-            status: status.into(),
+            status,
             latest_question: latest_question.into(),
             ledger_path: "/tmp/agent.db".into(),
         }

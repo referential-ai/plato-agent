@@ -263,7 +263,7 @@ impl DaemonConnectionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::protocol::{ProtocolError, SessionSummary};
+    use crate::daemon::protocol::{ProtocolError, RunStateName, SessionSummary};
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -335,7 +335,7 @@ mod tests {
             vec![SessionSummary {
                 session_id: "run_1".into(),
                 run_id: "run_1".into(),
-                status: "finished".into(),
+                status: RunStateName::Finished,
                 latest_question: "hello".into(),
                 ledger_path: "/tmp/agent.db".into(),
             }]
@@ -523,7 +523,7 @@ mod tests {
         handle.join().unwrap();
 
         assert_eq!(transcript.run_id, "run_1");
-        assert_eq!(transcript.status, "finished");
+        assert_eq!(transcript.status, RunStateName::Finished);
         assert_eq!(transcript.final_answer.as_deref(), Some("hello"));
         assert_eq!(run.session_id, "session_1");
         assert_eq!(run.run_id, "run_2");
@@ -587,9 +587,9 @@ mod tests {
         let canceled = client.run_cancel("run_3").unwrap();
         handle.join().unwrap();
 
-        assert_eq!(granted.status, "running");
-        assert_eq!(denied.status, "running");
-        assert_eq!(canceled.status, "cancel_requested");
+        assert_eq!(granted.status, RunStateName::Running);
+        assert_eq!(denied.status, RunStateName::Running);
+        assert_eq!(canceled.status, RunStateName::CancelRequested);
     }
 
     fn read_request(reader: &mut BufReader<UnixStream>) -> Envelope {

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -13,6 +14,36 @@ pub const ERROR_SESSIONS_LIST_FAILED: &str = "sessions_list_failed";
 pub const ERROR_UNSUPPORTED_METHOD: &str = "unsupported_method";
 pub const ERROR_UNSUPPORTED_VERSION: &str = "unsupported_version";
 pub const ERROR_WORKSPACE_MISMATCH: &str = "workspace_mismatch";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStateName {
+    Running,
+    Finished,
+    Failed,
+    Canceled,
+    CancelRequested,
+    Interrupted,
+}
+
+impl RunStateName {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::CancelRequested => "cancel_requested",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+impl fmt::Display for RunStateName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.pad(self.as_str())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,7 +141,7 @@ pub struct RunStartResult {
     pub run_id: String,
     pub session_id: String,
     pub ledger_path: String,
-    pub status: String,
+    pub status: RunStateName,
     pub final_answer: Option<String>,
 }
 
@@ -141,7 +172,7 @@ pub struct EventsStreamResult {
     pub run_id: String,
     pub from_offset: u64,
     pub next_offset: u64,
-    pub status: String,
+    pub status: RunStateName,
     pub events: Vec<Value>,
 }
 
@@ -164,7 +195,7 @@ pub struct RunCancelParams {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandAcceptedResult {
     pub run_id: String,
-    pub status: String,
+    pub status: RunStateName,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -176,7 +207,7 @@ pub struct SessionsListResult {
 pub struct SessionSummary {
     pub session_id: String,
     pub run_id: String,
-    pub status: String,
+    pub status: RunStateName,
     pub latest_question: String,
     pub ledger_path: String,
 }
@@ -193,7 +224,7 @@ pub struct TranscriptReadParams {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptReadResult {
     pub run_id: String,
-    pub status: String,
+    pub status: RunStateName,
     pub final_answer: Option<String>,
     pub transcript: String,
 }
@@ -239,6 +270,27 @@ pub fn decode_request(line: &str) -> Result<Envelope, Box<Envelope>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_state_names_keep_wire_values() {
+        let cases = [
+            (RunStateName::Running, "running"),
+            (RunStateName::Finished, "finished"),
+            (RunStateName::Failed, "failed"),
+            (RunStateName::Canceled, "canceled"),
+            (RunStateName::CancelRequested, "cancel_requested"),
+            (RunStateName::Interrupted, "interrupted"),
+        ];
+
+        for (state, wire_value) in cases {
+            assert_eq!(state.as_str(), wire_value);
+            assert_eq!(serde_json::to_value(state).unwrap(), wire_value);
+            assert_eq!(
+                serde_json::from_value::<RunStateName>(wire_value.into()).unwrap(),
+                state
+            );
+        }
+    }
 
     #[test]
     fn decodes_request_envelope() {

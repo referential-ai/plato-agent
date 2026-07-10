@@ -1,5 +1,6 @@
 use crate::{
-    AppResult, ApprovalRequest, AssistantDeltaEvent, daemon::server::DaemonPaths,
+    AppResult, ApprovalRequest, AssistantDeltaEvent,
+    daemon::{protocol::RunStateName, server::DaemonPaths},
     tools::ApprovalOutcome,
 };
 use platonic_core::RecordedEvent;
@@ -47,25 +48,6 @@ pub(super) struct RunStatus {
     pub(super) state: RunStateName,
     pub(super) final_answer: Option<String>,
     pub(super) error: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum RunStateName {
-    Running,
-    Finished,
-    Failed,
-    Canceled,
-}
-
-impl RunStateName {
-    pub(super) fn as_str(&self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Finished => "finished",
-            Self::Failed => "failed",
-            Self::Canceled => "canceled",
-        }
-    }
 }
 
 #[derive(Debug)]

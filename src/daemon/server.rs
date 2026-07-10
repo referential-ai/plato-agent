@@ -217,9 +217,9 @@ mod tests {
             protocol::{
                 ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_OVERLOAD, ERROR_RUN_FAILED,
                 ERROR_SESSIONS_LIST_FAILED, ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind,
-                ProtocolError,
+                ProtocolError, RunStateName,
             },
-            runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord, RunStateName},
+            runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord},
         },
         ledger::SqliteLedger,
         tools::ApprovalOutcome,
@@ -806,10 +806,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(tail.from_offset, (MAX_EVENT_BUFFER + 1) as u64);
         assert_eq!(tail.next_offset, tail.from_offset);
         assert!(tail.events.is_empty());
-        assert_eq!(tail.status, "finished");
+        assert_eq!(tail.status, RunStateName::Finished);
 
         let transcript = client.transcript_read("run_1").unwrap();
-        assert_eq!(transcript.status, "finished");
+        assert_eq!(transcript.status, RunStateName::Finished);
         assert_eq!(transcript.final_answer.as_deref(), Some("done"));
 
         drop(client);
@@ -838,11 +838,11 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         let sessions = client.sessions_list().unwrap();
         assert_eq!(sessions[0].session_id, "session_1");
-        assert_eq!(sessions[0].status, "finished");
+        assert_eq!(sessions[0].status, RunStateName::Finished);
 
         let transcript = client.transcript_read_session("session_1").unwrap();
         assert_eq!(transcript.run_id, "run_1");
-        assert_eq!(transcript.status, "finished");
+        assert_eq!(transcript.status, RunStateName::Finished);
         assert_eq!(transcript.final_answer.as_deref(), Some("persisted answer"));
 
         drop(client);
@@ -1071,7 +1071,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let _second_server = DaemonServer::bind(workspace.path(), Some(second_socket)).unwrap();
         let mut ledger = SqliteLedger::open_or_create(&ledger_path).unwrap();
 
-        assert_eq!(ledger.session_summaries().unwrap()[0].status, "interrupted");
+        assert_eq!(
+            ledger.session_summaries().unwrap()[0].status,
+            RunStateName::Interrupted
+        );
         ledger
             .begin_session_run(
                 "session_1",

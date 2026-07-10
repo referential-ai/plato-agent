@@ -6,7 +6,7 @@ use crate::{
             ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
             ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams,
             EventsStreamResult, HelloParams, HelloResult, MessageAppendParams, RunCancelParams,
-            RunStartParams, RunStartResult, SessionSummary, SessionsListResult,
+            RunStartParams, RunStartResult, RunStateName, SessionSummary, SessionsListResult,
             TranscriptReadParams, TranscriptReadResult, decode_request,
         },
         runtime::{DaemonRuntime, RunRecord, approval_handler},
@@ -24,8 +24,6 @@ use std::{
 
 const DEFAULT_EVENT_LIMIT: usize = 64;
 const MAX_EVENT_LIMIT: usize = 128;
-const SESSION_STATUS_RUNNING: &str = "running";
-const SESSION_STATUS_INTERRUPTED: &str = "interrupted";
 const LATEST_QUESTION_MAX_CHARS: usize = 120;
 
 pub(super) fn handle_line(runtime: &DaemonRuntime, line: &str) -> Envelope {
@@ -203,8 +201,7 @@ fn start_run(
     if let Some(active_run_id) = runs
         .values()
         .find(|record| {
-            record.session_id == session_id
-                && record.status().state == crate::daemon::runtime::RunStateName::Running
+            record.session_id == session_id && record.status().state == RunStateName::Running
         })
         .map(|record| record.run_id.clone())
     {
@@ -285,7 +282,7 @@ fn run_start_response(request_id: Option<String>, method: &str, record: &RunReco
             run_id: record.run_id.clone(),
             session_id: record.session_id.clone(),
             ledger_path: record.ledger_path.to_string_lossy().into_owned(),
-            status: status.state.as_str().into(),
+            status: status.state,
             final_answer: status.final_answer,
         })
         .expect("run.start result serializes"),
@@ -339,7 +336,7 @@ fn handle_events_stream(runtime: &DaemonRuntime, request: Envelope) -> Envelope 
             run_id: record.run_id.clone(),
             from_offset,
             next_offset,
-            status: record.status().state.as_str().into(),
+            status: record.status().state,
             events,
         })
         .expect("events.stream result serializes"),
@@ -390,7 +387,7 @@ fn handle_approval_decide(runtime: &DaemonRuntime, request: Envelope) -> Envelop
         Some("approval.decide".into()),
         to_value(CommandAcceptedResult {
             run_id: record.run_id.clone(),
-            status: record.status().state.as_str().into(),
+            status: record.status().state,
         })
         .expect("approval.decide result serializes"),
     )
@@ -418,7 +415,7 @@ fn handle_run_cancel(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
         Some("run.cancel".into()),
         to_value(CommandAcceptedResult {
             run_id: record.run_id.clone(),
-            status: "cancel_requested".into(),
+            status: RunStateName::CancelRequested,
         })
         .expect("run.cancel result serializes"),
     )
@@ -460,13 +457,13 @@ fn session_summaries(runtime: &DaemonRuntime) -> crate::AppResult<Vec<SessionSum
         .values()
         .filter_map(|record| {
             let status = record.status();
-            if status.state != crate::daemon::runtime::RunStateName::Running {
+            if status.state != RunStateName::Running {
                 return None;
             }
             Some(SessionSummary {
                 session_id: record.session_id.clone(),
                 run_id: record.run_id.clone(),
-                status: status.state.as_str().into(),
+                status: status.state,
                 latest_question: String::new(),
                 ledger_path: record.ledger_path.to_string_lossy().into_owned(),
             })
@@ -474,12 +471,12 @@ fn session_summaries(runtime: &DaemonRuntime) -> crate::AppResult<Vec<SessionSum
         .collect::<Vec<_>>();
 
     for session in &mut sessions {
-        if session.status == SESSION_STATUS_RUNNING
+        if session.status == RunStateName::Running
             && !active_sessions
                 .iter()
                 .any(|active| active.session_id == session.session_id)
         {
-            session.status = SESSION_STATUS_INTERRUPTED.into();
+            session.status = RunStateName::Interrupted;
         }
     }
 
