@@ -46,7 +46,16 @@ Single-operator v1. The gateway config holds one platform bot/app token (via env
 Recorded trigger: any multi-user or shared-channel ambition makes ingress identity semantic — per the core decision-boundary rule it must become a typed, recorded event, which requires a new design before implementation.
 
 ### D4. Event-stream recovery
-The ledger is truth; deltas are ephemera (existing law). The gateway polls `events.stream` from its last `next_offset`. On reconnect, `lagged`, or daemon restart: resync via `sessions.list` + `transcript.read`, reply from final ledger state, and resume polling at the current tip. No server-side persistent cursors, no delivery guarantee for deltas; final answers are always recoverable from the ledger.
+The ledger is truth; deltas are ephemera (existing law). The gateway polls `events.stream` from its last `next_offset`.
+
+Verified gaps (PR #94 review): `lagged` reports `first_offset` only inside the error message and omitted `from_offset` means 0, not tip (handlers.rs:307-318); a restarted daemon has an empty run map, so pre-restart run streams answer `not_found` (runtime.rs:24-29); `transcript.read` is store-backed but returns only a rendered string; `DaemonClient` flattens typed error codes into one string (client.rs:227-234).
+
+Recovery therefore requires a minimal typed surface — three additive in-repo changes, daemon-first per D2 (result structs carry no `deny_unknown_fields`, so result-field additions are client-safe):
+- `transcript.read` result gains `status` and nullable `final_answer` — already ledger-backed, so it answers for post-restart sessions.
+- `events.stream` with `from_offset` omitted means tail-from-current-tip; `lagged` recovery is one re-call without an offset. Existing omit-callers must be audited before the default changes.
+- `DaemonClient` preserves `ProtocolError { code, message }` as a typed error instead of flattening.
+
+Contract: on reconnect or `lagged`, resume from tip and backfill nothing; on daemon restart, resync via `sessions.list` + typed `transcript.read` and reply from final ledger state. No server-side persistent cursors, no delivery guarantee for deltas; final answers are recoverable without parsing display text.
 
 Session mapping: one remote channel/thread ↔ one daemon session, via the existing `message.append` `session_id`. `wait:false` (the #82 default) + polling; the gateway never blocks a connection on a run.
 
@@ -87,7 +96,7 @@ Jerome: default (notify-only). Accepted 2026-07-09 by ratifying the architecture
 
 ## First Slices (issues to cut after acceptance, in order)
 1. Socket hardening: `0700` dir / `0600` socket enforced at bind, fail-closed test. (Independent of platform choice.)
-2. Stream-recovery contract test: client-visible `lagged`/restart resync path proven against a live daemon.
+2. Typed recovery surface + contract test: the three D4 changes, plus a daemon integration test proving the lag path and the restart path with typed assertions.
 3. Gateway binary skeleton for the chosen platform: hello/capabilities check, allowlist filter, session map, `message.append` + polling, final-answer reply.
 4. Approval notify relay (plus `remote_deny` only if Q2 accepts it).
 
