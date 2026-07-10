@@ -1,3 +1,4 @@
+use crate::daemon::protocol::ProtocolError;
 use std::path::PathBuf;
 
 pub type AppResult<T> = Result<T, AppError>;
@@ -54,6 +55,9 @@ pub enum AppError {
 
     #[error("daemon protocol error: {0}")]
     DaemonProtocol(String),
+
+    #[error("daemon protocol error {}: {}", .0.code, .0.message)]
+    DaemonResponse(ProtocolError),
 
     #[error("path escapes workspace: {0}")]
     PathEscapesWorkspace(PathBuf),

@@ -116,14 +116,14 @@ impl DaemonClient {
     pub fn events_stream(
         &mut self,
         run_id: &str,
-        from_offset: u64,
+        from_offset: Option<u64>,
         limit: usize,
     ) -> AppResult<EventsStreamResult> {
         self.request(
             "events.stream",
             EventsStreamParams {
                 run_id: run_id.into(),
-                from_offset: Some(from_offset),
+                from_offset,
                 limit: Some(limit),
             },
         )
@@ -228,10 +228,7 @@ impl DaemonClient {
                 let error = response.error.ok_or_else(|| {
                     AppError::DaemonProtocol(format!("{method} error missing payload"))
                 })?;
-                Err(AppError::DaemonProtocol(format!(
-                    "{}: {}",
-                    error.code, error.message
-                )))
+                Err(AppError::DaemonResponse(error))
             }
             other => Err(AppError::DaemonProtocol(format!(
                 "{method} returned unexpected envelope kind {other:?}"
@@ -375,7 +372,11 @@ mod tests {
         let error = client.sessions_list().unwrap_err();
         handle.join().unwrap();
 
-        assert!(error.to_string().contains("not_found: missing"));
+        assert!(matches!(
+            error,
+            AppError::DaemonResponse(ProtocolError { code, message })
+                if code == "not_found" && message == "missing"
+        ));
     }
 
     #[test]
@@ -428,18 +429,37 @@ mod tests {
                     }]
                 }),
             );
+
+            let tail = read_request(&mut reader);
+            assert_eq!(tail.method.as_deref(), Some("events.stream"));
+            assert!(tail.params.as_ref().unwrap().get("from_offset").is_none());
+            write_response(
+                &mut writer,
+                tail.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 3,
+                    "next_offset": 3,
+                    "status": "finished",
+                    "events": []
+                }),
+            );
         });
 
         let mut client = DaemonClient::connect(&socket_path).unwrap();
         let run = client
             .run_start("summarize this".into(), Some("plato.toml".into()), false)
             .unwrap();
-        let events = client.events_stream(&run.run_id, 2, 16).unwrap();
+        let events = client.events_stream(&run.run_id, Some(2), 16).unwrap();
+        let tail = client.events_stream(&run.run_id, None, 16).unwrap();
         handle.join().unwrap();
 
         assert_eq!(run.run_id, "run_1");
         assert_eq!(events.next_offset, 3);
         assert_eq!(events.events.len(), 1);
+        assert_eq!(tail.from_offset, 3);
+        assert!(tail.events.is_empty());
     }
 
     #[test]
@@ -464,7 +484,9 @@ mod tests {
                 transcript.id,
                 "transcript.read",
                 json!({
-                    "run_id": "session_1",
+                    "run_id": "run_1",
+                    "status": "finished",
+                    "final_answer": "hello",
                     "transcript": "[turn_1] user: hello"
                 }),
             );
@@ -500,7 +522,9 @@ mod tests {
             .unwrap();
         handle.join().unwrap();
 
-        assert_eq!(transcript.run_id, "session_1");
+        assert_eq!(transcript.run_id, "run_1");
+        assert_eq!(transcript.status, "finished");
+        assert_eq!(transcript.final_answer.as_deref(), Some("hello"));
         assert_eq!(run.session_id, "session_1");
         assert_eq!(run.run_id, "run_2");
     }
