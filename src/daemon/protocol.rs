@@ -83,6 +83,18 @@ impl Envelope {
         }
     }
 
+    pub fn response_from<T: Serialize>(
+        id: Option<String>,
+        method: Option<String>,
+        result: T,
+    ) -> Self {
+        Self::response(
+            id,
+            method,
+            serde_json::to_value(result).expect("protocol result serializes"),
+        )
+    }
+
     pub fn error(
         id: Option<String>,
         method: Option<String>,

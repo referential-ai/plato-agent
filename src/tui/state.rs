@@ -39,43 +39,34 @@ impl TuiState {
         transcript: TranscriptState,
     ) -> Self {
         let selected_session_id = sessions.first().map(|session| session.session_id.clone());
-        Self {
+        let mut state = Self::new(
             workspace_root,
             socket_path,
-            connection: ConnectionState::Connected {
+            ConnectionState::Connected {
                 workspace_id: hello.workspace_id,
                 daemon_version: hello.daemon_version,
                 ledger_path: hello.ledger_path,
             },
-            sessions,
-            selected_session_id,
-            transcript,
-            active_run: None,
-            live_events: Vec::new(),
-            scroll_offset: 0,
-            active_model: None,
-            active_run_elapsed_secs: None,
-            composer: String::new(),
-            composer_cursor: 0,
-            composer_kill_buffer: String::new(),
-            slash_popup: None,
-            session_picker: None,
-            queued_messages: Vec::new(),
-            input_history: Vec::new(),
-            history_index: None,
-            status_message: None,
-            stream_warning: None,
-            approval: None,
-            help_visible: false,
-            cancel_requested: false,
-        }
+        );
+        state.sessions = sessions;
+        state.selected_session_id = selected_session_id;
+        state.transcript = transcript;
+        state
     }
 
     pub fn disconnected(workspace_root: String, socket_path: String, error: String) -> Self {
+        Self::new(
+            workspace_root,
+            socket_path,
+            ConnectionState::Disconnected { error },
+        )
+    }
+
+    fn new(workspace_root: String, socket_path: String, connection: ConnectionState) -> Self {
         Self {
             workspace_root,
             socket_path,
-            connection: ConnectionState::Disconnected { error },
+            connection,
             sessions: Vec::new(),
             selected_session_id: None,
             transcript: TranscriptState::None,
@@ -152,6 +143,12 @@ pub struct ActiveRunView {
     pub status: RunStateName,
 }
 
+impl ActiveRunView {
+    pub fn new(run_id: String, status: RunStateName) -> Self {
+        Self { run_id, status }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveEventLine {
     pub offset: Option<u64>,
@@ -160,10 +157,6 @@ pub struct LiveEventLine {
 }
 
 impl LiveEventLine {
-    pub fn new(offset: Option<u64>, text: impl Into<String>) -> Self {
-        Self::status(offset, text)
-    }
-
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             offset: None,

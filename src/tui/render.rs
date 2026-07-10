@@ -604,16 +604,19 @@ fn render_approval_modal(frame: &mut Frame<'_>, area: Rect, approval: &ApprovalM
         Line::from("g grant    d deny    Ctrl-C cancel run    q quit TUI"),
         Line::from(""),
     ];
-    if let Some(diff_preview) = &approval.diff_preview {
-        lines.push(Line::from("diff preview:"));
-        lines.extend(diff_preview.lines().map(|line| Line::from(line.to_owned())));
-    } else if let Some(approval_preview) = &approval.approval_preview {
-        lines.push(Line::from("approval preview:"));
-        lines.extend(
-            approval_preview
-                .lines()
-                .map(|line| Line::from(line.to_owned())),
-        );
+    let preview = approval
+        .diff_preview
+        .as_deref()
+        .map(|preview| ("diff preview:", preview))
+        .or_else(|| {
+            approval
+                .approval_preview
+                .as_deref()
+                .map(|preview| ("approval preview:", preview))
+        });
+    if let Some((title, preview)) = preview {
+        lines.push(Line::from(title));
+        lines.extend(preview.lines().map(|line| Line::from(line.to_owned())));
     } else {
         lines.push(Line::from("input preview:"));
         lines.push(Line::from(approval.input_preview.clone()));

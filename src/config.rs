@@ -107,30 +107,24 @@ impl Config {
         let provider = raw.provider.unwrap_or_default();
         let limits = raw.limits.unwrap_or_default();
         let tools = raw.tools.unwrap_or_default();
-        let token_budget = limits.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET);
-        if token_budget == 0 {
-            return Err(AppError::Config(
-                "limits.token_budget must be positive".into(),
-            ));
-        }
-        let max_output_tokens = limits
-            .max_output_tokens
-            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
-        if max_output_tokens == 0 {
-            return Err(AppError::Config(
-                "limits.max_output_tokens must be positive".into(),
-            ));
-        }
-        let max_turns = limits.max_turns.unwrap_or(DEFAULT_MAX_TURNS);
-        if max_turns == 0 {
-            return Err(AppError::Config("limits.max_turns must be positive".into()));
-        }
-        let timeout_ms = provider.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-        if timeout_ms == 0 {
-            return Err(AppError::Config(
-                "provider.timeout_ms must be positive".into(),
-            ));
-        }
+        let token_budget = positive(
+            limits.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET),
+            "limits.token_budget",
+        )?;
+        let max_output_tokens = positive(
+            limits
+                .max_output_tokens
+                .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
+            "limits.max_output_tokens",
+        )?;
+        let max_turns = positive(
+            limits.max_turns.unwrap_or(DEFAULT_MAX_TURNS),
+            "limits.max_turns",
+        )?;
+        let timeout_ms = positive(
+            provider.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
+            "provider.timeout_ms",
+        )?;
         let kind = provider.kind.unwrap_or(ProviderKind::OpenRouter);
 
         let enabled = tools.enabled.unwrap_or_else(default_enabled_tools);
@@ -171,15 +165,16 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let kind = ProviderKind::OpenRouter;
         Self {
             provider: ProviderConfig {
-                kind: ProviderKind::OpenRouter,
-                model: DEFAULT_OPENROUTER_MODEL.into(),
-                api_key_env: "OPENROUTER_API_KEY".into(),
-                base_url: OPENROUTER_BASE_URL.into(),
+                model: default_model(&kind).into(),
+                api_key_env: default_api_key_env(&kind).into(),
+                base_url: default_base_url(&kind).into(),
                 timeout_ms: DEFAULT_TIMEOUT_MS,
                 http_referer: None,
                 app_title: None,
+                kind,
             },
             limits: LimitsConfig {
                 token_budget: DEFAULT_TOKEN_BUDGET,
@@ -191,6 +186,13 @@ impl Default for Config {
             },
         }
     }
+}
+
+fn positive<T: From<u8> + PartialEq>(value: T, field: &str) -> AppResult<T> {
+    if value == T::from(0) {
+        return Err(AppError::Config(format!("{field} must be positive")));
+    }
+    Ok(value)
 }
 
 fn default_model(kind: &ProviderKind) -> &'static str {

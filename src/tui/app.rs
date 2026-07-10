@@ -5,7 +5,7 @@ use crate::{
         CommandAcceptedResult, ERROR_LAGGED, ERROR_OVERLOAD, ERROR_UNSUPPORTED_VERSION,
         ERROR_WORKSPACE_MISMATCH, EventsStreamResult, RunStartResult, RunStateName,
     },
-    tui::{TranscriptState, TranscriptView, TuiState, render, render_snapshot},
+    tui::{ActiveRunView, TranscriptState, TranscriptView, TuiState, render, render_snapshot},
 };
 use crossterm::{
     event::{
@@ -442,16 +442,7 @@ fn move_session_picker_selection(state: &mut TuiState, delta: isize) {
         return;
     };
     let count = state.sessions.len();
-    if count == 0 {
-        picker.selected = 0;
-        return;
-    }
-    let current = picker.selected.min(count - 1);
-    picker.selected = if delta < 0 {
-        current.checked_sub(1).unwrap_or(count - 1)
-    } else {
-        (current + 1) % count
-    };
+    picker.selected = wrapped_selection(picker.selected, count, delta);
 }
 
 fn select_picker_session(commands: &Sender<ClientCommand>, state: &mut TuiState) {
@@ -482,16 +473,19 @@ fn move_slash_popup_selection(state: &mut TuiState, delta: isize) {
         return;
     };
     let count = matching_slash_commands(&popup.filter).len().min(5);
+    popup.selected = wrapped_selection(popup.selected, count, delta);
+}
+
+fn wrapped_selection(selected: usize, count: usize, delta: isize) -> usize {
     if count == 0 {
-        popup.selected = 0;
-        return;
+        return 0;
     }
-    let current = popup.selected.min(count - 1);
-    popup.selected = if delta < 0 {
+    let current = selected.min(count - 1);
+    if delta < 0 {
         current.checked_sub(1).unwrap_or(count - 1)
     } else {
         (current + 1) % count
-    };
+    }
 }
 
 fn selected_slash_command(state: &TuiState) -> Option<&'static super::commands::SlashCommandSpec> {
@@ -947,10 +941,7 @@ fn load_connected_state(
                 .find(|session| session.status == RunStateName::Running)
         });
     if let Some(session) = active_session {
-        state.active_run = Some(crate::tui::ActiveRunView {
-            run_id: session.run_id.clone(),
-            status: session.status,
-        });
+        state.active_run = Some(ActiveRunView::new(session.run_id.clone(), session.status));
     }
     Ok(state)
 }
@@ -1166,19 +1157,13 @@ fn drain_client_events(
                 state.status_message =
                     Some(format!("approval decision sent for {}", result.run_id));
                 state.approval = None;
-                state.active_run = Some(crate::tui::ActiveRunView {
-                    run_id: result.run_id,
-                    status: result.status,
-                });
+                state.active_run = Some(ActiveRunView::new(result.run_id, result.status));
             }
             ClientEvent::RunCanceled(result) => {
                 state.status_message = Some(format!("cancel requested for {}", result.run_id));
                 state.cancel_requested = true;
                 state.approval = None;
-                state.active_run = Some(crate::tui::ActiveRunView {
-                    run_id: result.run_id.clone(),
-                    status: result.status,
-                });
+                state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
                 push_live_event(
                     state,
                     crate::tui::LiveEventLine::status(
@@ -1268,10 +1253,7 @@ fn apply_run_response(
     state.stream_warning = None;
     state.cancel_requested = false;
     state.approval = None;
-    state.active_run = Some(crate::tui::ActiveRunView {
-        run_id: run_id.clone(),
-        status,
-    });
+    state.active_run = Some(ActiveRunView::new(run_id.clone(), status));
     push_live_event(
         state,
         crate::tui::LiveEventLine::status(None, format!("{message}: {run_id}")),
@@ -1298,10 +1280,7 @@ fn apply_events_result(
         result.events.len() == EVENT_LIMIT && result.next_offset > result.from_offset;
     runtime.polling = result.status == RunStateName::Running || needs_catch_up;
     state.stream_warning = None;
-    state.active_run = Some(crate::tui::ActiveRunView {
-        run_id: result.run_id.clone(),
-        status: result.status,
-    });
+    state.active_run = Some(ActiveRunView::new(result.run_id.clone(), result.status));
     for event in result.events {
         if let Some(model) = crate::tui::model_from_event(&event) {
             state.active_model = Some(model);

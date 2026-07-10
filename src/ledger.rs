@@ -319,10 +319,7 @@ impl SqliteLedger {
                 now
             ],
         )?;
-        transaction.execute(
-            "UPDATE sessions SET updated_at_ms = ?2 WHERE session_id = ?1",
-            params![session_id, now],
-        )?;
+        touch_session(&transaction, session_id, now)?;
         transaction.commit()?;
         self.session_turns(session_id)
     }
@@ -372,10 +369,7 @@ impl SqliteLedger {
             ],
         )?;
         for session_id in session_ids {
-            transaction.execute(
-                "UPDATE sessions SET updated_at_ms = ?2 WHERE session_id = ?1",
-                params![session_id, now],
-            )?;
+            touch_session(&transaction, &session_id, now)?;
         }
         transaction.commit()?;
         Ok(updated)
@@ -439,32 +433,33 @@ impl SqliteLedger {
     }
 
     pub(crate) fn run_status(&self, run_id: &str) -> AppResult<PersistedRunStatus> {
-        self.connection
-            .query_row(
-                "SELECT run_id, status, final_answer FROM session_runs WHERE run_id = ?1",
-                params![run_id],
-                persisted_run_status,
-            )
-            .optional()?
-            .ok_or_else(|| AppError::RunNotFound(run_id.into()))
+        self.query_run_status(
+            "SELECT run_id, status, final_answer FROM session_runs WHERE run_id = ?1",
+            run_id,
+        )?
+        .ok_or_else(|| AppError::RunNotFound(run_id.into()))
     }
 
     pub(crate) fn latest_session_run_status(
         &self,
         session_id: &str,
     ) -> AppResult<PersistedRunStatus> {
-        self.connection
-            .query_row(
-                "SELECT run_id, status, final_answer
+        self.query_run_status(
+            "SELECT run_id, status, final_answer
                  FROM session_runs
                  WHERE session_id = ?1
                  ORDER BY session_index DESC
                  LIMIT 1",
-                params![session_id],
-                persisted_run_status,
-            )
-            .optional()?
-            .ok_or_else(|| AppError::SessionNotFound(session_id.into()))
+            session_id,
+        )?
+        .ok_or_else(|| AppError::SessionNotFound(session_id.into()))
+    }
+
+    fn query_run_status(&self, query: &str, id: &str) -> AppResult<Option<PersistedRunStatus>> {
+        Ok(self
+            .connection
+            .query_row(query, params![id], persisted_run_status)
+            .optional()?)
     }
 
     fn session_exists(&self, session_id: &str) -> AppResult<bool> {
@@ -500,10 +495,7 @@ impl SqliteLedger {
             params![run_id.to_string()],
             |row| row.get(0),
         )?;
-        transaction.execute(
-            "UPDATE sessions SET updated_at_ms = ?2 WHERE session_id = ?1",
-            params![session_id, now],
-        )?;
+        touch_session(&transaction, &session_id, now)?;
         transaction.commit()?;
         Ok(())
     }
@@ -599,6 +591,18 @@ fn active_run_in(connection: &Connection, session_id: &str) -> AppResult<Option<
         .optional()?)
 }
 
+fn touch_session(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "UPDATE sessions SET updated_at_ms = ?2 WHERE session_id = ?1",
+        params![session_id, now],
+    )?;
+    Ok(())
+}
+
 fn configure_sqlite_connection(connection: &Connection) -> AppResult<()> {
     connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
     Ok(())
@@ -607,33 +611,30 @@ fn configure_sqlite_connection(connection: &Connection) -> AppResult<()> {
 fn migrate_sqlite(connection: &mut Connection) -> AppResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    match version {
-        0 => {
-            transaction.execute_batch(
-                r#"
-                CREATE TABLE ledger_events (
-                  run_id TEXT NOT NULL,
-                  seq INTEGER NOT NULL,
-                  occurred_at_ms INTEGER NOT NULL,
-                  v INTEGER NOT NULL,
-                  event_json TEXT NOT NULL,
-                  PRIMARY KEY (run_id, seq)
-                );
-                "#,
-            )?;
-            create_session_tables(&transaction)?;
-            transaction.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
-        }
-        1 => {
-            create_session_tables(&transaction)?;
-            transaction.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
-        }
-        SQLITE_SCHEMA_VERSION => {}
-        _ => {
-            return Err(AppError::Config(format!(
-                "unsupported sqlite schema version: {version}"
-            )));
-        }
+    if version > SQLITE_SCHEMA_VERSION {
+        return Err(AppError::Config(format!(
+            "unsupported sqlite schema version: {version}"
+        )));
+    }
+    if version < 1 {
+        transaction.execute_batch(
+            r#"
+            CREATE TABLE ledger_events (
+              run_id TEXT NOT NULL,
+              seq INTEGER NOT NULL,
+              occurred_at_ms INTEGER NOT NULL,
+              v INTEGER NOT NULL,
+              event_json TEXT NOT NULL,
+              PRIMARY KEY (run_id, seq)
+            );
+            "#,
+        )?;
+    }
+    if version < 2 {
+        create_session_tables(&transaction)?;
+    }
+    if version < SQLITE_SCHEMA_VERSION {
+        transaction.pragma_update(None, "user_version", SQLITE_SCHEMA_VERSION)?;
     }
     transaction.commit()?;
     Ok(())
