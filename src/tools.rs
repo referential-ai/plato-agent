@@ -6,8 +6,9 @@ use serde_json::{Value, json};
 use std::{
     env, fs,
     io::{self, ErrorKind, Read, Write},
+    os::unix::process::CommandExt,
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
@@ -336,6 +337,7 @@ fn shell_exec(
         .envs(env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()?;
 
     let stdout = child
@@ -360,12 +362,12 @@ fn shell_exec(
             .is_some_and(|cancel| cancel.load(Ordering::SeqCst))
         {
             canceled = true;
-            let _ = child.kill();
+            kill_shell_group(&mut child);
             break child.wait()?;
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            let _ = child.kill();
+            kill_shell_group(&mut child);
             break child.wait()?;
         }
         thread::sleep(Duration::from_millis(20));
@@ -404,6 +406,13 @@ fn shell_exec(
         artifacts: vec![],
         visibility: ResultVisibility::Both,
     })
+}
+
+fn kill_shell_group(child: &mut Child) {
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    let _ = child.kill();
 }
 
 fn normalize_timeout_seconds(timeout_seconds: Option<u64>) -> u64 {
@@ -1239,6 +1248,52 @@ mod tests {
             err,
             AppError::Tool(message) if message == "shell.exec timed out after 1s"
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_exec_timeout_kills_grandchildren() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let command = format!(
+            "sleep 30 >/dev/null 2>&1 & echo $! > {}; wait",
+            pid_file.display()
+        );
+        let started = Instant::now();
+        let err = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            SHELL_EXEC,
+            json!({"command": command, "timeout_seconds": 1}),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Tool(message) if message == "shell.exec timed out after 1s"
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timeout return blocked on surviving grandchild"
+        );
+
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => break,
+                Ok(stat) if stat.split_whitespace().nth(2) == Some("Z") => break,
+                Ok(_) => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild {pid} survived group kill"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[cfg(unix)]
