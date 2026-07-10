@@ -138,6 +138,7 @@ mod tests {
         net::TcpListener,
         sync::Arc,
         thread,
+        time::{Duration, Instant},
     };
 
     #[test]
@@ -250,7 +251,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("plato.toml");
-        write_file_write_config(&config_path, &provider.base_url);
+        write_provider_config(&config_path, &provider.base_url, "file.write");
         let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
         let handle = thread::spawn(move || server.serve_next().unwrap());
         let mut stream = UnixStream::connect(&socket_path).unwrap();
@@ -306,6 +307,69 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         handle.join().unwrap();
         let _provider_request = provider.handle.join().unwrap();
+    }
+
+    #[test]
+    fn different_sessions_run_concurrently_with_separate_ledgers() {
+        let provider = spawn_concurrent_text_provider();
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_provider_config(&config_path, &provider.base_url, "file.read");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+
+        let first = server.handle_line(&format!(
+            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"question one","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(first.kind, EnvelopeKind::Response, "{:?}", first.error);
+        let first = first.result.unwrap();
+        assert_eq!(first["status"], "running");
+
+        let second = server.handle_line(&format!(
+            r#"{{"v":1,"id":"run_2","kind":"request","method":"run.start","params":{{"question":"question two","config_path":"{}"}}}}"#,
+            config_path.display()
+        ));
+        assert_eq!(second.kind, EnvelopeKind::Response, "{:?}", second.error);
+        let second = second.result.unwrap();
+
+        let first_run = first["run_id"].as_str().unwrap();
+        let first_session = first["session_id"].as_str().unwrap();
+        let second_run = second["run_id"].as_str().unwrap();
+        let second_session = second["session_id"].as_str().unwrap();
+        assert_ne!(first_run, second_run);
+        assert_ne!(first_session, second_session);
+
+        wait_for_finished_run(&server, first_run);
+        wait_for_finished_run(&server, second_run);
+        let requests = provider.handle.join().unwrap();
+        assert_eq!(requests.len(), 2);
+
+        let ledger = SqliteLedger::open_readonly(&server.paths().ledger_path).unwrap();
+        for (session_id, run_id, question, answer) in [
+            (first_session, first_run, "question one", "answer one"),
+            (second_session, second_run, "question two", "answer two"),
+        ] {
+            let session = ledger.read_session(session_id).unwrap();
+            assert_eq!(session.runs.len(), 1);
+            assert_eq!(session.runs[0].run_id, run_id);
+            assert!(
+                session.runs[0]
+                    .records
+                    .iter()
+                    .all(|record| record.event.run_id().to_string() == run_id)
+            );
+            assert!(matches!(
+                session.runs[0].records.last().map(|record| &record.event),
+                Some(HarnessEvent::RunFinished { .. })
+            ));
+
+            let turns = ledger.session_turns(session_id).unwrap();
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].question, question);
+            assert_eq!(turns[0].final_answer, answer);
+        }
     }
 
     #[test]
@@ -650,7 +714,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
         let config_path = workspace.path().join("plato.toml");
-        write_file_write_config(&config_path, &provider.base_url);
+        write_provider_config(&config_path, &provider.base_url, "file.write");
         let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
         let mut ledger = SqliteLedger::open_or_create(&server.paths().ledger_path).unwrap();
         let prior_run = RunId::new("run_prior").unwrap();
@@ -759,7 +823,12 @@ enabled = ["file.read"]
         handle: thread::JoinHandle<String>,
     }
 
-    fn write_file_write_config(path: &Path, base_url: &str) {
+    struct ConcurrentTextProvider {
+        base_url: String,
+        handle: thread::JoinHandle<Vec<String>>,
+    }
+
+    fn write_provider_config(path: &Path, base_url: &str, enabled_tool: &str) {
         std::fs::write(
             path,
             format!(
@@ -777,7 +846,7 @@ max_output_tokens = 32
 max_turns = 2
 
 [tools]
-enabled = ["file.write"]
+enabled = ["{enabled_tool}"]
 "#
             ),
         )
@@ -804,6 +873,96 @@ enabled = ["file.write"]
             request
         });
         ToolCallProvider { base_url, handle }
+    }
+
+    fn spawn_concurrent_text_provider() -> ConcurrentTextProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut clients = Vec::new();
+            while clients.len() < 2 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let request = read_http_request(&mut stream);
+                        clients.push((stream, request));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("provider accept failed: {error}"),
+                }
+            }
+            assert_eq!(
+                clients.len(),
+                2,
+                "both daemon runs must reach the provider before either response"
+            );
+
+            let mut requests = Vec::new();
+            for (mut stream, request) in clients {
+                let answer = if request.contains("question one") {
+                    "answer one"
+                } else if request.contains("question two") {
+                    "answer two"
+                } else {
+                    panic!("provider received an unexpected request")
+                };
+                let content = json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": answer},
+                        "finish_reason": null
+                    }]
+                });
+                let finish = json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                });
+                let body = format!("data: {content}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        ConcurrentTextProvider { base_url, handle }
+    }
+
+    fn wait_for_finished_run(server: &DaemonServer, run_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let response = server.handle_line(&format!(
+                r#"{{"v":1,"id":"events","kind":"request","method":"events.stream","params":{{"run_id":"{run_id}","from_offset":0,"limit":1}}}}"#
+            ));
+            assert_eq!(response.kind, EnvelopeKind::Response);
+            let result = response.result.unwrap();
+            match result["status"].as_str().unwrap() {
+                "finished" => return,
+                "running" => {}
+                status => {
+                    let record = server.runtime.runs.lock().unwrap()[run_id].clone();
+                    panic!(
+                        "run {run_id} ended as {status}: {:?}",
+                        record.status().error
+                    )
+                }
+            }
+            assert!(Instant::now() < deadline, "run {run_id} did not finish");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn read_envelope(reader: &mut BufReader<UnixStream>) -> Envelope {

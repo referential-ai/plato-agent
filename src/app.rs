@@ -22,7 +22,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::Sender,
     },
 };
@@ -180,6 +180,7 @@ impl ApprovalMode {
 
 const SESSION_TRUNCATION_MARKER: &str = "[older session turns omitted to fit the context budget]";
 const RUN_CANCELED_REASON: &str = "run canceled";
+static ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct ActiveSessionRun {
     ledger: SqliteLedger,
@@ -967,23 +968,25 @@ fn estimate_tokens(content: &str) -> u32 {
 }
 
 pub fn new_run_id() -> AppResult<RunId> {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    Ok(RunId::new(format!(
-        "run_{}_{}",
-        millis,
-        std::process::id()
-    ))?)
+    Ok(RunId::new(generated_id("run"))?)
 }
 
 pub fn new_session_id() -> String {
+    generated_id("session")
+}
+
+fn generated_id(prefix: &str) -> String {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    format!("session_{}_{}", millis, std::process::id())
+    format!(
+        "{}_{}_{}_{}",
+        prefix,
+        millis,
+        std::process::id(),
+        ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]
@@ -997,6 +1000,17 @@ mod tests {
         path::Path,
         thread,
     };
+
+    #[test]
+    fn generated_run_and_session_ids_are_unique() {
+        let first_run = new_run_id().unwrap();
+        let second_run = new_run_id().unwrap();
+        let first_session = new_session_id();
+        let second_session = new_session_id();
+
+        assert_ne!(first_run, second_run);
+        assert_ne!(first_session, second_session);
+    }
 
     #[test]
     fn yolo_auto_grants_required_approval() {

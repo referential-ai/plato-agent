@@ -617,7 +617,7 @@ fn text_from_blocks(blocks: &[ModelBlock]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::io::Cursor;
+    use std::io::{BufReader, Cursor, ErrorKind};
 
     #[test]
     fn maps_openai_tool_calls_to_internal_tool_names() {
@@ -813,5 +813,75 @@ mod tests {
                 json!({"path": "README.md"})
             )]
         );
+    }
+
+    #[test]
+    fn streaming_parser_rejects_adversarial_inputs() {
+        let huge_event = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"garbage": "x".repeat(1024 * 1024)})
+        )
+        .into_bytes();
+        let cases = [
+            b"data: not-json\n\n".to_vec(),
+            b"data: {\"choices\":\"wrong shape\"}\n\n".to_vec(),
+            b"data: {\"choices\":[\n\n".to_vec(),
+            b"data: \xff\n\n".to_vec(),
+            huge_event,
+        ];
+
+        for raw in cases {
+            for capacity in [1, 2, 7, 64] {
+                let reader = BufReader::with_capacity(capacity, Cursor::new(&raw));
+                let mut deltas = Vec::new();
+                let error = parse_chat_completion_stream(reader, &mut |delta| {
+                    deltas.push(delta.to_string());
+                    Ok(())
+                })
+                .unwrap_err();
+
+                assert!(deltas.is_empty());
+                match error {
+                    AppError::Provider(_) => {}
+                    AppError::Io(error) => assert_eq!(error.kind(), ErrorKind::InvalidData),
+                    other => panic!("unexpected stream error: {other}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_parser_handles_split_utf8_and_ignores_non_data_fields() {
+        let chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "h\u{e9}\u{754c}"},
+                "finish_reason": null
+            }]
+        });
+        let finish = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        });
+        let raw = format!(
+            ": keepalive\nevent: message\nid: 1\nretry: 100\ngarbage\ndata: {chunk}\n\ndata: {finish}\n\ndata: [DONE]\n\n"
+        );
+
+        for capacity in 1..=4 {
+            let reader = BufReader::with_capacity(capacity, Cursor::new(raw.as_bytes()));
+            let mut deltas = Vec::new();
+            let response = parse_chat_completion_stream(reader, &mut |delta| {
+                deltas.push(delta.to_string());
+                Ok(())
+            })
+            .unwrap();
+
+            assert_eq!(deltas, ["h\u{e9}\u{754c}"]);
+            assert_eq!(response.text(), "h\u{e9}\u{754c}");
+            assert_eq!(response.stop, ModelStop::EndTurn);
+        }
     }
 }
