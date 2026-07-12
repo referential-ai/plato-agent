@@ -5,7 +5,7 @@ issue: https://github.com/referential-ai/plato-agent/issues/129
 
 # Gateway In-Channel Presentation (Reactions + Typing)
 
-Revision 3 — addresses lead-lane critical review findings F1–F10 (2026-07-12).
+Revision 4 — addresses lead-lane critical review findings F1–F10 and closure fixes R11–R13 (2026-07-12).
 
 ## Authority
 - Human direction 2026-07-12: status reactions like Hermes/OpenCode (👀 while reading/thinking); plan and document; lead-lane critical review before finalization.
@@ -23,15 +23,17 @@ Revision 3 — addresses lead-lane critical review findings F1–F10 (2026-07-12
 ## Design
 
 ### Effects model (F5, F6)
-All presentation effects execute **serialized on the single gateway loop**, in program order, best-effort: each is a logged-ignored `Result`, **exactly one attempt**, bounded ~1.5s; a 429 is logged and dropped — no retry, no `Retry-After` wait (an arbitrary server-directed sleep could stall the loop past the typing deadline). No detached threads or queues — out-of-order effects (late 👀 after a terminal swap, phantom typing) are structurally impossible. Presentation failures never propagate to run flow.
+**Classification.** Presentation effects are exactly: reactions and typing. The final-answer reply and terminal notifications are **product messages**, not presentation — their error semantics are unchanged by this design (they propagate per existing gateway flow), and terminal notifications are owned by #102.
 
-**Terminal cleanup rule:** every exit from the message lifecycle **attempts** cleanup (best-effort; accepted partial failures below). Any post-👀 gateway-side failure outside run states (daemon connect/hello, dispatch, poll, readback, reply errors that today propagate) attempts stop-typing-refresh → remove 👀 → add ❌ **before** propagating. Discord has no typing-off call: stopping the refresh lets the indicator decay within its documented ~10s. Run semantics unchanged.
+All presentation effects execute **serialized on the single gateway loop**, in program order, best-effort: each is a logged-ignored `Result`, **exactly one attempt**, bounded ~1.5s — never retried. On a 429, the effect is dropped **and presentation enters a monotonic not-before gate**: `presentation_not_before = now + retry_after` (capped 60s), during which further presentation calls are dropped and logged — no sleeping, no retrying, product messages unaffected. This honors Discord's rate contract (retry_after is the time before submitting another request to the affected scope; one gateway-wide presentation gate is the smallest rule that cannot re-violate a bucket: https://docs.discord.com/developers/topics/rate-limits). No detached threads or queues — out-of-order effects (late 👀 after a terminal swap, phantom typing) are structurally impossible. Presentation failures never propagate to run flow.
+
+**Terminal cleanup rule:** every exit from the message lifecycle **attempts** cleanup (best-effort, subject to the not-before gate; accepted partial failures below): stop-typing-refresh → remove 👀 → add ❌. This includes exits caused by product-message failures (daemon connect/hello, dispatch, poll, readback, reply errors) — cleanup is attempted first, then the error propagates with its existing semantics. Discord has no typing-off call: stopping the refresh lets the indicator decay within its documented ~10s. Run semantics unchanged.
 
 ### Typing (F1)
 Independent monotonic deadline, never tied to poll pages: while status is `Running` and no approval is pending, send trigger-typing when `now ≥ next_typing_at`, then `next_typing_at = now + 8s` (Discord documents ~10s expiry; 2s margin). The **first** send fires immediately on first observing `Running` (and again immediately on resume after an approval decision): `next_typing_at` initializes in the past. Catch-up/backfill pages never burst typing sends. Send timeout (~1.5s) stays well below the 8s interval; a slow send delays polls by at most the timeout — accepted for a single serialized loop.
 
 ### Reactions per message lifecycle (F1, F3)
-Up to **three** reaction calls plus the reply, in this order at terminal: reply first (answer latency wins), then remove 👀, then add the terminal emoji. Accepted partial-failure states: orphan 👀 (remove failed) or missing terminal emoji (add failed) — logged, never retried beyond the single Retry-After allowance.
+Up to **three** reaction calls plus the reply, in this order at terminal: reply first (answer latency wins), then remove 👀, then add the terminal emoji. Accepted partial-failure states: orphan 👀 (remove failed) or missing terminal emoji (add failed) — logged, never retried.
 
 Full status map (exhaustive `match` on `RunStateName`; a seventh state fails at compile time):
 
@@ -40,7 +42,7 @@ Full status map (exhaustive `match` on `RunStateName`; a seventh state fails at 
 | `Running` | on (deadline-based) | 👀 present (added at filter-pass) |
 | `CancelRequested` | stop refresh (waiting quietly) | unchanged |
 | `Finished` | stop refresh | reply → remove 👀 → add ✅ |
-| `Failed` | stop refresh | brief generic failure reply (**new behavior** — today the gateway sends nothing on failure and `terminal_answer` errors when `final_answer` is absent, src/discord_gateway.rs:149-163,253-260; no failure-reason field exists on `TranscriptReadResult`, so the text is generic) → remove 👀 → add ❌ |
+| `Failed` | stop refresh | remove 👀 → add ❌. The one-time terminal failure notification (today the gateway sends nothing on failure — `terminal_answer` errors when `final_answer` is absent, src/discord_gateway.rs:149-163,253-260) is **#102's surface, single owner; duplication prohibited here** — canonical copy proposed on #102 |
 | `Canceled` | stop refresh | no reply (the operator canceled it); remove 👀, **no terminal emoji** (current-Hermes behavior; stale 👀 falsely says in-progress) |
 | `Interrupted` | stop refresh | no reply (the session is resumable and the recovered status is itself `Interrupted` — no recursion into readback); remove 👀, no emoji |
 
@@ -59,7 +61,7 @@ Full status map (exhaustive `match` on `RunStateName`; a seventh state fails at 
 - Rate budget stated plainly, no broader claims: ≤3 reaction calls + `ceil(len/2000)` reply POSTs per message lifecycle (`send_message` chunks at 2000 chars, src/discord_gateway.rs:357-368); typing ≤1 per 8s per active run; zero retries.
 
 ### Alignment with #102 (in progress)
-The approval notify message is #102's surface; this design only pauses/resumes typing around it and must not duplicate its text. The shared event-fold loop is reconciled with #102's implementation before card #129 goes Ready.
+#102 owns **all one-time terminal notifications** (approval notify and the terminal failure notification; its card states terminal states notify once) — this design sends no terminal text of its own, only reactions and typing, and must not duplicate #102's messages. Proposed literal failure copy is recorded on #102 so implementation and tests do not invent wording. The shared event-fold loop is reconciled with #102's implementation before card #129 goes Ready.
 
 ## Non-Goals
 - No per-tool-call or per-event reactions; no configurable emoji sets.
@@ -74,8 +76,9 @@ Fake-platform tests:
 - Event fold: sequential request → decision folding, including request + decision + terminal in one page; the test fixture uses the **exact production JSON nesting** (`kind=ledger` / `record.event.event` / `call_id`) to prove the key normalization.
 - Resync clears pause state.
 - Terminal order per status including `Canceled` (remove-👀-only) and `CancelRequested` (typing off, no reaction change).
-- Outer-failure cleanup: an induced daemon error after 👀 yields typing-off + remove 👀 + ❌ without changing run flow.
+- Outer-failure cleanup: an induced daemon error after 👀 attempts stop-refresh + remove 👀 + ❌ before the error propagates, without changing run semantics.
 - Serialized effects: no reaction call observable after the terminal swap for the same message.
+- Rate gate: after an injected 429, presentation calls are dropped until the gate expires; product replies are unaffected during the gate.
 
 Real-Discord smoke: one run showing 👀 → typing → reply → ✅; one stranger message showing nothing.
 
