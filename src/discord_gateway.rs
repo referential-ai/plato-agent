@@ -58,6 +58,7 @@ const GATEWAY_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const EVENT_PAGE_LIMIT: usize = 64;
 const EVENT_POLL_DELAY: Duration = Duration::from_millis(100);
 const PRESENTATION_TIMEOUT: Duration = Duration::from_millis(1_500);
+const TERMINAL_REACTION_WAIT_LIMIT: Duration = Duration::from_secs(2);
 const TYPING_INTERVAL: Duration = Duration::from_secs(8);
 const APPROVAL_FIELD_LIMIT: usize = 80;
 const RUN_FAILED_MESSAGE: &str = "Run failed. Inspect it locally with: plato replay";
@@ -625,11 +626,19 @@ impl MessagePresentation {
         match status {
             RunStateName::Finished => {
                 self.remove_eyes(platform);
-                self.ignore(platform.add_reaction(self.channel_id, self.message_id, SUCCESS_EMOJI));
+                self.ignore(platform.add_terminal_reaction(
+                    self.channel_id,
+                    self.message_id,
+                    SUCCESS_EMOJI,
+                ));
             }
             RunStateName::Failed => {
                 self.remove_eyes(platform);
-                self.ignore(platform.add_reaction(self.channel_id, self.message_id, FAILURE_EMOJI));
+                self.ignore(platform.add_terminal_reaction(
+                    self.channel_id,
+                    self.message_id,
+                    FAILURE_EMOJI,
+                ));
             }
             RunStateName::Canceled | RunStateName::Interrupted => self.remove_eyes(platform),
             RunStateName::Running | RunStateName::CancelRequested => {}
@@ -703,6 +712,16 @@ impl DiscordPlatform {
             .reaction(channel_id, message_id, emoji, ReactionAction::Add)
     }
 
+    fn add_terminal_reaction(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        emoji: &str,
+    ) -> AppResult<()> {
+        self.rest
+            .add_terminal_reaction(channel_id, message_id, emoji)
+    }
+
     fn remove_reaction(&self, channel_id: u64, message_id: u64, emoji: &str) -> AppResult<()> {
         self.rest
             .reaction(channel_id, message_id, emoji, ReactionAction::Remove)
@@ -768,7 +787,10 @@ impl DiscordRestClient {
                 content,
                 allowed_mentions: AllowedMentions { parse: Vec::new() },
             })
-            .map_err(|error| self.discord_http_error("message send", RestClass::Product, error))?;
+            .map_err(|error| {
+                self.discord_http_error("message send", RestClass::Product, error)
+                    .app_error
+            })?;
         }
         Ok(())
     }
@@ -782,7 +804,10 @@ impl DiscordRestClient {
                 .post(&format!("{}/channels/{channel_id}/typing", self.api_base)),
         )
         .call()
-        .map_err(|error| self.discord_http_error("typing", RestClass::Presentation, error))?;
+        .map_err(|error| {
+            self.discord_http_error("typing", RestClass::Presentation, error)
+                .app_error
+        })?;
         Ok(())
     }
 
@@ -793,8 +818,49 @@ impl DiscordRestClient {
         emoji: &str,
         action: ReactionAction,
     ) -> AppResult<()> {
+        match self.reaction_attempt(channel_id, message_id, emoji, action)? {
+            PresentationAttempt::Sent | PresentationAttempt::Gated => Ok(()),
+            PresentationAttempt::RateLimited(_) => Err(AppError::Provider(
+                "discord reaction returned HTTP 429".into(),
+            )),
+        }
+    }
+
+    fn add_terminal_reaction(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        emoji: &str,
+    ) -> AppResult<()> {
+        match self.reaction_attempt(channel_id, message_id, emoji, ReactionAction::Add)? {
+            PresentationAttempt::Sent | PresentationAttempt::Gated => Ok(()),
+            PresentationAttempt::RateLimited(rate_limit) => {
+                let Some(wait) = terminal_reaction_wait(rate_limit) else {
+                    return Err(AppError::Provider(
+                        "discord terminal reaction returned HTTP 429".into(),
+                    ));
+                };
+                eprintln!("discord terminal reaction rate limited; waiting {wait:?}");
+                thread::sleep(wait);
+                match self.reaction_attempt(channel_id, message_id, emoji, ReactionAction::Add)? {
+                    PresentationAttempt::Sent | PresentationAttempt::Gated => Ok(()),
+                    PresentationAttempt::RateLimited(_) => Err(AppError::Provider(
+                        "discord terminal reaction returned HTTP 429".into(),
+                    )),
+                }
+            }
+        }
+    }
+
+    fn reaction_attempt(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        emoji: &str,
+        action: ReactionAction,
+    ) -> AppResult<PresentationAttempt> {
         if !self.presentation_allowed("reaction") {
-            return Ok(());
+            return Ok(PresentationAttempt::Gated);
         }
         let emoji = url::form_urlencoded::byte_serialize(emoji.as_bytes()).collect::<String>();
         let url = format!(
@@ -805,10 +871,16 @@ impl DiscordRestClient {
             ReactionAction::Add => self.presentation_agent.put(&url),
             ReactionAction::Remove => self.presentation_agent.delete(&url),
         };
-        self.request(request)
-            .call()
-            .map_err(|error| self.discord_http_error("reaction", RestClass::Presentation, error))?;
-        Ok(())
+        match self.request(request).call() {
+            Ok(_) => Ok(PresentationAttempt::Sent),
+            Err(error) => {
+                let error = self.discord_http_error("reaction", RestClass::Presentation, error);
+                match error.rate_limit {
+                    Some(rate_limit) => Ok(PresentationAttempt::RateLimited(rate_limit)),
+                    None => Err(error.app_error),
+                }
+            }
+        }
     }
 
     fn presentation_allowed(&self, operation: &str) -> bool {
@@ -834,7 +906,7 @@ impl DiscordRestClient {
         operation: &str,
         class: RestClass,
         error: ureq::Error,
-    ) -> AppError {
+    ) -> DiscordRestError {
         match error {
             ureq::Error::Status(429, response) => {
                 let header_retry_after = response.header("Retry-After").and_then(parse_retry_after);
@@ -848,19 +920,25 @@ impl DiscordRestClient {
                     .into_iter()
                     .flatten()
                     .max();
+                let global =
+                    header_global || rate_limit.is_some_and(|rate_limit| rate_limit.global);
                 if let Some(retry_after) = retry_after {
                     let mut limits = self.rate_limits.get();
-                    limits.record(
-                        class,
-                        header_global || rate_limit.is_some_and(|rate_limit| rate_limit.global),
-                        retry_after,
-                        Instant::now(),
-                    );
+                    limits.record(class, global, retry_after, Instant::now());
                     self.rate_limits.set(limits);
                 }
-                AppError::Provider(format!("discord {operation} returned HTTP 429"))
+                DiscordRestError {
+                    app_error: AppError::Provider(format!("discord {operation} returned HTTP 429")),
+                    rate_limit: retry_after.map(|retry_after| DiscordRateLimit {
+                        retry_after,
+                        global,
+                    }),
+                }
             }
-            error => discord_http_error(operation, error),
+            error => DiscordRestError {
+                app_error: discord_http_error(operation, error),
+                rate_limit: None,
+            },
         }
     }
 
@@ -879,6 +957,10 @@ fn parse_retry_after_number(value: f64) -> Option<Duration> {
     Duration::try_from_secs_f64(value).ok()
 }
 
+fn terminal_reaction_wait(rate_limit: DiscordRateLimit) -> Option<Duration> {
+    (!rate_limit.global).then(|| rate_limit.retry_after.min(TERMINAL_REACTION_WAIT_LIMIT))
+}
+
 #[derive(Clone, Copy)]
 enum ReactionAction {
     Add,
@@ -889,6 +971,23 @@ enum ReactionAction {
 enum RestClass {
     Presentation,
     Product,
+}
+
+struct DiscordRestError {
+    app_error: AppError,
+    rate_limit: Option<DiscordRateLimit>,
+}
+
+#[derive(Clone, Copy)]
+struct DiscordRateLimit {
+    retry_after: Duration,
+    global: bool,
+}
+
+enum PresentationAttempt {
+    Sent,
+    Gated,
+    RateLimited(DiscordRateLimit),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1519,7 +1618,7 @@ mod tests {
                 let socket_dir = tempfile::tempdir().unwrap();
                 let socket_path = socket_dir.path().join("daemon.sock");
                 let daemon = spawn_finished_daemon(&socket_path, "run.start", "session_1", "done");
-                let rest = spawn_fake_rest(1, 200, None);
+                let rest = spawn_fake_rest(4, 200, None);
                 let platform = test_platform(
                     &rest.base_url,
                     discord_message(42, 200, "test config handoff"),
@@ -1538,6 +1637,154 @@ mod tests {
                 rest.handle.join().unwrap();
             }
         });
+    }
+
+    #[test]
+    fn terminal_reaction_waits_once_after_shared_bucket_429() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_finished_daemon(&socket_path, "run.start", "session_1", "final answer");
+        let rest = spawn_scripted_rest(vec![
+            FakeResponse {
+                status: 204,
+                body: Value::Null,
+                headers: Vec::new(),
+            },
+            FakeResponse {
+                status: 200,
+                body: json!({"id": "reply_1"}),
+                headers: Vec::new(),
+            },
+            FakeResponse {
+                status: 204,
+                body: Value::Null,
+                headers: Vec::new(),
+            },
+            FakeResponse {
+                status: 429,
+                body: json!({"retry_after": 0.05, "global": false}),
+                headers: vec![("Retry-After", "0.05")],
+            },
+            FakeResponse {
+                status: 204,
+                body: Value::Null,
+                headers: Vec::new(),
+            },
+        ]);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "hello"));
+        let mut gateway = test_gateway(&workspace, socket_path, platform);
+
+        gateway.poll_once().unwrap();
+
+        daemon.join().unwrap();
+        let requests = rest.handle.join().unwrap();
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert_eq!(requests[1].path, "/channels/200/messages");
+        assert_reaction(&requests[2], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[3], "PUT", SUCCESS_EMOJI);
+        assert_reaction(&requests[4], "PUT", SUCCESS_EMOJI);
+        let retry_delay = requests[4]
+            .received_at
+            .duration_since(requests[3].received_at);
+        assert!(retry_delay >= Duration::from_millis(40));
+        assert!(retry_delay < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn terminal_reaction_wait_is_capped_at_two_seconds() {
+        assert_eq!(
+            terminal_reaction_wait(DiscordRateLimit {
+                retry_after: Duration::from_millis(250),
+                global: false,
+            }),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            terminal_reaction_wait(DiscordRateLimit {
+                retry_after: Duration::from_secs(30),
+                global: false,
+            }),
+            Some(TERMINAL_REACTION_WAIT_LIMIT)
+        );
+        assert_eq!(
+            terminal_reaction_wait(DiscordRateLimit {
+                retry_after: Duration::from_millis(250),
+                global: true,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_reaction_drops_after_one_rate_limited_retry() {
+        let rest = spawn_scripted_rest(vec![
+            FakeResponse {
+                status: 429,
+                body: json!({"retry_after": 0.02, "global": false}),
+                headers: Vec::new(),
+            },
+            FakeResponse {
+                status: 429,
+                body: json!({"retry_after": 0.02, "global": false}),
+                headers: Vec::new(),
+            },
+        ]);
+        let client = DiscordRestClient::new(&rest.base_url, "test-token".into());
+
+        let error = client
+            .add_terminal_reaction(200, 300, SUCCESS_EMOJI)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("terminal reaction returned HTTP 429")
+        );
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_reaction(&requests[0], "PUT", SUCCESS_EMOJI);
+        assert_reaction(&requests[1], "PUT", SUCCESS_EMOJI);
+    }
+
+    #[test]
+    fn terminal_reaction_does_not_wait_or_retry_global_429() {
+        let rest = spawn_scripted_rest(vec![FakeResponse {
+            status: 429,
+            body: json!({"retry_after": 0.02, "global": true}),
+            headers: Vec::new(),
+        }]);
+        let client = DiscordRestClient::new(&rest.base_url, "test-token".into());
+
+        assert!(
+            client
+                .add_terminal_reaction(200, 300, SUCCESS_EMOJI)
+                .is_err()
+        );
+
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_reaction(&requests[0], "PUT", SUCCESS_EMOJI);
+    }
+
+    #[test]
+    fn terminal_reaction_does_not_retry_429_without_retry_after() {
+        let rest = spawn_scripted_rest(vec![FakeResponse {
+            status: 429,
+            body: json!({}),
+            headers: Vec::new(),
+        }]);
+        let client = DiscordRestClient::new(&rest.base_url, "test-token".into());
+
+        assert!(
+            client
+                .add_terminal_reaction(200, 300, SUCCESS_EMOJI)
+                .is_err()
+        );
+
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_reaction(&requests[0], "PUT", SUCCESS_EMOJI);
     }
 
     #[test]
@@ -2288,6 +2535,7 @@ mod tests {
         path: String,
         authorization: String,
         body: Value,
+        received_at: Instant,
     }
 
     fn spawn_fake_rest(
@@ -2404,6 +2652,7 @@ mod tests {
             } else {
                 serde_json::from_slice(&body).unwrap()
             },
+            received_at: Instant::now(),
         }
     }
 
