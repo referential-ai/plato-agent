@@ -5,7 +5,7 @@ issue: https://github.com/referential-ai/plato-agent/issues/129
 
 # Gateway In-Channel Presentation (Reactions + Typing)
 
-Revision 5 — addresses findings F1–F10 and closure fixes R11–R13, C1–C3 (2026-07-12).
+Revision 6 — adds the bounded terminal-swap wait (S1) after real-Discord smoke (2026-07-12); revision 5 addressed F1–F10, R11–R13, C1–C3.
 
 ## Authority
 - Human direction 2026-07-12: status reactions like Hermes/OpenCode (👀 while reading/thinking); plan and document; lead-lane critical review before finalization.
@@ -33,7 +33,9 @@ All presentation effects execute **serialized on the single gateway loop**, in p
 Independent monotonic deadline, never tied to poll pages: while status is `Running` and no approval is pending, send trigger-typing when `now ≥ next_typing_at`, then `next_typing_at = now + 8s` (Discord documents ~10s expiry; 2s margin). The **first** send fires immediately on first observing `Running` (and again immediately on resume after an approval decision): `next_typing_at` initializes in the past. Catch-up/backfill pages never burst typing sends. Send timeout (~1.5s) stays well below the 8s interval; a slow send delays polls by at most the timeout — accepted for a single serialized loop.
 
 ### Reactions per message lifecycle (F1, F3)
-Up to **three** reaction calls plus the reply, in this order at terminal: reply first (answer latency wins), then remove 👀, then add the terminal emoji. Accepted partial-failure states: orphan 👀 (remove failed) or missing terminal emoji (add failed) — logged, never retried.
+Up to **three** reaction calls plus the reply, in this order at terminal: reply first (answer latency wins), then remove 👀, then add the terminal emoji.
+
+**S1 — bounded terminal-swap wait (real-smoke finding, rev 6).** Discord assigns *all* reaction writes on a message to one rate-limit bucket (observed limit 1). Back-to-back remove-👀 then add-terminal therefore collide: the add 429s and, under the strict no-sleep rule, was dropped — so ✅/❌ never landed (verified in the #133 smoke). Narrow exception: **between the terminal remove and the terminal add only**, the loop may wait for the bucket to reset — honor the response's `Retry-After`, **capped at 2s**, then make exactly one add attempt; if it still 429s, drop it (accepted partial failure). This wait is bounded, non-recursive, and occurs **after the product reply is already delivered**, so it adds no perceived answer latency. It does **not** apply to mid-run presentation, product messages, or the not-before gate below — those keep the strict no-sleep rule (C1/C2). The 2s cap means a pathological large `Retry-After` degrades to a dropped terminal emoji, never a loop stall. Accepted partial-failure states otherwise: orphan 👀 (remove failed) or missing terminal emoji (add failed after the one bounded wait) — logged, never further retried.
 
 Full status map (exhaustive `match` on `RunStateName`; a seventh state fails at compile time):
 
@@ -80,7 +82,7 @@ Fake-platform tests:
 - Serialized effects: no reaction call observable after the terminal swap for the same message.
 - Rate gate: after an injected scoped 429, presentation calls are dropped for the full `retry_after` while product replies flow; after an injected global 429, a due product message fails and propagates without being sent.
 
-Real-Discord smoke: one run showing 👀 → typing → reply → ✅; one stranger message showing nothing.
+Real-Discord smoke: one run showing 👀 → typing → reply → ✅ **with the terminal ✅ confirmed present via REST reaction readback** (the rev-5 gap: the swap must be verified landed, not assumed); one stranger message showing nothing. A fake-platform test must also simulate the shared-bucket 429-on-add and assert the bounded wait then successful add.
 
 Docs: the implementation PR updates README.md/docs/QUICKSTART.md for the user-visible changes (reactions, typing) in the same PR per plato-agent/AGENTS.md — not deferred to the guide card #127. The failure-notification docs belong to #102's PR with its own same-PR requirement.
 
