@@ -5,7 +5,7 @@ issue: https://github.com/referential-ai/plato-agent/issues/129
 
 # Gateway In-Channel Presentation (Reactions + Typing)
 
-Revision 2 — addresses lead-lane critical review findings F1–F6 (2026-07-12).
+Revision 3 — addresses lead-lane critical review findings F1–F10 (2026-07-12).
 
 ## Authority
 - Human direction 2026-07-12: status reactions like Hermes/OpenCode (👀 while reading/thinking); plan and document; lead-lane critical review before finalization.
@@ -16,19 +16,19 @@ Revision 2 — addresses lead-lane critical review findings F1–F6 (2026-07-12)
 - Poll loop: `EVENT_POLL_DELAY = 100ms`, sleeping only on empty pages (src/discord_gateway.rs:34,180) — polling is far faster than any sane typing cadence; the two must be independent.
 - Allowlist/content gate before any daemon call (src/discord_gateway.rs `handle_message`).
 - Typed status on every poll: `EventsStreamResult.status: RunStateName`; typed comparisons already present.
-- `approval_requested` transient event (kind + `tool_call_id`, tool, effect, preview: src/daemon/runtime.rs:151-195). Resolution arrives as **nested ledger records**: `record.event.event = approval_granted | approval_denied` carrying `tool_call_id`.
+- `approval_requested` transient event carries `tool_call_id` (src/daemon/runtime.rs:180-185). Resolution arrives as **nested durable ledger records** pushed as `{"kind":"ledger","record":{…,"event":{"event":"approval_granted"|"approval_denied","call_id":…}}}` (runtime.rs:107-112; platonic-core event.rs:96-109) — note the durable field is **`call_id`**, not `tool_call_id`. Presentation must normalize the transient `tool_call_id` against the durable `call_id`, and the test suite must prove the exact production JSON nesting.
 - Terminal readback: `TranscriptReadResult { status, final_answer }`.
 - Gap (in scope to fix): `DiscordMessage`/`MessageCreateEvent` currently discard the Discord message id (src/discord_gateway.rs:415-419,639-643) — reactions target `channel_id + message_id`, so the id must be carried through.
 
 ## Design
 
 ### Effects model (F5, F6)
-All presentation effects execute **serialized on the single gateway loop**, in program order, best-effort: each is a logged-ignored `Result`, one attempt, bounded ~1.5s, honoring one `Retry-After` on 429 then dropping. No detached threads or queues — out-of-order effects (late 👀 after a terminal swap, phantom typing) are structurally impossible. Presentation failures never propagate to run flow.
+All presentation effects execute **serialized on the single gateway loop**, in program order, best-effort: each is a logged-ignored `Result`, **exactly one attempt**, bounded ~1.5s; a 429 is logged and dropped — no retry, no `Retry-After` wait (an arbitrary server-directed sleep could stall the loop past the typing deadline). No detached threads or queues — out-of-order effects (late 👀 after a terminal swap, phantom typing) are structurally impossible. Presentation failures never propagate to run flow.
 
-**Terminal cleanup rule:** no code path may leave the message lifecycle with 👀 still present and no terminal decision, except process kill. Any post-👀 gateway-side failure outside run states (daemon connect/hello, dispatch, poll, readback, reply errors that today propagate) performs best-effort typing-off → remove 👀 → add ❌ **before** propagating. Run semantics unchanged.
+**Terminal cleanup rule:** every exit from the message lifecycle **attempts** cleanup (best-effort; accepted partial failures below). Any post-👀 gateway-side failure outside run states (daemon connect/hello, dispatch, poll, readback, reply errors that today propagate) attempts stop-typing-refresh → remove 👀 → add ❌ **before** propagating. Discord has no typing-off call: stopping the refresh lets the indicator decay within its documented ~10s. Run semantics unchanged.
 
 ### Typing (F1)
-Independent monotonic deadline, never tied to poll pages: while status is `Running` and no approval is pending, send trigger-typing when `now ≥ next_typing_at`, then `next_typing_at = now + 8s` (Discord documents ~10s expiry; 2s margin). Catch-up/backfill pages never burst typing sends. Send timeout (~1.5s) stays well below the 8s interval; a slow send delays polls by at most the timeout — accepted for a single serialized loop.
+Independent monotonic deadline, never tied to poll pages: while status is `Running` and no approval is pending, send trigger-typing when `now ≥ next_typing_at`, then `next_typing_at = now + 8s` (Discord documents ~10s expiry; 2s margin). The **first** send fires immediately on first observing `Running` (and again immediately on resume after an approval decision): `next_typing_at` initializes in the past. Catch-up/backfill pages never burst typing sends. Send timeout (~1.5s) stays well below the 8s interval; a slow send delays polls by at most the timeout — accepted for a single serialized loop.
 
 ### Reactions per message lifecycle (F1, F3)
 Up to **three** reaction calls plus the reply, in this order at terminal: reply first (answer latency wins), then remove 👀, then add the terminal emoji. Accepted partial-failure states: orphan 👀 (remove failed) or missing terminal emoji (add failed) — logged, never retried beyond the single Retry-After allowance.
@@ -38,25 +38,28 @@ Full status map (exhaustive `match` on `RunStateName`; a seventh state fails at 
 | Status observed | Typing | Reactions |
 | --- | --- | --- |
 | `Running` | on (deadline-based) | 👀 present (added at filter-pass) |
-| `CancelRequested` | off (waiting quietly) | unchanged |
-| `Finished` | off | reply → remove 👀 → add ✅ |
-| `Failed` | off | failure note (existing) → remove 👀 → add ❌ |
-| `Canceled` | off | remove 👀, **no terminal emoji** (current-Hermes behavior; stale 👀 falsely says in-progress) |
-| `Interrupted` | off | present per the recovered terminal status from `transcript.read`; if recovery yields no terminal, remove 👀, no emoji |
+| `CancelRequested` | stop refresh (waiting quietly) | unchanged |
+| `Finished` | stop refresh | reply → remove 👀 → add ✅ |
+| `Failed` | stop refresh | brief generic failure reply (**new behavior** — today the gateway sends nothing on failure and `terminal_answer` errors when `final_answer` is absent, src/discord_gateway.rs:149-163,253-260; no failure-reason field exists on `TranscriptReadResult`, so the text is generic) → remove 👀 → add ❌ |
+| `Canceled` | stop refresh | no reply (the operator canceled it); remove 👀, **no terminal emoji** (current-Hermes behavior; stale 👀 falsely says in-progress) |
+| `Interrupted` | stop refresh | no reply (the session is resumable and the recovered status is itself `Interrupted` — no recursion into readback); remove 👀, no emoji |
 
 👀 is added on the exact branch where the message passes the allowlist/content gate — never before (silent-ignore must not leak a "seen" signal), never for strangers.
 
 ### Approval pause/resume (F2)
-- Pending approvals tracked per run, keyed by `tool_call_id`, inserted on `approval_requested`.
+- Pending approval tracked per run as a **single `Option<call id>`** — the runtime admits at most one at a time (multiple tool calls per response are rejected, src/app.rs:503-511, and the approval callback blocks synchronously). A set and concurrent-approval proofs would be speculative under the simplicity directive.
 - **Event fold order:** all events of a page are processed in offset order **before** acting on that page's `status` — request + decision + terminal arriving in one page resolves correctly.
-- Resume: remove the key on a matching `approval_granted`/`approval_denied` ledger record; typing resumes when the set is empty and status is `Running`. Any terminal status clears the set.
+- Resume: clear the pending id on a durable `approval_granted`/`approval_denied` record whose `call_id` matches the stored transient `tool_call_id` (normalized per Source Grounding); typing resumes (immediately) when cleared and status is `Running`. Any terminal status clears it.
 - **Resync rule:** lag/reconnect recovery tails from the current tip, so decision events can be legitimately missed. On any resync, clear all pause state and re-derive from current status — accepted best-effort (replaying history for presentation would be disproportionate; Hermes fixed this same missed-resume class in ba2572e54).
 
 ### Discord contract (F4)
 - Carry `MESSAGE_CREATE.id` through `DiscordMessage` (small in-scope struct change) so reactions can target `channel_id + message_id`.
 - Emoji are URL-encoded in REST paths.
 - Permissions (guide #127 updates): **Add Reactions** + **Read Message History** (required for Create Reaction), and **Send Messages in Threads** if thread channels are used.
-- Rate budget stated plainly, no broader claims: ≤3 reaction calls + 1 reply per message lifecycle; typing ≤1 per 8s per active run; one Retry-After honor per effect.
+- Rate budget stated plainly, no broader claims: ≤3 reaction calls + `ceil(len/2000)` reply POSTs per message lifecycle (`send_message` chunks at 2000 chars, src/discord_gateway.rs:357-368); typing ≤1 per 8s per active run; zero retries.
+
+### Alignment with #102 (in progress)
+The approval notify message is #102's surface; this design only pauses/resumes typing around it and must not duplicate its text. The shared event-fold loop is reconciled with #102's implementation before card #129 goes Ready.
 
 ## Non-Goals
 - No per-tool-call or per-event reactions; no configurable emoji sets.
@@ -67,14 +70,16 @@ Full status map (exhaustive `match` on `RunStateName`; a seventh state fails at 
 ## Acceptance (supersedes card #129 acceptance on adoption)
 Fake-platform tests:
 - Post-filter-only ordering; stranger message produces zero reactions and zero typing.
-- Typing deadline math: no send before due; no bursts during catch-up pages; paused while an approval is pending.
-- Event fold: two concurrent approvals (pause until both resolved); request + decision + terminal in one page.
+- Typing deadline math: first send immediate on `Running`; no send before due thereafter; no bursts during catch-up pages; paused while an approval is pending; immediate send on resume.
+- Event fold: sequential request → decision folding, including request + decision + terminal in one page; the test fixture uses the **exact production JSON nesting** (`kind=ledger` / `record.event.event` / `call_id`) to prove the key normalization.
 - Resync clears pause state.
 - Terminal order per status including `Canceled` (remove-👀-only) and `CancelRequested` (typing off, no reaction change).
 - Outer-failure cleanup: an induced daemon error after 👀 yields typing-off + remove 👀 + ❌ without changing run flow.
 - Serialized effects: no reaction call observable after the terminal swap for the same message.
 
 Real-Discord smoke: one run showing 👀 → typing → reply → ✅; one stranger message showing nothing.
+
+Docs: the implementation PR updates README.md/docs/QUICKSTART.md for the user-visible changes (reactions, typing, new failure reply) in the same PR per plato-agent/AGENTS.md — not deferred to the guide card #127.
 
 ## Proof
 `cargo test --locked`; scratch-workspace smoke with reaction readback via REST.
