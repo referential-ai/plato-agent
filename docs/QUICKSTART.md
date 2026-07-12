@@ -111,7 +111,10 @@ When `plato-gateway-discord` reaches an approval-required tool, Discord gets one
 bounded notification with the tool, effect, and preview. Grant or deny it
 locally in `plato-tui`; the gateway never sends approval decisions. Failed runs
 post `Run failed. Inspect it locally with: plato replay`. Canceled and
-interrupted runs do not post terminal messages.
+interrupted runs do not post terminal messages. Allowed messages show 👀 and a
+typing indicator while active, then ✅ or ❌; canceled and interrupted runs
+remove 👀 without a terminal reaction. The bot needs Add Reactions and Read
+Message History, plus Send Messages in Threads when threads are used.
 
 ## 5. Run the test suite (no API key needed)
 

@@ -9,6 +9,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     ffi::OsString,
     net::TcpStream,
@@ -56,8 +57,13 @@ const GATEWAY_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const GATEWAY_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const EVENT_PAGE_LIMIT: usize = 64;
 const EVENT_POLL_DELAY: Duration = Duration::from_millis(100);
+const PRESENTATION_TIMEOUT: Duration = Duration::from_millis(1_500);
+const TYPING_INTERVAL: Duration = Duration::from_secs(8);
 const APPROVAL_FIELD_LIMIT: usize = 80;
 const RUN_FAILED_MESSAGE: &str = "Run failed. Inspect it locally with: plato replay";
+const EYES_EMOJI: &str = "👀";
+const SUCCESS_EMOJI: &str = "✅";
+const FAILURE_EMOJI: &str = "❌";
 const RECONNECT_ATTEMPTS: usize = 40;
 const RECONNECT_DELAY: Duration = Duration::from_millis(50);
 const REQUIRED_CAPABILITIES: [&str; 6] = [
@@ -180,25 +186,42 @@ impl DiscordGateway {
                 .send_message(message.channel_id, DISCORD_REJECTION_MESSAGE)?;
             return Ok(());
         }
-        self.handle_message(message.channel_id, message.content)
+        self.handle_message(message)
     }
 
-    fn handle_message(&mut self, channel_id: u64, text: String) -> AppResult<()> {
+    fn handle_message(&mut self, message: DiscordMessage) -> AppResult<()> {
+        let mut presentation = MessagePresentation::new(message.channel_id, message.id);
+        presentation.add_eyes(&self.platform);
+        let result = self.handle_allowed_message(message, &mut presentation);
+        if result.is_err() {
+            presentation.abnormal_exit(&self.platform);
+        }
+        result
+    }
+
+    fn handle_allowed_message(
+        &mut self,
+        message: DiscordMessage,
+        presentation: &mut MessagePresentation,
+    ) -> AppResult<()> {
+        let channel_id = message.channel_id;
         let mut daemon = self.connect_daemon()?;
         let run = match self.sessions.get(&channel_id).cloned() {
             Some(session_id) => daemon.message_append_to_session(
-                text,
+                message.content,
                 Some(session_id),
                 self.config_path.clone(),
                 false,
             ),
-            None => daemon.run_start(text, self.config_path.clone(), false),
+            None => daemon.run_start(message.content, self.config_path.clone(), false),
         }?;
         self.sessions.insert(channel_id, run.session_id.clone());
-        let terminal = self.wait_for_run(&mut daemon, channel_id, &run.run_id)?;
+        let terminal = self.wait_for_run(&mut daemon, channel_id, &run.run_id, presentation)?;
+        let terminal_status = terminal.status;
         if let Some(message) = terminal_message(terminal)? {
             self.platform.send_message(channel_id, &message)?;
         }
+        presentation.finish(&self.platform, terminal_status);
         Ok(())
     }
 
@@ -207,21 +230,42 @@ impl DiscordGateway {
         daemon: &mut DaemonClient,
         channel_id: u64,
         run_id: &str,
+        presentation: &mut MessagePresentation,
     ) -> AppResult<TranscriptReadResult> {
         let mut next_offset = Some(0);
         let mut approvals = ApprovalNotifications::default();
+        let mut canceling = false;
         loop {
             match daemon.events_stream(run_id, next_offset, EVENT_PAGE_LIMIT) {
                 Ok(events) => {
                     next_offset = Some(events.next_offset);
                     let needs_catch_up = events.events.len() == EVENT_PAGE_LIMIT
                         && events.next_offset > events.from_offset;
-                    approvals.fold(&events.events);
+                    let was_pending = approvals.pending.is_some();
+                    canceling |= approvals.fold(&events.events);
+                    if was_pending != approvals.pending.is_some() {
+                        presentation.stop_typing();
+                    }
                     if needs_catch_up {
                         continue;
                     }
                     match events.status {
-                        RunStateName::Running | RunStateName::CancelRequested => {
+                        RunStateName::Running => {
+                            if let Some(message) = approvals.take_notification() {
+                                self.platform.send_message(channel_id, &message)?;
+                            }
+                            presentation.observe_running(
+                                &self.platform,
+                                approvals.pending.is_some() || canceling,
+                                Instant::now(),
+                            );
+                            if events.events.is_empty() {
+                                thread::sleep(self.event_poll_delay);
+                            }
+                        }
+                        RunStateName::CancelRequested => {
+                            canceling = true;
+                            presentation.stop_typing();
                             if let Some(message) = approvals.take_notification() {
                                 self.platform.send_message(channel_id, &message)?;
                             }
@@ -233,6 +277,8 @@ impl DiscordGateway {
                         | RunStateName::Failed
                         | RunStateName::Canceled
                         | RunStateName::Interrupted => {
+                            presentation.stop_typing();
+                            approvals.clear();
                             return self.read_terminal_run(daemon, run_id);
                         }
                     }
@@ -240,10 +286,14 @@ impl DiscordGateway {
                 Err(AppError::DaemonResponse(error)) if error.code == "lagged" => {
                     next_offset = None;
                     approvals.clear();
+                    canceling = false;
+                    presentation.stop_typing();
                 }
                 Err(error) if reconnectable(&error) => {
                     *daemon = self.reconnect_daemon()?;
                     approvals.clear();
+                    canceling = false;
+                    presentation.stop_typing();
                     let status = daemon
                         .sessions_list()?
                         .into_iter()
@@ -392,11 +442,13 @@ struct PendingApprovalNotification {
 }
 
 impl ApprovalNotifications {
-    fn fold(&mut self, entries: &[Value]) {
+    fn fold(&mut self, entries: &[Value]) -> bool {
+        let mut canceled = false;
         for entry in entries {
             let event = entry.get("event").unwrap_or(entry);
             if event.get("kind").and_then(Value::as_str) == Some("canceled") {
                 self.clear();
+                canceled = true;
                 continue;
             }
             if let Some((call_id, preview)) = tool_input_preview(event) {
@@ -438,6 +490,7 @@ impl ApprovalNotifications {
                 }
             }
         }
+        canceled
     }
 
     fn take_notification(&mut self) -> Option<String> {
@@ -525,6 +578,81 @@ fn reconnectable(error: &AppError) -> bool {
     )
 }
 
+struct MessagePresentation {
+    channel_id: u64,
+    message_id: u64,
+    next_typing_at: Option<Instant>,
+}
+
+impl MessagePresentation {
+    fn new(channel_id: u64, message_id: u64) -> Self {
+        Self {
+            channel_id,
+            message_id,
+            next_typing_at: None,
+        }
+    }
+
+    fn add_eyes(&self, platform: &DiscordPlatform) {
+        self.ignore(platform.add_reaction(self.channel_id, self.message_id, EYES_EMOJI));
+    }
+
+    fn observe_running(&mut self, platform: &DiscordPlatform, paused: bool, now: Instant) {
+        if !self.typing_due(paused, now) {
+            return;
+        }
+        self.ignore(platform.trigger_typing(self.channel_id));
+    }
+
+    fn typing_due(&mut self, paused: bool, now: Instant) -> bool {
+        if paused {
+            self.stop_typing();
+            return false;
+        }
+        if self.next_typing_at.is_some_and(|deadline| now < deadline) {
+            return false;
+        }
+        self.next_typing_at = now.checked_add(TYPING_INTERVAL);
+        true
+    }
+
+    fn stop_typing(&mut self) {
+        self.next_typing_at = None;
+    }
+
+    fn finish(&mut self, platform: &DiscordPlatform, status: RunStateName) {
+        self.stop_typing();
+        match status {
+            RunStateName::Finished => {
+                self.remove_eyes(platform);
+                self.ignore(platform.add_reaction(self.channel_id, self.message_id, SUCCESS_EMOJI));
+            }
+            RunStateName::Failed => {
+                self.remove_eyes(platform);
+                self.ignore(platform.add_reaction(self.channel_id, self.message_id, FAILURE_EMOJI));
+            }
+            RunStateName::Canceled | RunStateName::Interrupted => self.remove_eyes(platform),
+            RunStateName::Running | RunStateName::CancelRequested => {}
+        }
+    }
+
+    fn abnormal_exit(&mut self, platform: &DiscordPlatform) {
+        self.stop_typing();
+        self.remove_eyes(platform);
+        self.ignore(platform.add_reaction(self.channel_id, self.message_id, FAILURE_EMOJI));
+    }
+
+    fn remove_eyes(&self, platform: &DiscordPlatform) {
+        self.ignore(platform.remove_reaction(self.channel_id, self.message_id, EYES_EMOJI));
+    }
+
+    fn ignore(&self, result: AppResult<()>) {
+        if let Err(error) = result {
+            eprintln!("discord presentation effect failed: {error}");
+        }
+    }
+}
+
 struct DiscordPlatform {
     rest: DiscordRestClient,
     messages: Receiver<AppResult<DiscordMessage>>,
@@ -565,6 +693,20 @@ impl DiscordPlatform {
     fn send_message(&self, channel_id: u64, text: &str) -> AppResult<()> {
         self.rest.send_message(channel_id, text)
     }
+
+    fn trigger_typing(&self, channel_id: u64) -> AppResult<()> {
+        self.rest.trigger_typing(channel_id)
+    }
+
+    fn add_reaction(&self, channel_id: u64, message_id: u64, emoji: &str) -> AppResult<()> {
+        self.rest
+            .reaction(channel_id, message_id, emoji, ReactionAction::Add)
+    }
+
+    fn remove_reaction(&self, channel_id: u64, message_id: u64, emoji: &str) -> AppResult<()> {
+        self.rest
+            .reaction(channel_id, message_id, emoji, ReactionAction::Remove)
+    }
 }
 
 impl Drop for DiscordPlatform {
@@ -578,8 +720,10 @@ impl Drop for DiscordPlatform {
 
 struct DiscordRestClient {
     agent: ureq::Agent,
+    presentation_agent: ureq::Agent,
     api_base: String,
     token: String,
+    rate_limits: Cell<DiscordRateLimits>,
 }
 
 impl DiscordRestClient {
@@ -588,8 +732,12 @@ impl DiscordRestClient {
             agent: ureq::AgentBuilder::new()
                 .timeout(Duration::from_secs(35))
                 .build(),
+            presentation_agent: ureq::AgentBuilder::new()
+                .timeout(PRESENTATION_TIMEOUT)
+                .build(),
             api_base: api_base.trim_end_matches('/').into(),
             token,
+            rate_limits: Cell::new(DiscordRateLimits::default()),
         }
     }
 
@@ -611,6 +759,7 @@ impl DiscordRestClient {
 
     fn send_message(&self, channel_id: u64, text: &str) -> AppResult<()> {
         for content in discord_chunks(text) {
+            self.require_product_allowed()?;
             self.request(
                 self.agent
                     .post(&format!("{}/channels/{channel_id}/messages", self.api_base)),
@@ -619,15 +768,164 @@ impl DiscordRestClient {
                 content,
                 allowed_mentions: AllowedMentions { parse: Vec::new() },
             })
-            .map_err(|error| discord_http_error("message send", error))?;
+            .map_err(|error| self.discord_http_error("message send", RestClass::Product, error))?;
         }
         Ok(())
+    }
+
+    fn trigger_typing(&self, channel_id: u64) -> AppResult<()> {
+        if !self.presentation_allowed("typing") {
+            return Ok(());
+        }
+        self.request(
+            self.presentation_agent
+                .post(&format!("{}/channels/{channel_id}/typing", self.api_base)),
+        )
+        .call()
+        .map_err(|error| self.discord_http_error("typing", RestClass::Presentation, error))?;
+        Ok(())
+    }
+
+    fn reaction(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+        emoji: &str,
+        action: ReactionAction,
+    ) -> AppResult<()> {
+        if !self.presentation_allowed("reaction") {
+            return Ok(());
+        }
+        let emoji = url::form_urlencoded::byte_serialize(emoji.as_bytes()).collect::<String>();
+        let url = format!(
+            "{}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me",
+            self.api_base
+        );
+        let request = match action {
+            ReactionAction::Add => self.presentation_agent.put(&url),
+            ReactionAction::Remove => self.presentation_agent.delete(&url),
+        };
+        self.request(request)
+            .call()
+            .map_err(|error| self.discord_http_error("reaction", RestClass::Presentation, error))?;
+        Ok(())
+    }
+
+    fn presentation_allowed(&self, operation: &str) -> bool {
+        let allowed = self.rate_limits.get().presentation_allowed(Instant::now());
+        if !allowed {
+            eprintln!("discord {operation} dropped: rate-limit gate open");
+        }
+        allowed
+    }
+
+    fn require_product_allowed(&self) -> AppResult<()> {
+        if self.rate_limits.get().product_allowed(Instant::now()) {
+            Ok(())
+        } else {
+            Err(AppError::Provider(
+                "discord REST is globally rate limited".into(),
+            ))
+        }
+    }
+
+    fn discord_http_error(
+        &self,
+        operation: &str,
+        class: RestClass,
+        error: ureq::Error,
+    ) -> AppError {
+        match error {
+            ureq::Error::Status(429, response) => {
+                let header_retry_after = response.header("Retry-After").and_then(parse_retry_after);
+                let header_global = response.header("X-RateLimit-Global") == Some("true")
+                    || response.header("X-RateLimit-Scope") == Some("global");
+                let rate_limit = response.into_json::<DiscordRateLimitResponse>().ok();
+                let body_retry_after = rate_limit
+                    .as_ref()
+                    .and_then(|rate_limit| parse_retry_after_number(rate_limit.retry_after));
+                let retry_after = [header_retry_after, body_retry_after]
+                    .into_iter()
+                    .flatten()
+                    .max();
+                if let Some(retry_after) = retry_after {
+                    let mut limits = self.rate_limits.get();
+                    limits.record(
+                        class,
+                        header_global || rate_limit.is_some_and(|rate_limit| rate_limit.global),
+                        retry_after,
+                        Instant::now(),
+                    );
+                    self.rate_limits.set(limits);
+                }
+                AppError::Provider(format!("discord {operation} returned HTTP 429"))
+            }
+            error => discord_http_error(operation, error),
+        }
     }
 
     fn request(&self, request: ureq::Request) -> ureq::Request {
         request
             .set("Authorization", &format!("Bot {}", self.token))
             .set("User-Agent", "plato-agent/0.1")
+    }
+}
+
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    parse_retry_after_number(value.parse().ok()?)
+}
+
+fn parse_retry_after_number(value: f64) -> Option<Duration> {
+    Duration::try_from_secs_f64(value).ok()
+}
+
+#[derive(Clone, Copy)]
+enum ReactionAction {
+    Add,
+    Remove,
+}
+
+#[derive(Clone, Copy)]
+enum RestClass {
+    Presentation,
+    Product,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DiscordRateLimits {
+    presentation_not_before: Option<Instant>,
+    global_not_before: Option<Instant>,
+}
+
+impl DiscordRateLimits {
+    fn presentation_allowed(&self, now: Instant) -> bool {
+        self.global_not_before
+            .is_none_or(|deadline| now >= deadline)
+            && self
+                .presentation_not_before
+                .is_none_or(|deadline| now >= deadline)
+    }
+
+    fn product_allowed(&self, now: Instant) -> bool {
+        self.global_not_before
+            .is_none_or(|deadline| now >= deadline)
+    }
+
+    fn record(&mut self, class: RestClass, global: bool, retry_after: Duration, now: Instant) {
+        let Some(deadline) = now.checked_add(retry_after) else {
+            return;
+        };
+        if global {
+            self.global_not_before = Some(
+                self.global_not_before
+                    .map_or(deadline, |current| current.max(deadline)),
+            );
+        } else if matches!(class, RestClass::Presentation) {
+            self.presentation_not_before = Some(
+                self.presentation_not_before
+                    .map_or(deadline, |current| current.max(deadline)),
+            );
+        }
     }
 }
 
@@ -661,6 +959,13 @@ struct CreateMessage {
     allowed_mentions: AllowedMentions,
 }
 
+#[derive(Deserialize)]
+struct DiscordRateLimitResponse {
+    retry_after: f64,
+    #[serde(default)]
+    global: bool,
+}
+
 #[derive(Serialize)]
 struct AllowedMentions {
     parse: Vec<String>,
@@ -668,6 +973,7 @@ struct AllowedMentions {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DiscordMessage {
+    id: u64,
     channel_id: u64,
     author_id: u64,
     content: String,
@@ -817,6 +1123,10 @@ impl DiscordGatewayReceiver {
                         if message.author.bot.unwrap_or(false) {
                             continue;
                         }
+                        let message_id = match parse_snowflake(&message.id) {
+                            Ok(value) => value,
+                            Err(error) => return GatewayControl::Fatal(error),
+                        };
                         let channel_id = match parse_snowflake(&message.channel_id) {
                             Ok(value) => value,
                             Err(error) => return GatewayControl::Fatal(error),
@@ -827,6 +1137,7 @@ impl DiscordGatewayReceiver {
                         };
                         if sender
                             .send(Ok(DiscordMessage {
+                                id: message_id,
                                 channel_id,
                                 author_id,
                                 content: message.content,
@@ -892,6 +1203,7 @@ struct ReadyEvent {
 
 #[derive(Deserialize)]
 struct MessageCreateEvent {
+    id: String,
     channel_id: String,
     author: DiscordAuthor,
     content: String,
@@ -1171,7 +1483,7 @@ mod tests {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("daemon.sock");
         let daemon = spawn_finished_daemon(&socket_path, "run.start", "session_1", "final answer");
-        let rest = spawn_fake_rest(1, 200, None);
+        let rest = spawn_fake_rest(4, 200, None);
         let content = "keep\u{2003}this\u{7} byte-for-byte";
         let platform = test_platform(&rest.base_url, discord_message(42, 200, content));
         let mut gateway = test_gateway(&workspace, socket_path, platform);
@@ -1183,10 +1495,14 @@ mod tests {
         assert!(start_params.get("session_id").is_none());
         assert_eq!(start_params["wait"], false);
         let requests = rest.handle.join().unwrap();
-        assert_eq!(requests[0].path, "/channels/200/messages");
-        assert_eq!(requests[0].authorization, "Bot test-token");
-        assert_eq!(requests[0].body["content"], "final answer");
-        assert_eq!(requests[0].body["allowed_mentions"]["parse"], json!([]));
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, "/channels/200/messages");
+        assert_eq!(requests[1].authorization, "Bot test-token");
+        assert_eq!(requests[1].body["content"], "final answer");
+        assert_eq!(requests[1].body["allowed_mentions"]["parse"], json!([]));
+        assert_reaction(&requests[2], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[3], "PUT", SUCCESS_EMOJI);
         assert_eq!(gateway.sessions[&200], "session_1");
     }
 
@@ -1235,7 +1551,7 @@ mod tests {
             "session_existing",
             "next answer",
         );
-        let rest = spawn_fake_rest(1, 200, None);
+        let rest = spawn_fake_rest(4, 200, None);
         let platform = test_platform(&rest.base_url, discord_message(42, 200, "follow up"));
         let mut gateway = test_gateway(&workspace, socket_path, platform);
         gateway.sessions.insert(200, "session_existing".into());
@@ -1247,8 +1563,30 @@ mod tests {
         assert_eq!(append_params["session_id"], "session_existing");
         assert_eq!(append_params["wait"], false);
         let requests = rest.handle.join().unwrap();
-        assert_eq!(requests[0].body["content"], "next answer");
+        assert_eq!(requests[1].body["content"], "next answer");
         assert_eq!(gateway.sessions[&200], "session_existing");
+    }
+
+    #[test]
+    fn catch_up_pages_do_not_burst_typing() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_catch_up_daemon(&socket_path);
+        let rest = spawn_fake_rest(5, 200, None);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "hello"));
+        let mut gateway = test_gateway(&workspace, socket_path, platform);
+
+        gateway.poll_once().unwrap();
+
+        daemon.join().unwrap();
+        let requests = rest.handle.join().unwrap();
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, "/channels/200/typing");
+        assert_eq!(requests[2].body["content"], "caught up");
+        assert_reaction(&requests[3], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[4], "PUT", SUCCESS_EMOJI);
     }
 
     #[test]
@@ -1257,7 +1595,7 @@ mod tests {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("daemon.sock");
         let daemon = spawn_approval_daemon(&socket_path);
-        let rest = spawn_fake_rest(2, 200, None);
+        let rest = spawn_fake_rest(6, 200, None);
         let platform = test_platform(&rest.base_url, discord_message(42, 200, "edit note"));
         let mut gateway = test_gateway(&workspace, socket_path, platform);
 
@@ -1271,17 +1609,43 @@ mod tests {
                 "run.start",
                 "events.stream",
                 "events.stream",
+                "events.stream",
                 "transcript.read"
             ]
         );
         assert!(!methods.contains(&"approval.decide"));
         let requests = rest.handle.join().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 6);
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
         assert_eq!(
-            requests[0].body["content"],
+            requests[1].body["content"],
             "Approval required: `file.write` (workspace_write)\nPreview:\n{\n  \"content\": \"hello\",\n  \"path\": \"note.txt\"\n}\nGrant or deny it locally in `plato-tui`."
         );
-        assert_eq!(requests[1].body["content"], "saved note");
+        assert_eq!(requests[2].method, "POST");
+        assert_eq!(requests[2].path, "/channels/200/typing");
+        assert_eq!(requests[3].body["content"], "saved note");
+        assert_reaction(&requests[4], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[5], "PUT", SUCCESS_EMOJI);
+    }
+
+    #[test]
+    fn request_decision_and_terminal_in_one_page_do_not_emit_stale_effects() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_folded_terminal_daemon(&socket_path);
+        let rest = spawn_fake_rest(4, 200, None);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "edit note"));
+        let mut gateway = test_gateway(&workspace, socket_path, platform);
+
+        gateway.poll_once().unwrap();
+
+        daemon.join().unwrap();
+        let requests = rest.handle.join().unwrap();
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert_eq!(requests[1].body["content"], "saved without stale effects");
+        assert_reaction(&requests[2], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[3], "PUT", SUCCESS_EMOJI);
     }
 
     #[test]
@@ -1290,7 +1654,7 @@ mod tests {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("daemon.sock");
         let daemon = spawn_failed_daemon(&socket_path);
-        let rest = spawn_fake_rest(1, 200, None);
+        let rest = spawn_fake_rest(4, 200, None);
         let platform = test_platform(&rest.base_url, discord_message(42, 200, "fail"));
         let mut gateway = test_gateway(&workspace, socket_path, platform);
 
@@ -1298,14 +1662,17 @@ mod tests {
 
         daemon.join().unwrap();
         let requests = rest.handle.join().unwrap();
-        assert_eq!(requests[0].body["content"], RUN_FAILED_MESSAGE);
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert_eq!(requests[1].body["content"], RUN_FAILED_MESSAGE);
+        assert_reaction(&requests[2], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[3], "PUT", FAILURE_EMOJI);
     }
 
     #[test]
     fn approval_fold_suppresses_resolved_requests_and_bounds_unicode_preview() {
         let mut approvals = ApprovalNotifications::default();
         let long_preview = "界".repeat(DISCORD_MESSAGE_LIMIT);
-        approvals.fold(&[
+        let _ = approvals.fold(&[
             json!({
                 "event": {
                     "kind": "approval_requested",
@@ -1330,7 +1697,7 @@ mod tests {
 
         assert_eq!(approvals.take_notification(), None);
 
-        approvals.fold(&[json!({
+        let _ = approvals.fold(&[json!({
             "event": {
                 "kind": "approval_requested",
                 "tool_call_id": "call_2",
@@ -1348,7 +1715,7 @@ mod tests {
     #[test]
     fn approval_fold_suppresses_a_request_canceled_while_status_is_running() {
         let mut approvals = ApprovalNotifications::default();
-        approvals.fold(&[
+        let canceled = approvals.fold(&[
             json!({
                 "event": {
                     "kind": "approval_requested",
@@ -1367,6 +1734,48 @@ mod tests {
         ]);
 
         assert_eq!(approvals.take_notification(), None);
+        assert!(canceled);
+    }
+
+    #[test]
+    fn typing_deadline_is_immediate_bounded_and_resumes_immediately() {
+        let now = Instant::now();
+        let mut presentation = MessagePresentation::new(200, 300);
+
+        assert!(presentation.typing_due(false, now));
+        assert!(!presentation.typing_due(false, now + TYPING_INTERVAL - Duration::from_millis(1)));
+        assert!(presentation.typing_due(false, now + TYPING_INTERVAL));
+        assert!(!presentation.typing_due(true, now + TYPING_INTERVAL));
+        assert!(presentation.typing_due(false, now + TYPING_INTERVAL));
+    }
+
+    #[test]
+    fn approval_fold_normalizes_transient_and_durable_call_ids() {
+        let mut approvals = ApprovalNotifications::default();
+        let _ = approvals.fold(&[json!({
+            "event": {
+                "kind": "approval_requested",
+                "tool_call_id": "call_1",
+                "tool_name": "file.write",
+                "effect": "workspace_write",
+                "approval_preview": "write note.txt"
+            }
+        })]);
+        let _ = approvals.fold(&[json!({
+            "event": {
+                "kind": "ledger",
+                "record": {"event": {"event": "approval_denied", "call_id": "call_2"}}
+            }
+        })]);
+        assert!(approvals.pending.is_some());
+
+        let _ = approvals.fold(&[json!({
+            "event": {
+                "kind": "ledger",
+                "record": {"event": {"event": "approval_granted", "call_id": "call_1"}}
+            }
+        })]);
+        assert!(approvals.pending.is_none());
     }
 
     #[test]
@@ -1388,12 +1797,283 @@ mod tests {
     }
 
     #[test]
+    fn canceled_and_interrupted_runs_only_remove_eyes() {
+        for status in [RunStateName::Canceled, RunStateName::Interrupted] {
+            let workspace = tempfile::tempdir().unwrap();
+            let socket_dir = tempfile::tempdir().unwrap();
+            let socket_path = socket_dir.path().join("daemon.sock");
+            let daemon = spawn_status_daemon(&socket_path, vec![status]);
+            let rest = spawn_fake_rest(2, 200, None);
+            let platform = test_platform(&rest.base_url, discord_message(42, 200, "stop"));
+            let mut gateway = test_gateway(&workspace, socket_path, platform);
+
+            gateway.poll_once().unwrap();
+
+            daemon.join().unwrap();
+            let requests = rest.handle.join().unwrap();
+            assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+            assert_reaction(&requests[1], "DELETE", EYES_EMOJI);
+        }
+    }
+
+    #[test]
+    fn cancel_requested_stops_typing_without_changing_reactions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_status_daemon(
+            &socket_path,
+            vec![RunStateName::CancelRequested, RunStateName::Canceled],
+        );
+        let rest = spawn_fake_rest(2, 200, None);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "stop"));
+        let mut gateway = test_gateway(&workspace, socket_path, platform);
+
+        gateway.poll_once().unwrap();
+
+        daemon.join().unwrap();
+        let requests = rest.handle.join().unwrap();
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert_reaction(&requests[1], "DELETE", EYES_EMOJI);
+    }
+
+    #[test]
+    fn canceled_event_keeps_running_status_quiet_until_terminal() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_canceled_event_daemon(&socket_path);
+        let rest = spawn_fake_rest(2, 200, None);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "stop"));
+        let mut gateway = test_gateway(&workspace, socket_path, platform);
+
+        gateway.poll_once().unwrap();
+
+        daemon.join().unwrap();
+        let requests = rest.handle.join().unwrap();
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert_reaction(&requests[1], "DELETE", EYES_EMOJI);
+    }
+
+    #[test]
+    fn outer_daemon_failure_attempts_reaction_cleanup_then_propagates() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let rest = spawn_fake_rest(3, 200, None);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "hello"));
+        let mut gateway =
+            test_gateway(&workspace, socket_dir.path().join("missing.sock"), platform);
+
+        let error = gateway.poll_once().unwrap_err();
+
+        assert!(matches!(error, AppError::Io(_)));
+        let requests = rest.handle.join().unwrap();
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert_reaction(&requests[1], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[2], "PUT", FAILURE_EMOJI);
+    }
+
+    #[test]
+    fn product_message_failure_attempts_cleanup_then_propagates() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_finished_daemon(&socket_path, "run.start", "session_1", "answer");
+        let rest = spawn_scripted_rest(vec![
+            FakeResponse {
+                status: 200,
+                body: json!({}),
+                headers: Vec::new(),
+            },
+            FakeResponse {
+                status: 500,
+                body: json!({}),
+                headers: Vec::new(),
+            },
+            FakeResponse {
+                status: 200,
+                body: json!({}),
+                headers: Vec::new(),
+            },
+            FakeResponse {
+                status: 200,
+                body: json!({}),
+                headers: Vec::new(),
+            },
+        ]);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "hello"));
+        let mut gateway = test_gateway(&workspace, socket_path, platform);
+
+        let error = gateway.poll_once().unwrap_err();
+
+        assert!(error.to_string().contains("message send returned HTTP 500"));
+        daemon.join().unwrap();
+        let requests = rest.handle.join().unwrap();
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert_eq!(requests[1].path, "/channels/200/messages");
+        assert_reaction(&requests[2], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[3], "PUT", FAILURE_EMOJI);
+    }
+
+    #[test]
+    fn scoped_rate_limit_drops_presentation_while_product_messages_flow() {
+        let rest = spawn_scripted_rest(vec![
+            FakeResponse {
+                status: 429,
+                body: json!({"retry_after": 1336.57, "global": false}),
+                headers: vec![("Retry-After", "2")],
+            },
+            FakeResponse {
+                status: 200,
+                body: json!({"id": "message_1"}),
+                headers: Vec::new(),
+            },
+        ]);
+        let client = DiscordRestClient::new(&rest.base_url, "test-token".into());
+
+        client
+            .reaction(200, 300, EYES_EMOJI, ReactionAction::Add)
+            .unwrap_err();
+        client.trigger_typing(200).unwrap();
+        client.send_message(200, "still delivered").unwrap();
+
+        let limits = client.rate_limits.get();
+        assert!(
+            limits.presentation_not_before.unwrap() > Instant::now() + Duration::from_secs(1_300)
+        );
+        assert!(limits.global_not_before.is_none());
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert_eq!(requests[1].path, "/channels/200/messages");
+    }
+
+    #[test]
+    fn presentation_endpoints_accept_empty_no_content_responses() {
+        let rest = spawn_scripted_rest(
+            (0..3)
+                .map(|_| FakeResponse {
+                    status: 204,
+                    body: Value::Null,
+                    headers: Vec::new(),
+                })
+                .collect(),
+        );
+        let client = DiscordRestClient::new(&rest.base_url, "test-token".into());
+
+        client
+            .reaction(200, 300, EYES_EMOJI, ReactionAction::Add)
+            .unwrap();
+        client.trigger_typing(200).unwrap();
+        client
+            .reaction(200, 300, EYES_EMOJI, ReactionAction::Remove)
+            .unwrap();
+
+        let requests = rest.handle.join().unwrap();
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, "/channels/200/typing");
+        assert_reaction(&requests[2], "DELETE", EYES_EMOJI);
+    }
+
+    #[test]
+    fn presentation_timeout_is_bounded_to_one_attempt() {
+        let rest = spawn_stalled_rest(Duration::from_secs(3));
+        let client = DiscordRestClient::new(&rest.base_url, "test-token".into());
+        let started = Instant::now();
+
+        let error = client.trigger_typing(200).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(error.to_string().contains("typing transport failed"));
+        assert!(elapsed >= Duration::from_secs(1));
+        assert!(elapsed < Duration::from_millis(2_500));
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/channels/200/typing");
+    }
+
+    #[test]
+    fn global_rate_limit_blocks_due_product_message_without_sending() {
+        let rest = spawn_scripted_rest(vec![FakeResponse {
+            status: 429,
+            body: json!({"retry_after": 1336.57, "global": true}),
+            headers: vec![("X-RateLimit-Scope", "global")],
+        }]);
+        let client = DiscordRestClient::new(&rest.base_url, "test-token".into());
+
+        client
+            .reaction(200, 300, EYES_EMOJI, ReactionAction::Add)
+            .unwrap_err();
+        let error = client.send_message(200, "not sent").unwrap_err();
+
+        assert!(error.to_string().contains("globally rate limited"));
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+    }
+
+    #[test]
+    fn header_only_global_rate_limit_is_honored() {
+        let rest = spawn_scripted_rest(vec![FakeResponse {
+            status: 429,
+            body: json!({}),
+            headers: vec![("Retry-After", "90"), ("X-RateLimit-Global", "true")],
+        }]);
+        let client = DiscordRestClient::new(&rest.base_url, "test-token".into());
+
+        client.trigger_typing(200).unwrap_err();
+
+        let limits = client.rate_limits.get();
+        assert!(limits.global_not_before.unwrap() > Instant::now() + Duration::from_secs(89));
+        assert!(client.send_message(200, "not sent").is_err());
+        assert_eq!(rest.handle.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn product_global_rate_limit_blocks_the_next_product_message() {
+        let rest = spawn_scripted_rest(vec![FakeResponse {
+            status: 429,
+            body: json!({"retry_after": 90.0, "global": true}),
+            headers: Vec::new(),
+        }]);
+        let client = DiscordRestClient::new(&rest.base_url, "test-token".into());
+
+        assert!(client.send_message(200, "first").is_err());
+        let error = client.send_message(200, "second").unwrap_err();
+
+        assert!(error.to_string().contains("globally rate limited"));
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, "/channels/200/messages");
+    }
+
+    #[test]
+    fn rate_limit_deadlines_use_the_full_duration_and_expire_at_the_boundary() {
+        let now = Instant::now();
+        let mut limits = DiscordRateLimits::default();
+        limits.record(
+            RestClass::Presentation,
+            false,
+            Duration::from_secs_f64(1336.57),
+            now,
+        );
+        assert!(!limits.presentation_allowed(now + Duration::from_secs(1_336)));
+        assert!(limits.product_allowed(now + Duration::from_secs(1_336)));
+        assert!(limits.presentation_allowed(now + Duration::from_secs_f64(1336.57)));
+
+        limits.record(RestClass::Presentation, true, Duration::from_secs(2), now);
+        assert!(!limits.product_allowed(now + Duration::from_secs(1)));
+        assert!(limits.product_allowed(now + Duration::from_secs(2)));
+    }
+
+    #[test]
     fn reconnect_reads_exact_run_when_the_session_has_advanced() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("daemon.sock");
         let daemon = spawn_advanced_session_daemon(&socket_path, "recovered answer");
-        let rest = spawn_fake_rest(1, 200, None);
+        let rest = spawn_fake_rest(4, 200, None);
         let platform = test_platform(&rest.base_url, discord_message(42, 200, "hello"));
         let mut gateway = test_gateway(&workspace, socket_path, platform);
 
@@ -1401,7 +2081,34 @@ mod tests {
 
         daemon.join().unwrap();
         let requests = rest.handle.join().unwrap();
-        assert_eq!(requests[0].body["content"], "recovered answer");
+        assert_eq!(requests[1].body["content"], "recovered answer");
+    }
+
+    #[test]
+    fn reconnect_clears_pending_pause_and_resumes_typing() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_reconnecting_pending_daemon(&socket_path);
+        let rest = spawn_fake_rest(6, 200, None);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "hello"));
+        let mut gateway = test_gateway(&workspace, socket_path, platform);
+
+        gateway.poll_once().unwrap();
+
+        daemon.join().unwrap();
+        let requests = rest.handle.join().unwrap();
+        assert_reaction(&requests[0], "PUT", EYES_EMOJI);
+        assert!(
+            requests[1].body["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("Approval required:")
+        );
+        assert_eq!(requests[2].path, "/channels/200/typing");
+        assert_eq!(requests[3].body["content"], "answer after reconnect");
+        assert_reaction(&requests[4], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[5], "PUT", SUCCESS_EMOJI);
     }
 
     #[test]
@@ -1410,7 +2117,7 @@ mod tests {
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("daemon.sock");
         let daemon = spawn_lagged_daemon(&socket_path, "answer after lag");
-        let rest = spawn_fake_rest(1, 200, None);
+        let rest = spawn_fake_rest(6, 200, None);
         let platform = test_platform(&rest.base_url, discord_message(42, 200, "hello"));
         let mut gateway = test_gateway(&workspace, socket_path, platform);
 
@@ -1418,7 +2125,14 @@ mod tests {
 
         daemon.join().unwrap();
         let requests = rest.handle.join().unwrap();
-        assert_eq!(requests[0].body["content"], "answer after lag");
+        assert_eq!(
+            requests[1].body["content"],
+            "Approval required: `file.write` (workspace_write)\nPreview:\nwrite note.txt\nGrant or deny it locally in `plato-tui`."
+        );
+        assert_eq!(requests[2].path, "/channels/200/typing");
+        assert_eq!(requests[3].body["content"], "answer after lag");
+        assert_reaction(&requests[4], "DELETE", EYES_EMOJI);
+        assert_reaction(&requests[5], "PUT", SUCCESS_EMOJI);
     }
 
     #[test]
@@ -1471,6 +2185,7 @@ mod tests {
                     "s": 2,
                     "t": "MESSAGE_CREATE",
                     "d": {
+                        "id": "300",
                         "channel_id": "200",
                         "author": {"id": "42", "bot": false},
                         "content": "hello"
@@ -1512,10 +2227,26 @@ mod tests {
 
     fn discord_message(author_id: u64, channel_id: u64, content: &str) -> DiscordMessage {
         DiscordMessage {
+            id: 300,
             channel_id,
             author_id,
             content: content.into(),
         }
+    }
+
+    fn assert_reaction(request: &HttpRequest, method: &str, emoji: &str) {
+        let emoji = match emoji {
+            EYES_EMOJI => "%F0%9F%91%80",
+            SUCCESS_EMOJI => "%E2%9C%85",
+            FAILURE_EMOJI => "%E2%9D%8C",
+            _ => panic!("unexpected test emoji"),
+        };
+        assert_eq!(request.method, method);
+        assert_eq!(
+            request.path,
+            format!("/channels/200/messages/300/reactions/{emoji}/@me")
+        );
+        assert_eq!(request.authorization, "Bot test-token");
     }
 
     fn test_platform(api_base: &str, message: DiscordMessage) -> DiscordPlatform {
@@ -1546,7 +2277,14 @@ mod tests {
         handle: thread::JoinHandle<Vec<HttpRequest>>,
     }
 
+    struct FakeResponse {
+        status: u16,
+        body: Value,
+        headers: Vec<(&'static str, &'static str)>,
+    }
+
     struct HttpRequest {
+        method: String,
         path: String,
         authorization: String,
         body: Value,
@@ -1587,6 +2325,49 @@ mod tests {
         FakeRest { base_url, handle }
     }
 
+    fn spawn_scripted_rest(responses: Vec<FakeResponse>) -> FakeRest {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "discord REST request timed out");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("discord REST accept failed: {error}"),
+                    }
+                };
+                requests.push(read_http_request(&mut stream));
+                write_http_response_with_headers(
+                    &mut stream,
+                    response.status,
+                    &response.body,
+                    &response.headers,
+                );
+            }
+            requests
+        });
+        FakeRest { base_url, handle }
+    }
+
+    fn spawn_stalled_rest(delay: Duration) -> FakeRest {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            thread::sleep(delay);
+            vec![request]
+        });
+        FakeRest { base_url, handle }
+    }
+
     fn read_http_request(stream: &mut TcpStream) -> HttpRequest {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1594,7 +2375,9 @@ mod tests {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut request_line = String::new();
         reader.read_line(&mut request_line).unwrap();
-        let path = request_line.split_whitespace().nth(1).unwrap().to_owned();
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts.next().unwrap().to_owned();
+        let path = request_parts.next().unwrap().to_owned();
         let mut content_length = 0;
         let mut authorization = String::new();
         loop {
@@ -1613,6 +2396,7 @@ mod tests {
         let mut body = vec![0; content_length];
         reader.read_exact(&mut body).unwrap();
         HttpRequest {
+            method,
             path,
             authorization,
             body: if body.is_empty() {
@@ -1624,11 +2408,33 @@ mod tests {
     }
 
     fn write_http_response(stream: &mut TcpStream, status: u16, body: &Value) {
-        let body = serde_json::to_vec(body).unwrap();
-        let reason = if status == 200 { "OK" } else { "Unauthorized" };
+        write_http_response_with_headers(stream, status, body, &[]);
+    }
+
+    fn write_http_response_with_headers(
+        stream: &mut TcpStream,
+        status: u16,
+        body: &Value,
+        headers: &[(&str, &str)],
+    ) {
+        let body = if status == 204 {
+            Vec::new()
+        } else {
+            serde_json::to_vec(body).unwrap()
+        };
+        let reason = match status {
+            200 => "OK",
+            204 => "No Content",
+            429 => "Too Many Requests",
+            _ => "Error",
+        };
+        let headers = headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
         write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
         )
         .unwrap();
@@ -1722,6 +2528,127 @@ mod tests {
         })
     }
 
+    fn spawn_catch_up_daemon(socket_path: &Path) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            respond_hello(&mut reader, &mut writer);
+            let start = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                start.id,
+                "run.start",
+                json!({
+                    "run_id": "run_1",
+                    "session_id": "session_1",
+                    "ledger_path": "/tmp/agent.db",
+                    "status": "running",
+                    "final_answer": null
+                }),
+            );
+
+            let catch_up = read_daemon_request(&mut reader);
+            let mut events = vec![json!({
+                "offset": 0,
+                "event": {
+                    "kind": "approval_requested",
+                    "tool_call_id": "call_1",
+                    "tool_name": "file.write",
+                    "effect": "workspace_write",
+                    "approval_preview": "write note.txt"
+                }
+            })];
+            events.extend(
+                (1..EVENT_PAGE_LIMIT)
+                    .map(|offset| json!({"offset": offset, "event": {"kind": "delta"}})),
+            );
+            write_daemon_response(
+                &mut writer,
+                catch_up.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 0,
+                    "next_offset": EVENT_PAGE_LIMIT,
+                    "status": "running",
+                    "events": events
+                }),
+            );
+
+            let resolution = read_daemon_request(&mut reader);
+            let mut events = vec![json!({
+                "offset": EVENT_PAGE_LIMIT,
+                "event": {
+                    "kind": "ledger",
+                    "record": {
+                        "event": {"event": "approval_granted", "call_id": "call_1"}
+                    }
+                }
+            })];
+            events.extend((1..EVENT_PAGE_LIMIT).map(|offset| {
+                json!({
+                    "offset": EVENT_PAGE_LIMIT + offset,
+                    "event": {"kind": "delta"}
+                })
+            }));
+            write_daemon_response(
+                &mut writer,
+                resolution.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": EVENT_PAGE_LIMIT,
+                    "next_offset": EVENT_PAGE_LIMIT * 2,
+                    "status": "running",
+                    "events": events
+                }),
+            );
+
+            let running = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                running.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": EVENT_PAGE_LIMIT * 2,
+                    "next_offset": EVENT_PAGE_LIMIT * 2,
+                    "status": "running",
+                    "events": []
+                }),
+            );
+
+            let finished = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                finished.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": EVENT_PAGE_LIMIT * 2,
+                    "next_offset": EVENT_PAGE_LIMIT * 2,
+                    "status": "finished",
+                    "events": []
+                }),
+            );
+
+            let transcript = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                transcript.id,
+                "transcript.read",
+                json!({
+                    "run_id": "run_1",
+                    "status": "finished",
+                    "final_answer": "caught up",
+                    "transcript": "not parsed"
+                }),
+            );
+        })
+    }
+
     fn spawn_approval_daemon(socket_path: &Path) -> thread::JoinHandle<Vec<&'static str>> {
         let listener = UnixListener::bind(socket_path).unwrap();
         thread::spawn(move || {
@@ -1794,18 +2721,18 @@ mod tests {
                 }),
             );
 
-            let finished = read_daemon_request(&mut reader);
-            assert_eq!(finished.method.as_deref(), Some("events.stream"));
+            let resolved = read_daemon_request(&mut reader);
+            assert_eq!(resolved.method.as_deref(), Some("events.stream"));
             methods.push("events.stream");
             write_daemon_response(
                 &mut writer,
-                finished.id,
+                resolved.id,
                 "events.stream",
                 json!({
                     "run_id": "run_1",
                     "from_offset": 2,
                     "next_offset": 3,
-                    "status": "finished",
+                    "status": "running",
                     "events": [{
                         "offset": 2,
                         "event": {
@@ -1818,6 +2745,22 @@ mod tests {
                             }
                         }
                     }]
+                }),
+            );
+
+            let finished = read_daemon_request(&mut reader);
+            assert_eq!(finished.method.as_deref(), Some("events.stream"));
+            methods.push("events.stream");
+            write_daemon_response(
+                &mut writer,
+                finished.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 3,
+                    "next_offset": 3,
+                    "status": "finished",
+                    "events": []
                 }),
             );
 
@@ -1837,6 +2780,77 @@ mod tests {
                 }),
             );
             methods
+        })
+    }
+
+    fn spawn_folded_terminal_daemon(socket_path: &Path) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            respond_hello(&mut reader, &mut writer);
+            let start = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                start.id,
+                "run.start",
+                json!({
+                    "run_id": "run_1",
+                    "session_id": "session_1",
+                    "ledger_path": "/tmp/agent.db",
+                    "status": "running",
+                    "final_answer": null
+                }),
+            );
+            let events = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                events.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 0,
+                    "next_offset": 2,
+                    "status": "finished",
+                    "events": [
+                        {
+                            "offset": 0,
+                            "event": {
+                                "kind": "approval_requested",
+                                "tool_call_id": "call_1",
+                                "tool_name": "file.write",
+                                "effect": "workspace_write",
+                                "approval_preview": "write note.txt"
+                            }
+                        },
+                        {
+                            "offset": 1,
+                            "event": {
+                                "kind": "ledger",
+                                "record": {
+                                    "event": {
+                                        "event": "approval_granted",
+                                        "call_id": "call_1"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }),
+            );
+            let transcript = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                transcript.id,
+                "transcript.read",
+                json!({
+                    "run_id": "run_1",
+                    "status": "finished",
+                    "final_answer": "saved without stale effects",
+                    "transcript": "not parsed"
+                }),
+            );
         })
     }
 
@@ -1884,6 +2898,133 @@ mod tests {
                     "status": "failed",
                     "final_answer": null,
                     "transcript": "run_failed"
+                }),
+            );
+        })
+    }
+
+    fn spawn_status_daemon(
+        socket_path: &Path,
+        statuses: Vec<RunStateName>,
+    ) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        thread::spawn(move || {
+            let terminal_status = *statuses.last().unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            respond_hello(&mut reader, &mut writer);
+            let start = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                start.id,
+                "run.start",
+                json!({
+                    "run_id": "run_1",
+                    "session_id": "session_1",
+                    "ledger_path": "/tmp/agent.db",
+                    "status": "running",
+                    "final_answer": null
+                }),
+            );
+            for status in statuses {
+                let events = read_daemon_request(&mut reader);
+                write_daemon_response(
+                    &mut writer,
+                    events.id,
+                    "events.stream",
+                    json!({
+                        "run_id": "run_1",
+                        "from_offset": 0,
+                        "next_offset": 0,
+                        "status": status.to_string(),
+                        "events": []
+                    }),
+                );
+            }
+            let transcript = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                transcript.id,
+                "transcript.read",
+                json!({
+                    "run_id": "run_1",
+                    "status": terminal_status.to_string(),
+                    "final_answer": null,
+                    "transcript": "not parsed"
+                }),
+            );
+        })
+    }
+
+    fn spawn_canceled_event_daemon(socket_path: &Path) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            respond_hello(&mut reader, &mut writer);
+            let start = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                start.id,
+                "run.start",
+                json!({
+                    "run_id": "run_1",
+                    "session_id": "session_1",
+                    "ledger_path": "/tmp/agent.db",
+                    "status": "running",
+                    "final_answer": null
+                }),
+            );
+            let canceled = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                canceled.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 0,
+                    "next_offset": 2,
+                    "status": "running",
+                    "events": [
+                        {
+                            "offset": 0,
+                            "event": {
+                                "kind": "approval_requested",
+                                "tool_call_id": "call_1",
+                                "tool_name": "file.write",
+                                "effect": "workspace_write",
+                                "approval_preview": "write note.txt"
+                            }
+                        },
+                        {"offset": 1, "event": {"kind": "canceled", "run_id": "run_1"}}
+                    ]
+                }),
+            );
+            let terminal = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                terminal.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 2,
+                    "next_offset": 2,
+                    "status": "canceled",
+                    "events": []
+                }),
+            );
+            let transcript = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                transcript.id,
+                "transcript.read",
+                json!({
+                    "run_id": "run_1",
+                    "status": "canceled",
+                    "final_answer": null,
+                    "transcript": "not parsed"
                 }),
             );
         })
@@ -1955,6 +3096,124 @@ mod tests {
         })
     }
 
+    fn spawn_reconnecting_pending_daemon(socket_path: &Path) -> thread::JoinHandle<()> {
+        let first_listener = UnixListener::bind(socket_path).unwrap();
+        let socket_path = socket_path.to_path_buf();
+        thread::spawn(move || {
+            {
+                let (stream, _) = first_listener.accept().unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                respond_hello(&mut reader, &mut writer);
+                let start = read_daemon_request(&mut reader);
+                write_daemon_response(
+                    &mut writer,
+                    start.id,
+                    "run.start",
+                    json!({
+                        "run_id": "run_1",
+                        "session_id": "session_1",
+                        "ledger_path": "/tmp/agent.db",
+                        "status": "running",
+                        "final_answer": null
+                    }),
+                );
+                let pending = read_daemon_request(&mut reader);
+                write_daemon_response(
+                    &mut writer,
+                    pending.id,
+                    "events.stream",
+                    json!({
+                        "run_id": "run_1",
+                        "from_offset": 0,
+                        "next_offset": 1,
+                        "status": "running",
+                        "events": [{
+                            "offset": 0,
+                            "event": {
+                                "kind": "approval_requested",
+                                "tool_call_id": "call_1",
+                                "tool_name": "file.write",
+                                "effect": "workspace_write",
+                                "approval_preview": "write note.txt"
+                            }
+                        }]
+                    }),
+                );
+                let reconnecting = read_daemon_request(&mut reader);
+                assert_eq!(reconnecting.method.as_deref(), Some("events.stream"));
+            }
+            drop(first_listener);
+            std::fs::remove_file(&socket_path).unwrap();
+            let second_listener = UnixListener::bind(&socket_path).unwrap();
+            let (stream, _) = second_listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            respond_hello(&mut reader, &mut writer);
+            let sessions = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                sessions.id,
+                "sessions.list",
+                json!({
+                    "sessions": [{
+                        "session_id": "session_1",
+                        "run_id": "run_1",
+                        "status": "running",
+                        "latest_question": "hello",
+                        "ledger_path": "/tmp/agent.db"
+                    }]
+                }),
+            );
+            let running = read_daemon_request(&mut reader);
+            assert!(
+                running
+                    .params
+                    .as_ref()
+                    .unwrap()
+                    .get("from_offset")
+                    .is_none()
+            );
+            write_daemon_response(
+                &mut writer,
+                running.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 2,
+                    "next_offset": 2,
+                    "status": "running",
+                    "events": []
+                }),
+            );
+            let finished = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                finished.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 2,
+                    "next_offset": 2,
+                    "status": "finished",
+                    "events": []
+                }),
+            );
+            let transcript = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                transcript.id,
+                "transcript.read",
+                json!({
+                    "run_id": "run_1",
+                    "status": "finished",
+                    "final_answer": "answer after reconnect",
+                    "transcript": "not parsed"
+                }),
+            );
+        })
+    }
+
     fn spawn_lagged_daemon(socket_path: &Path, answer: &str) -> thread::JoinHandle<()> {
         let listener = UnixListener::bind(socket_path).unwrap();
         let answer = answer.to_owned();
@@ -1977,8 +3236,31 @@ mod tests {
                     "final_answer": null
                 }),
             );
+            let pending = read_daemon_request(&mut reader);
+            assert_eq!(pending.params.as_ref().unwrap()["from_offset"], 0);
+            write_daemon_response(
+                &mut writer,
+                pending.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 0,
+                    "next_offset": 1,
+                    "status": "running",
+                    "events": [{
+                        "offset": 0,
+                        "event": {
+                            "kind": "approval_requested",
+                            "tool_call_id": "call_1",
+                            "tool_name": "file.write",
+                            "effect": "workspace_write",
+                            "approval_preview": "write note.txt"
+                        }
+                    }]
+                }),
+            );
             let lagged = read_daemon_request(&mut reader);
-            assert_eq!(lagged.params.as_ref().unwrap()["from_offset"], 0);
+            assert_eq!(lagged.params.as_ref().unwrap()["from_offset"], 1);
             write_daemon_error(&mut writer, lagged.id, "events.stream", "lagged");
             let resumed = read_daemon_request(&mut reader);
             assert!(
@@ -1992,6 +3274,19 @@ mod tests {
             write_daemon_response(
                 &mut writer,
                 resumed.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 3,
+                    "next_offset": 3,
+                    "status": "running",
+                    "events": []
+                }),
+            );
+            let finished = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                finished.id,
                 "events.stream",
                 json!({
                     "run_id": "run_1",
