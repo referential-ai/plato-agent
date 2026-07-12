@@ -780,7 +780,7 @@ mod tests {
         path::Path,
         time::Instant,
     };
-    use tungstenite::accept;
+    use tungstenite::{accept, error::ProtocolError};
 
     #[test]
     fn gateway_environment_rejects_provider_credentials() {
@@ -925,7 +925,8 @@ mod tests {
                 &mut socket,
                 json!({"op": 10, "d": {"heartbeat_interval": 20}}),
             );
-            let identify = read_websocket_json(&mut socket);
+            let identify =
+                read_websocket_json(&mut socket).expect("client disconnected before identifying");
             assert_eq!(identify["op"], 2);
             assert_eq!(identify["d"]["token"], "test-token");
             assert_eq!(identify["d"]["intents"], DISCORD_INTENTS);
@@ -956,7 +957,9 @@ mod tests {
             );
             let deadline = Instant::now() + Duration::from_secs(1);
             while Instant::now() < deadline {
-                let payload = read_websocket_json(&mut socket);
+                let Some(payload) = read_websocket_json(&mut socket) else {
+                    return;
+                };
                 if payload["op"] == 1 {
                     send_websocket_json(&mut socket, json!({"op": 11, "d": null}));
                     if payload["d"] == 2 {
@@ -1110,12 +1113,21 @@ mod tests {
         stream.write_all(&body).unwrap();
     }
 
-    fn read_websocket_json(socket: &mut WebSocket<TcpStream>) -> Value {
+    fn read_websocket_json(socket: &mut WebSocket<TcpStream>) -> Option<Value> {
         loop {
-            match socket.read().unwrap() {
-                Message::Text(text) => return serde_json::from_str(&text).unwrap(),
-                Message::Ping(payload) => socket.send(Message::Pong(payload)).unwrap(),
-                _ => {}
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    return Some(serde_json::from_str(&text).unwrap());
+                }
+                Ok(Message::Ping(payload)) => socket.send(Message::Pong(payload)).unwrap(),
+                Ok(Message::Close(_))
+                | Err(tungstenite::Error::ConnectionClosed)
+                | Err(tungstenite::Error::AlreadyClosed)
+                | Err(tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake)) => {
+                    return None;
+                }
+                Ok(_) => {}
+                Err(error) => panic!("fake websocket read failed: {error}"),
             }
         }
     }
