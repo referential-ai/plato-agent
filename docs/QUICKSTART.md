@@ -107,6 +107,12 @@ plato-tui --workspace "$PWD" --config plato.toml      # terminal B
 Ctrl-C on the daemon shuts down cleanly (socket and lock removed).
 Quitting a manually attached TUI never stops the daemon.
 
+When `plato-gateway-discord` reaches an approval-required tool, Discord gets one
+bounded notification with the tool, effect, and preview. Grant or deny it
+locally in `plato-tui`; the gateway never sends approval decisions. Failed runs
+post `Run failed. Inspect it locally with: plato replay`. Canceled and
+interrupted runs do not post terminal messages.
+
 ## 5. Run the test suite (no API key needed)
 
 ```bash

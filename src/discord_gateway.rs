@@ -32,6 +32,8 @@ const GATEWAY_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const GATEWAY_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const EVENT_PAGE_LIMIT: usize = 64;
 const EVENT_POLL_DELAY: Duration = Duration::from_millis(100);
+const APPROVAL_FIELD_LIMIT: usize = 80;
+const RUN_FAILED_MESSAGE: &str = "Run failed. Inspect it locally with: plato replay";
 const RECONNECT_ATTEMPTS: usize = 40;
 const RECONNECT_DELAY: Duration = Duration::from_millis(50);
 const REQUIRED_CAPABILITIES: [&str; 6] = [
@@ -158,42 +160,72 @@ impl DiscordGateway {
             None => daemon.run_start(text, self.config_path.clone(), false),
         }?;
         self.sessions.insert(channel_id, run.session_id.clone());
-        let answer = self.wait_for_run(&mut daemon, &run.run_id, &run.session_id)?;
-        self.platform.send_message(channel_id, &answer)
+        let terminal = self.wait_for_run(&mut daemon, channel_id, &run.run_id)?;
+        if let Some(message) = terminal_message(terminal)? {
+            self.platform.send_message(channel_id, &message)?;
+        }
+        Ok(())
     }
 
     fn wait_for_run(
         &self,
         daemon: &mut DaemonClient,
+        channel_id: u64,
         run_id: &str,
-        session_id: &str,
-    ) -> AppResult<String> {
+    ) -> AppResult<TranscriptReadResult> {
         let mut next_offset = Some(0);
+        let mut approvals = ApprovalNotifications::default();
         loop {
             match daemon.events_stream(run_id, next_offset, EVENT_PAGE_LIMIT) {
                 Ok(events) => {
                     next_offset = Some(events.next_offset);
-                    if events.status != RunStateName::Running {
-                        return self.read_terminal_answer(daemon, session_id);
+                    let needs_catch_up = events.events.len() == EVENT_PAGE_LIMIT
+                        && events.next_offset > events.from_offset;
+                    approvals.fold(&events.events);
+                    if needs_catch_up {
+                        continue;
                     }
-                    if events.events.is_empty() {
-                        thread::sleep(self.event_poll_delay);
+                    match events.status {
+                        RunStateName::Running | RunStateName::CancelRequested => {
+                            if let Some(message) = approvals.take_notification() {
+                                self.platform.send_message(channel_id, &message)?;
+                            }
+                            if events.events.is_empty() {
+                                thread::sleep(self.event_poll_delay);
+                            }
+                        }
+                        RunStateName::Finished
+                        | RunStateName::Failed
+                        | RunStateName::Canceled
+                        | RunStateName::Interrupted => {
+                            return self.read_terminal_run(daemon, run_id);
+                        }
                     }
                 }
                 Err(AppError::DaemonResponse(error)) if error.code == "lagged" => {
                     next_offset = None;
+                    approvals.clear();
                 }
                 Err(error) if reconnectable(&error) => {
                     *daemon = self.reconnect_daemon()?;
-                    let session = daemon
+                    approvals.clear();
+                    let status = daemon
                         .sessions_list()?
                         .into_iter()
-                        .find(|session| session.session_id == session_id)
-                        .ok_or_else(|| AppError::SessionNotFound(session_id.into()))?;
-                    if session.status != RunStateName::Running {
-                        return self.read_terminal_answer(daemon, session_id);
+                        .find(|session| session.run_id == run_id)
+                        .map(|session| session.status);
+                    match status {
+                        Some(RunStateName::Running | RunStateName::CancelRequested) => {
+                            next_offset = None;
+                        }
+                        Some(
+                            RunStateName::Finished
+                            | RunStateName::Failed
+                            | RunStateName::Canceled
+                            | RunStateName::Interrupted,
+                        )
+                        | None => return self.read_terminal_run(daemon, run_id),
                     }
-                    next_offset = None;
                 }
                 Err(error) => return Err(error),
             }
@@ -220,16 +252,16 @@ impl DiscordGateway {
         Ok(client)
     }
 
-    fn read_terminal_answer(
+    fn read_terminal_run(
         &self,
         daemon: &mut DaemonClient,
-        session_id: &str,
-    ) -> AppResult<String> {
-        match daemon.transcript_read_session(session_id) {
-            Ok(transcript) => terminal_answer(transcript),
+        run_id: &str,
+    ) -> AppResult<TranscriptReadResult> {
+        match daemon.transcript_read(run_id) {
+            Ok(transcript) => Ok(transcript),
             Err(error) if reconnectable(&error) => {
                 *daemon = self.reconnect_daemon()?;
-                terminal_answer(daemon.transcript_read_session(session_id)?)
+                daemon.transcript_read(run_id)
             }
             Err(error) => Err(error),
         }
@@ -250,14 +282,161 @@ fn require_capabilities(hello: &HelloResult) -> AppResult<()> {
     Ok(())
 }
 
-fn terminal_answer(transcript: TranscriptReadResult) -> AppResult<String> {
-    if let Some(answer) = transcript.final_answer {
-        return Ok(answer);
+fn terminal_message(transcript: TranscriptReadResult) -> AppResult<Option<String>> {
+    match transcript.status {
+        RunStateName::Finished => transcript.final_answer.map(Some).ok_or_else(|| {
+            AppError::RunFailed(format!(
+                "run {} ended with status {} without a final answer",
+                transcript.run_id, transcript.status
+            ))
+        }),
+        RunStateName::Failed => Ok(Some(RUN_FAILED_MESSAGE.into())),
+        RunStateName::Canceled | RunStateName::Interrupted => Ok(None),
+        RunStateName::Running | RunStateName::CancelRequested => {
+            Err(AppError::DaemonProtocol(format!(
+                "run {} read back with nonterminal status {}",
+                transcript.run_id, transcript.status
+            )))
+        }
     }
-    Err(AppError::RunFailed(format!(
-        "run {} ended with status {} without a final answer",
-        transcript.run_id, transcript.status
-    )))
+}
+
+#[derive(Default)]
+struct ApprovalNotifications {
+    pending: Option<PendingApprovalNotification>,
+    input_previews: HashMap<String, String>,
+}
+
+struct PendingApprovalNotification {
+    call_id: String,
+    tool_name: String,
+    effect: String,
+    preview: Option<String>,
+    notified: bool,
+}
+
+impl ApprovalNotifications {
+    fn fold(&mut self, entries: &[Value]) {
+        for entry in entries {
+            let event = entry.get("event").unwrap_or(entry);
+            if event.get("kind").and_then(Value::as_str) == Some("canceled") {
+                self.clear();
+                continue;
+            }
+            if let Some((call_id, preview)) = tool_input_preview(event) {
+                self.input_previews.insert(call_id, preview);
+            }
+            if event.get("kind").and_then(Value::as_str) == Some("approval_requested") {
+                let Some(call_id) = event.get("tool_call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                self.pending = Some(PendingApprovalNotification {
+                    call_id: call_id.into(),
+                    tool_name: event
+                        .get("tool_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown tool")
+                        .into(),
+                    effect: event
+                        .get("effect")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown effect")
+                        .into(),
+                    preview: event
+                        .get("diff_preview")
+                        .and_then(non_empty_string)
+                        .or_else(|| event.get("approval_preview").and_then(non_empty_string))
+                        .map(str::to_owned),
+                    notified: false,
+                });
+            }
+            if let Some(call_id) = approval_resolution_call_id(event) {
+                self.input_previews.remove(call_id);
+                if self
+                    .pending
+                    .as_ref()
+                    .map(|pending| pending.call_id.as_str())
+                    == Some(call_id)
+                {
+                    self.pending = None;
+                }
+            }
+        }
+    }
+
+    fn take_notification(&mut self) -> Option<String> {
+        let pending = self.pending.as_mut()?;
+        if pending.notified {
+            return None;
+        }
+        let preview = pending.preview.as_deref().or_else(|| {
+            self.input_previews
+                .get(&pending.call_id)
+                .map(String::as_str)
+        })?;
+        pending.notified = true;
+        Some(approval_notification(
+            &pending.tool_name,
+            &pending.effect,
+            preview,
+        ))
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+        self.input_previews.clear();
+    }
+}
+
+fn non_empty_string(value: &Value) -> Option<&str> {
+    value.as_str().filter(|value| !value.is_empty())
+}
+
+fn tool_input_preview(event: &Value) -> Option<(String, String)> {
+    if event.get("kind").and_then(Value::as_str) != Some("ledger")
+        || event.pointer("/record/event/event").and_then(Value::as_str)
+            != Some("tool_call_proposed")
+    {
+        return None;
+    }
+    let call_id = event.pointer("/record/event/call/id")?.as_str()?.to_owned();
+    let input = event.pointer("/record/event/call/input")?;
+    let preview = serde_json::to_string_pretty(input).ok()?;
+    Some((call_id, preview))
+}
+
+fn approval_resolution_call_id(event: &Value) -> Option<&str> {
+    if event.get("kind").and_then(Value::as_str) != Some("ledger")
+        || !matches!(
+            event.pointer("/record/event/event").and_then(Value::as_str),
+            Some("approval_granted" | "approval_denied")
+        )
+    {
+        return None;
+    }
+    event.pointer("/record/event/call_id")?.as_str()
+}
+
+fn approval_notification(tool_name: &str, effect: &str, preview: &str) -> String {
+    let tool_name = truncate_chars(tool_name, APPROVAL_FIELD_LIMIT);
+    let effect = truncate_chars(effect, APPROVAL_FIELD_LIMIT);
+    let prefix = format!("Approval required: `{tool_name}` ({effect})\nPreview:\n");
+    let suffix = "\nGrant or deny it locally in `plato-tui`.";
+    let preview_limit =
+        DISCORD_MESSAGE_LIMIT.saturating_sub(prefix.chars().count() + suffix.chars().count());
+    format!("{prefix}{}{suffix}", truncate_chars(preview, preview_limit))
+}
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.into();
+    }
+    if limit <= 3 {
+        return ".".repeat(limit);
+    }
+    let mut truncated = value.chars().take(limit - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn reconnectable(error: &AppError) -> bool {
@@ -866,11 +1045,145 @@ mod tests {
     }
 
     #[test]
-    fn daemon_restart_recovers_final_answer_from_typed_transcript() {
+    fn approval_required_run_notifies_once_then_replies_without_deciding() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("daemon.sock");
-        let daemon = spawn_restarting_daemon(&socket_path, "recovered answer");
+        let daemon = spawn_approval_daemon(&socket_path);
+        let rest = spawn_fake_rest(2, 200, None);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "edit note"));
+        let mut gateway = test_gateway(&workspace, socket_path, platform);
+
+        gateway.poll_once().unwrap();
+
+        let methods = daemon.join().unwrap();
+        assert_eq!(
+            methods,
+            [
+                "hello",
+                "run.start",
+                "events.stream",
+                "events.stream",
+                "transcript.read"
+            ]
+        );
+        assert!(!methods.contains(&"approval.decide"));
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].body["content"],
+            "Approval required: `file.write` (workspace_write)\nPreview:\n{\n  \"content\": \"hello\",\n  \"path\": \"note.txt\"\n}\nGrant or deny it locally in `plato-tui`."
+        );
+        assert_eq!(requests[1].body["content"], "saved note");
+    }
+
+    #[test]
+    fn failed_run_sends_canonical_terminal_notification() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_failed_daemon(&socket_path);
+        let rest = spawn_fake_rest(1, 200, None);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, "fail"));
+        let mut gateway = test_gateway(&workspace, socket_path, platform);
+
+        gateway.poll_once().unwrap();
+
+        daemon.join().unwrap();
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests[0].body["content"], RUN_FAILED_MESSAGE);
+    }
+
+    #[test]
+    fn approval_fold_suppresses_resolved_requests_and_bounds_unicode_preview() {
+        let mut approvals = ApprovalNotifications::default();
+        let long_preview = "界".repeat(DISCORD_MESSAGE_LIMIT);
+        approvals.fold(&[
+            json!({
+                "event": {
+                    "kind": "approval_requested",
+                    "tool_call_id": "call_1",
+                    "tool_name": "file.edit",
+                    "effect": "workspace_write",
+                    "diff_preview": long_preview
+                }
+            }),
+            json!({
+                "event": {
+                    "kind": "ledger",
+                    "record": {
+                        "event": {
+                            "event": "approval_granted",
+                            "call_id": "call_1"
+                        }
+                    }
+                }
+            }),
+        ]);
+
+        assert_eq!(approvals.take_notification(), None);
+
+        approvals.fold(&[json!({
+            "event": {
+                "kind": "approval_requested",
+                "tool_call_id": "call_2",
+                "tool_name": "file.edit",
+                "effect": "workspace_write",
+                "diff_preview": "界".repeat(DISCORD_MESSAGE_LIMIT)
+            }
+        })]);
+        let message = approvals.take_notification().unwrap();
+        assert!(message.chars().count() <= DISCORD_MESSAGE_LIMIT);
+        assert!(message.ends_with("Grant or deny it locally in `plato-tui`."));
+        assert_eq!(approvals.take_notification(), None);
+    }
+
+    #[test]
+    fn approval_fold_suppresses_a_request_canceled_while_status_is_running() {
+        let mut approvals = ApprovalNotifications::default();
+        approvals.fold(&[
+            json!({
+                "event": {
+                    "kind": "approval_requested",
+                    "tool_call_id": "call_1",
+                    "tool_name": "file.write",
+                    "effect": "workspace_write",
+                    "approval_preview": "write note.txt"
+                }
+            }),
+            json!({
+                "event": {
+                    "kind": "canceled",
+                    "run_id": "run_1"
+                }
+            }),
+        ]);
+
+        assert_eq!(approvals.take_notification(), None);
+    }
+
+    #[test]
+    fn canceled_and_interrupted_runs_are_silent() {
+        for status in [RunStateName::Canceled, RunStateName::Interrupted] {
+            assert_eq!(
+                terminal_message(TranscriptReadResult {
+                    run_id: "run_1".into(),
+                    status,
+                    final_answer: None,
+                    transcript: String::new(),
+                })
+                .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_reads_exact_run_when_the_session_has_advanced() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("daemon.sock");
+        let daemon = spawn_advanced_session_daemon(&socket_path, "recovered answer");
         let rest = spawn_fake_rest(1, 200, None);
         let platform = test_platform(&rest.base_url, discord_message(42, 200, "hello"));
         let mut gateway = test_gateway(&workspace, socket_path, platform);
@@ -1183,6 +1496,8 @@ mod tests {
             );
             let transcript = read_daemon_request(&mut reader);
             assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
+            assert_eq!(transcript.params.as_ref().unwrap()["run_id"], "run_1");
+            assert!(transcript.params.as_ref().unwrap()["session_id"].is_null());
             write_daemon_response(
                 &mut writer,
                 transcript.id,
@@ -1198,7 +1513,174 @@ mod tests {
         })
     }
 
-    fn spawn_restarting_daemon(socket_path: &Path, answer: &str) -> thread::JoinHandle<()> {
+    fn spawn_approval_daemon(socket_path: &Path) -> thread::JoinHandle<Vec<&'static str>> {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut methods = Vec::new();
+
+            respond_hello(&mut reader, &mut writer);
+            methods.push("hello");
+
+            let start = read_daemon_request(&mut reader);
+            assert_eq!(start.method.as_deref(), Some("run.start"));
+            methods.push("run.start");
+            write_daemon_response(
+                &mut writer,
+                start.id,
+                "run.start",
+                json!({
+                    "run_id": "run_1",
+                    "session_id": "session_1",
+                    "ledger_path": "/tmp/agent.db",
+                    "status": "running",
+                    "final_answer": null
+                }),
+            );
+
+            let pending = read_daemon_request(&mut reader);
+            assert_eq!(pending.method.as_deref(), Some("events.stream"));
+            methods.push("events.stream");
+            write_daemon_response(
+                &mut writer,
+                pending.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 0,
+                    "next_offset": 2,
+                    "status": "running",
+                    "events": [
+                        {
+                            "offset": 0,
+                            "event": {
+                                "kind": "approval_requested",
+                                "run_id": "run_1",
+                                "tool_call_id": "call_1",
+                                "tool_name": "file.write",
+                                "effect": "workspace_write",
+                                "reason": "approval required"
+                            }
+                        },
+                        {
+                            "offset": 1,
+                            "event": {
+                                "kind": "ledger",
+                                "record": {
+                                    "event": {
+                                        "event": "tool_call_proposed",
+                                        "call": {
+                                            "id": "call_1",
+                                            "tool": "file.write",
+                                            "effect": "workspace_write",
+                                            "input": {"path": "note.txt", "content": "hello"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }),
+            );
+
+            let finished = read_daemon_request(&mut reader);
+            assert_eq!(finished.method.as_deref(), Some("events.stream"));
+            methods.push("events.stream");
+            write_daemon_response(
+                &mut writer,
+                finished.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 2,
+                    "next_offset": 3,
+                    "status": "finished",
+                    "events": [{
+                        "offset": 2,
+                        "event": {
+                            "kind": "ledger",
+                            "record": {
+                                "event": {
+                                    "event": "approval_granted",
+                                    "call_id": "call_1"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            );
+
+            let transcript = read_daemon_request(&mut reader);
+            assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
+            methods.push("transcript.read");
+            assert_eq!(transcript.params.as_ref().unwrap()["run_id"], "run_1");
+            write_daemon_response(
+                &mut writer,
+                transcript.id,
+                "transcript.read",
+                json!({
+                    "run_id": "run_1",
+                    "status": "finished",
+                    "final_answer": "saved note",
+                    "transcript": "not parsed"
+                }),
+            );
+            methods
+        })
+    }
+
+    fn spawn_failed_daemon(socket_path: &Path) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket_path).unwrap();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            respond_hello(&mut reader, &mut writer);
+            let start = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                start.id,
+                "run.start",
+                json!({
+                    "run_id": "run_1",
+                    "session_id": "session_1",
+                    "ledger_path": "/tmp/agent.db",
+                    "status": "running",
+                    "final_answer": null
+                }),
+            );
+            let events = read_daemon_request(&mut reader);
+            write_daemon_response(
+                &mut writer,
+                events.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 0,
+                    "next_offset": 0,
+                    "status": "failed",
+                    "events": []
+                }),
+            );
+            let transcript = read_daemon_request(&mut reader);
+            assert_eq!(transcript.params.as_ref().unwrap()["run_id"], "run_1");
+            write_daemon_response(
+                &mut writer,
+                transcript.id,
+                "transcript.read",
+                json!({
+                    "run_id": "run_1",
+                    "status": "failed",
+                    "final_answer": null,
+                    "transcript": "run_failed"
+                }),
+            );
+        })
+    }
+
+    fn spawn_advanced_session_daemon(socket_path: &Path, answer: &str) -> thread::JoinHandle<()> {
         let first_listener = UnixListener::bind(socket_path).unwrap();
         let socket_path = socket_path.to_path_buf();
         let answer = answer.to_owned();
@@ -1241,9 +1723,9 @@ mod tests {
                 json!({
                     "sessions": [{
                         "session_id": "session_1",
-                        "run_id": "run_1",
-                        "status": "finished",
-                        "latest_question": "hello",
+                        "run_id": "run_2",
+                        "status": "running",
+                        "latest_question": "newer local run",
                         "ledger_path": "/tmp/agent.db"
                     }]
                 }),
