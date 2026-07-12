@@ -3,6 +3,7 @@
 pub mod app;
 pub mod config;
 pub mod daemon;
+pub mod discord_gateway;
 pub mod error;
 pub mod ledger;
 pub mod model;

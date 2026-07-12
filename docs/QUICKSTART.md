@@ -6,7 +6,7 @@ Everything below is copy-pasteable. Companion docs: [`../README.md`](../README.m
 
 ```bash
 cd ~/projects/platonic-workspace/plato-agent
-cargo build --locked                      # builds plato, plato-agentd, plato-tui
+cargo build --locked                      # builds all binaries
 export OPENROUTER_API_KEY="$(cat /path/to/your/openrouter-key)"
 export PATH="$PWD/target/debug:$PATH"     # so the binaries just work in this shell
 ```

@@ -23,6 +23,18 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub limits: LimitsConfig,
     pub tools: ToolsConfig,
+    pub gateway: Option<GatewayConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayConfig {
+    pub discord: DiscordGatewayConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscordGatewayConfig {
+    pub api_key_env: String,
+    pub owner_user_ids: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +73,20 @@ struct RawConfig {
     provider: Option<RawProviderConfig>,
     limits: Option<RawLimitsConfig>,
     tools: Option<RawToolsConfig>,
+    gateway: Option<RawGatewayConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGatewayConfig {
+    discord: RawDiscordGatewayConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDiscordGatewayConfig {
+    api_key_env: String,
+    owner_user_ids: Vec<u64>,
 }
 
 #[derive(Default, Debug, Deserialize)]
@@ -107,6 +133,7 @@ impl Config {
         let provider = raw.provider.unwrap_or_default();
         let limits = raw.limits.unwrap_or_default();
         let tools = raw.tools.unwrap_or_default();
+        let gateway = raw.gateway.map(GatewayConfig::from_raw).transpose()?;
         let token_budget = positive(
             limits.token_budget.unwrap_or(DEFAULT_TOKEN_BUDGET),
             "limits.token_budget",
@@ -159,6 +186,7 @@ impl Config {
                 max_turns,
             },
             tools: ToolsConfig { enabled },
+            gateway,
         })
     }
 }
@@ -184,6 +212,7 @@ impl Default for Config {
             tools: ToolsConfig {
                 enabled: default_enabled_tools(),
             },
+            gateway: None,
         }
     }
 }
@@ -193,6 +222,32 @@ fn positive<T: From<u8> + PartialEq>(value: T, field: &str) -> AppResult<T> {
         return Err(AppError::Config(format!("{field} must be positive")));
     }
     Ok(value)
+}
+
+impl GatewayConfig {
+    fn from_raw(raw: RawGatewayConfig) -> AppResult<Self> {
+        if raw.discord.api_key_env.trim().is_empty() {
+            return Err(AppError::Config(
+                "gateway.discord.api_key_env must not be empty".into(),
+            ));
+        }
+        if raw.discord.owner_user_ids.is_empty() {
+            return Err(AppError::Config(
+                "gateway.discord.owner_user_ids must not be empty".into(),
+            ));
+        }
+        if raw.discord.owner_user_ids.contains(&0) {
+            return Err(AppError::Config(
+                "gateway.discord.owner_user_ids must contain positive integers".into(),
+            ));
+        }
+        Ok(Self {
+            discord: DiscordGatewayConfig {
+                api_key_env: raw.discord.api_key_env,
+                owner_user_ids: raw.discord.owner_user_ids,
+            },
+        })
+    }
 }
 
 fn default_model(kind: &ProviderKind) -> &'static str {
@@ -299,6 +354,7 @@ mod tests {
         assert_eq!(config.provider.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(config.provider.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(config.limits.max_turns, 8);
+        assert!(config.gateway.is_none());
         assert_eq!(
             config.tools.enabled,
             vec![
@@ -312,6 +368,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_discord_gateway_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plato.toml");
+        std::fs::write(
+            &path,
+            r#"
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [123456789]
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_file(&path).unwrap();
+        let discord = config.gateway.unwrap().discord;
+
+        assert_eq!(discord.api_key_env, "DISCORD_BOT_TOKEN");
+        assert_eq!(discord.owner_user_ids, vec![123456789]);
+    }
+
+    #[test]
     fn rejects_zero_token_budget() {
         let raw = RawConfig {
             provider: None,
@@ -321,6 +398,7 @@ mod tests {
                 max_turns: None,
             }),
             tools: None,
+            gateway: None,
         };
 
         assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
@@ -336,6 +414,7 @@ mod tests {
                 max_turns: None,
             }),
             tools: None,
+            gateway: None,
         };
 
         assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
@@ -349,6 +428,7 @@ mod tests {
             tools: Some(RawToolsConfig {
                 enabled: Some(vec!["shell.delete".into()]),
             }),
+            gateway: None,
         };
 
         let err = Config::from_raw(raw).unwrap_err();
@@ -369,6 +449,7 @@ mod tests {
                 max_turns: Some(0),
             }),
             tools: None,
+            gateway: None,
         };
 
         assert!(matches!(Config::from_raw(raw), Err(AppError::Config(_))));
@@ -384,6 +465,7 @@ mod tests {
                 max_turns: Some(3),
             }),
             tools: None,
+            gateway: None,
         };
 
         assert_eq!(Config::from_raw(raw).unwrap().limits.max_turns, 3);
@@ -403,6 +485,7 @@ mod tests {
             }),
             limits: None,
             tools: None,
+            gateway: None,
         };
 
         let config = Config::from_raw(raw).unwrap();

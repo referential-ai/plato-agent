@@ -163,6 +163,33 @@ NDJSON `run.start` and `message.append` default to `wait: false`, returning a
 `running` response immediately. Send `"wait": true` only when the connection can
 block until the run finishes.
 
+## Discord Gateway
+
+`plato-gateway-discord` receives Discord messages over an outbound WebSocket
+and sends replies through Discord's REST API. Add the bot token variable name
+and numeric owner user ids to `plato.toml`:
+
+```toml
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [123456789]
+```
+
+With the workspace daemon already running, start the gateway in an environment
+that contains the bot token but no provider credentials:
+
+```bash
+unset OPENAI_API_KEY OPENROUTER_API_KEY
+export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
+cargo run --bin plato-gateway-discord -- --workspace "$PWD"
+```
+
+Enable the bot's Message Content intent and grant it View Channel and Send
+Messages where it will run. Messages from other user ids are ignored. Each
+allowed channel or DM continues one daemon session; final answers are recovered
+from the ledger after daemon reconnects. Remote approval notifications are not
+part of this binary yet.
+
 ## TUI
 
 `plato --tui` is the interactive local entrypoint. It attaches to the workspace
