@@ -3,7 +3,7 @@ use crate::{
     config::{Config, DiscordGatewayConfig, resolve_config_path},
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
-        protocol::{HelloResult, TranscriptReadResult},
+        protocol::{HelloResult, RunStateName, TranscriptReadResult},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -173,7 +173,7 @@ impl DiscordGateway {
             match daemon.events_stream(run_id, next_offset, EVENT_PAGE_LIMIT) {
                 Ok(events) => {
                     next_offset = Some(events.next_offset);
-                    if events.status != "running" {
+                    if events.status != RunStateName::Running {
                         return self.read_terminal_answer(daemon, session_id);
                     }
                     if events.events.is_empty() {
@@ -190,7 +190,7 @@ impl DiscordGateway {
                         .into_iter()
                         .find(|session| session.session_id == session_id)
                         .ok_or_else(|| AppError::SessionNotFound(session_id.into()))?;
-                    if session.status != "running" {
+                    if session.status != RunStateName::Running {
                         return self.read_terminal_answer(daemon, session_id);
                     }
                     next_offset = None;
