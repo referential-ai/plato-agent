@@ -5,7 +5,7 @@ issue: https://github.com/referential-ai/plato-agent/issues/129
 
 # Gateway In-Channel Presentation (Reactions + Typing)
 
-Revision 4 — addresses lead-lane critical review findings F1–F10 and closure fixes R11–R13 (2026-07-12).
+Revision 5 — addresses findings F1–F10 and closure fixes R11–R13, C1–C3 (2026-07-12).
 
 ## Authority
 - Human direction 2026-07-12: status reactions like Hermes/OpenCode (👀 while reading/thinking); plan and document; lead-lane critical review before finalization.
@@ -25,9 +25,9 @@ Revision 4 — addresses lead-lane critical review findings F1–F10 and closure
 ### Effects model (F5, F6)
 **Classification.** Presentation effects are exactly: reactions and typing. The final-answer reply and terminal notifications are **product messages**, not presentation — their error semantics are unchanged by this design (they propagate per existing gateway flow), and terminal notifications are owned by #102.
 
-All presentation effects execute **serialized on the single gateway loop**, in program order, best-effort: each is a logged-ignored `Result`, **exactly one attempt**, bounded ~1.5s — never retried. On a 429, the effect is dropped **and presentation enters a monotonic not-before gate**: `presentation_not_before = now + retry_after` (capped 60s), during which further presentation calls are dropped and logged — no sleeping, no retrying, product messages unaffected. This honors Discord's rate contract (retry_after is the time before submitting another request to the affected scope; one gateway-wide presentation gate is the smallest rule that cannot re-violate a bucket: https://docs.discord.com/developers/topics/rate-limits). No detached threads or queues — out-of-order effects (late 👀 after a terminal swap, phantom typing) are structurally impossible. Presentation failures never propagate to run flow.
+All presentation effects execute **serialized on the single gateway loop**, in program order, best-effort: each is a logged-ignored `Result`, **exactly one attempt**, bounded ~1.5s — never retried. On a 429, the effect is dropped **and a monotonic not-before gate opens for the full returned `retry_after`** — no cap; Discord documents values well above a minute (official example 1336.57s). Gate scope follows the response: a scoped 429 gates **presentation effects**; a **global** 429 gates **all Discord REST** — while a global gate is open, a due product message fails and **propagates without being sent** (its normal error semantics; never silently dropped, never delayed by sleeping). No sleeping, no retrying in either case. Contract: https://docs.discord.com/developers/topics/rate-limits. No detached threads or queues — out-of-order effects (late 👀 after a terminal swap, phantom typing) are structurally impossible. Presentation failures never propagate to run flow.
 
-**Terminal cleanup rule:** every exit from the message lifecycle **attempts** cleanup (best-effort, subject to the not-before gate; accepted partial failures below): stop-typing-refresh → remove 👀 → add ❌. This includes exits caused by product-message failures (daemon connect/hello, dispatch, poll, readback, reply errors) — cleanup is attempted first, then the error propagates with its existing semantics. Discord has no typing-off call: stopping the refresh lets the indicator decay within its documented ~10s. Run semantics unchanged.
+**Abnormal-exit cleanup rule:** exits caused by **errors outside the typed terminal-status paths** (daemon connect/hello, dispatch, poll, readback, product-message send failures) attempt best-effort cleanup — stop-typing-refresh → remove 👀 → add ❌ — before the error propagates with its existing semantics (subject to the not-before gate; accepted partial failures below). Typed terminal states are **not** cleanup: they follow the exhaustive table exactly (✅ / ❌ / no emoji). Discord has no typing-off call: stopping the refresh lets the indicator decay within its documented ~10s. Run semantics unchanged.
 
 ### Typing (F1)
 Independent monotonic deadline, never tied to poll pages: while status is `Running` and no approval is pending, send trigger-typing when `now ≥ next_typing_at`, then `next_typing_at = now + 8s` (Discord documents ~10s expiry; 2s margin). The **first** send fires immediately on first observing `Running` (and again immediately on resume after an approval decision): `next_typing_at` initializes in the past. Catch-up/backfill pages never burst typing sends. Send timeout (~1.5s) stays well below the 8s interval; a slow send delays polls by at most the timeout — accepted for a single serialized loop.
@@ -78,11 +78,11 @@ Fake-platform tests:
 - Terminal order per status including `Canceled` (remove-👀-only) and `CancelRequested` (typing off, no reaction change).
 - Outer-failure cleanup: an induced daemon error after 👀 attempts stop-refresh + remove 👀 + ❌ before the error propagates, without changing run semantics.
 - Serialized effects: no reaction call observable after the terminal swap for the same message.
-- Rate gate: after an injected 429, presentation calls are dropped until the gate expires; product replies are unaffected during the gate.
+- Rate gate: after an injected scoped 429, presentation calls are dropped for the full `retry_after` while product replies flow; after an injected global 429, a due product message fails and propagates without being sent.
 
 Real-Discord smoke: one run showing 👀 → typing → reply → ✅; one stranger message showing nothing.
 
-Docs: the implementation PR updates README.md/docs/QUICKSTART.md for the user-visible changes (reactions, typing, new failure reply) in the same PR per plato-agent/AGENTS.md — not deferred to the guide card #127.
+Docs: the implementation PR updates README.md/docs/QUICKSTART.md for the user-visible changes (reactions, typing) in the same PR per plato-agent/AGENTS.md — not deferred to the guide card #127. The failure-notification docs belong to #102's PR with its own same-PR requirement.
 
 ## Proof
 `cargo test --locked`; scratch-workspace smoke with reaction readback via REST.
