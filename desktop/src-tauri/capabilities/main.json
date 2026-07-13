@@ -1,11 +1,18 @@
 {
   "identifier": "main",
-  "description": "Typed read-only Plato desktop commands for the main window",
+  "description": "Typed Plato desktop commands for the main window",
   "local": true,
   "windows": ["main"],
   "permissions": [
     "allow-bootstrap",
     "allow-pick-workspace",
-    "allow-read-run"
+    "allow-read-run",
+    "allow-list-sessions",
+    "allow-read-session",
+    "allow-submit-message",
+    "allow-poll-run",
+    "allow-recover-run",
+    "allow-decide-approval",
+    "allow-cancel-run"
   ]
 }

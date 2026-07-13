@@ -1,9 +1,11 @@
 use plato_agent::{
+    AppError,
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
         protocol::{
-            ApprovalDecisionName, HelloResult, RunStateName, SessionSummary, TranscriptReadResult,
-            TypedRun, TypedTranscriptEntry,
+            ApprovalDecisionName, CommandAcceptedResult, EventsStreamResult, HelloResult,
+            PendingApprovalSnapshot, RunStartResult, RunStateName, SessionSummary,
+            TranscriptReadResult, TypedRun, TypedTranscriptEntry,
         },
     },
     paths,
@@ -14,15 +16,54 @@ use std::{fs, io::ErrorKind, path::Path, path::PathBuf};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
-const REQUIRED_CAPABILITIES: [&str; 4] = [
+const REQUIRED_CAPABILITIES: [&str; 10] = [
     "hello",
+    "run.start",
+    "message.append",
+    "events.stream",
+    "approval.decide",
+    "run.cancel",
     "sessions.list",
     "transcript.read",
     "transcript.read.typed",
+    "transcript.read.pending_approval",
 ];
+const EVENT_PAGE_SIZE: usize = 128;
+const INPUT_PREVIEW_MAX_CHARS: usize = 2_000;
 
 struct DesktopState {
     workspace_file: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopError {
+    code: String,
+    message: String,
+}
+
+impl DesktopError {
+    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    fn daemon(context: &str, error: AppError) -> Self {
+        match error {
+            AppError::DaemonResponse(error) => Self::new(error.code, error.message),
+            AppError::DaemonProtocol(message) => {
+                Self::new("incompatible_daemon", format!("{context}: {message}"))
+            }
+            AppError::Json(error) => Self::new(
+                "incompatible_daemon",
+                format!("{context}: invalid daemon response: {error}"),
+            ),
+            AppError::Io(error) => Self::new("daemon_unavailable", format!("{context}: {error}")),
+            error => Self::new("desktop_error", format!("{context}: {error}")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -72,14 +113,31 @@ struct DesktopRun {
     entries: Vec<DesktopEntry>,
 }
 
-impl From<TypedRun> for DesktopRun {
-    fn from(run: TypedRun) -> Self {
-        Self {
+impl TryFrom<TypedRun> for DesktopRun {
+    type Error = DesktopError;
+
+    fn try_from(run: TypedRun) -> Result<Self, Self::Error> {
+        let mut assistant_step = 0_u32;
+        let mut entries = Vec::with_capacity(run.entries.len());
+        for entry in run.entries {
+            let step =
+                matches!(entry, TypedTranscriptEntry::Assistant { .. }).then_some(assistant_step);
+            if step.is_some() {
+                assistant_step = assistant_step.checked_add(1).ok_or_else(|| {
+                    DesktopError::new(
+                        "incompatible_daemon",
+                        "typed transcript contains too many assistant steps",
+                    )
+                })?;
+            }
+            entries.push(DesktopEntry::from_typed(entry, step));
+        }
+        Ok(Self {
             run_id: run.run_id,
             session_index: run.session_index,
             status: run.status,
-            entries: run.entries.into_iter().map(DesktopEntry::from).collect(),
-        }
+            entries,
+        })
     }
 }
 
@@ -94,12 +152,13 @@ enum DesktopEntry {
         text: String,
     },
     Assistant {
+        step: u32,
         text: String,
     },
     ToolCall {
         call_id: String,
         tool: String,
-        input: Value,
+        input_preview: String,
     },
     ToolResult {
         call_id: String,
@@ -121,11 +180,14 @@ enum DesktopEntry {
     },
 }
 
-impl From<TypedTranscriptEntry> for DesktopEntry {
-    fn from(entry: TypedTranscriptEntry) -> Self {
+impl DesktopEntry {
+    fn from_typed(entry: TypedTranscriptEntry, assistant_step: Option<u32>) -> Self {
         match entry {
             TypedTranscriptEntry::User { text } => Self::User { text },
-            TypedTranscriptEntry::Assistant { text } => Self::Assistant { text },
+            TypedTranscriptEntry::Assistant { text } => Self::Assistant {
+                step: assistant_step.expect("assistant step assigned before conversion"),
+                text,
+            },
             TypedTranscriptEntry::ToolCall {
                 call_id,
                 tool,
@@ -133,7 +195,7 @@ impl From<TypedTranscriptEntry> for DesktopEntry {
             } => Self::ToolCall {
                 call_id,
                 tool,
-                input,
+                input_preview: json_preview(&input),
             },
             TypedTranscriptEntry::ToolResult { call_id, summary } => {
                 Self::ToolResult { call_id, summary }
@@ -159,6 +221,166 @@ impl From<TypedTranscriptEntry> for DesktopEntry {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopTranscript {
+    runs: Vec<DesktopRun>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopPendingApproval {
+    run_id: String,
+    tool_call_id: String,
+    tool_name: String,
+    effect: String,
+    reason: Option<String>,
+    input_preview: Option<String>,
+    approval_preview: Option<String>,
+    diff_preview: Option<String>,
+}
+
+impl TryFrom<PendingApprovalSnapshot> for DesktopPendingApproval {
+    type Error = DesktopError;
+
+    fn try_from(snapshot: PendingApprovalSnapshot) -> Result<Self, Self::Error> {
+        let effect = serde_json::to_value(snapshot.effect)
+            .ok()
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .ok_or_else(|| {
+                DesktopError::new(
+                    "incompatible_daemon",
+                    "pending approval effect is not a wire string",
+                )
+            })?;
+        Ok(Self {
+            run_id: snapshot.run_id,
+            tool_call_id: snapshot.tool_call_id,
+            tool_name: snapshot.tool_name,
+            effect,
+            reason: snapshot.reason,
+            input_preview: snapshot.input_preview,
+            approval_preview: snapshot.approval_preview,
+            diff_preview: snapshot.diff_preview,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopSubmission {
+    run_id: String,
+    session_id: String,
+    status: RunStateName,
+}
+
+impl From<RunStartResult> for DesktopSubmission {
+    fn from(result: RunStartResult) -> Self {
+        Self {
+            run_id: result.run_id,
+            session_id: result.session_id,
+            status: result.status,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopCommandStatus {
+    run_id: String,
+    status: RunStateName,
+}
+
+impl From<CommandAcceptedResult> for DesktopCommandStatus {
+    fn from(result: CommandAcceptedResult) -> Self {
+        Self {
+            run_id: result.run_id,
+            status: result.status,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DesktopApprovalDecision {
+    Grant,
+    Deny,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopEventPage {
+    run_id: String,
+    from_offset: u64,
+    next_offset: u64,
+    status: RunStateName,
+    events: Vec<DesktopEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum DesktopEvent {
+    AssistantDelta {
+        offset: u64,
+        step: u32,
+        delta_index: u64,
+        text: String,
+    },
+    AssistantCommitted {
+        offset: u64,
+        step: u32,
+        text: String,
+    },
+    ToolCall {
+        offset: u64,
+        call_id: String,
+        tool: String,
+        input_preview: String,
+    },
+    ToolResult {
+        offset: u64,
+        call_id: String,
+        summary: String,
+    },
+    Approval {
+        offset: u64,
+        call_id: String,
+        decision: ApprovalDecisionName,
+        actor_id: String,
+        reason: Option<String>,
+    },
+    PolicyDenied {
+        offset: u64,
+        call_id: String,
+        reason: String,
+    },
+    ToolFailed {
+        offset: u64,
+        call_id: String,
+        error: String,
+    },
+    ApprovalRequested {
+        offset: u64,
+        tool_call_id: String,
+    },
+    CancelRequested {
+        offset: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopRecovery {
+    anchor_offset: u64,
+    run: DesktopRun,
+    pending_approval: Option<DesktopPendingApproval>,
+    page: DesktopEventPage,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SavedWorkspace {
@@ -172,54 +394,168 @@ enum SavedWorkspaceState {
 }
 
 #[tauri::command]
-async fn bootstrap(state: tauri::State<'_, DesktopState>) -> Result<BootstrapView, String> {
+async fn bootstrap(state: tauri::State<'_, DesktopState>) -> Result<BootstrapView, DesktopError> {
     let workspace_file = state.workspace_file.clone();
     tauri::async_runtime::spawn_blocking(move || bootstrap_from_store(&workspace_file, None))
         .await
-        .map_err(|error| format!("Desktop worker failed: {error}"))?
+        .map_err(worker_error)?
 }
 
 #[tauri::command]
 async fn pick_workspace(
     app: tauri::AppHandle,
     state: tauri::State<'_, DesktopState>,
-) -> Result<Option<BootstrapView>, String> {
+) -> Result<Option<BootstrapView>, DesktopError> {
     let selected =
         tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
             .await
-            .map_err(|error| format!("Workspace picker failed: {error}"))?;
+            .map_err(worker_error)?;
     let Some(selected) = selected else {
         return Ok(None);
     };
-    let selected = selected
-        .into_path()
-        .map_err(|error| format!("Workspace picker returned an invalid path: {error}"))?;
+    let selected = selected.into_path().map_err(|error| {
+        DesktopError::new(
+            "invalid_workspace",
+            format!("Workspace picker returned an invalid path: {error}"),
+        )
+    })?;
     let workspace_file = state.workspace_file.clone();
     tauri::async_runtime::spawn_blocking(move || {
         persist_workspace(&workspace_file, &selected)?;
         connect_workspace(&selected, None).map(Some)
     })
     .await
-    .map_err(|error| format!("Desktop worker failed: {error}"))?
+    .map_err(worker_error)?
 }
 
 #[tauri::command]
 async fn read_run(
     run_id: String,
     state: tauri::State<'_, DesktopState>,
-) -> Result<DesktopRun, String> {
+) -> Result<DesktopRun, DesktopError> {
     let workspace_file = state.workspace_file.clone();
     tauri::async_runtime::spawn_blocking(move || {
         read_run_from_store(&workspace_file, &run_id, None)
     })
     .await
-    .map_err(|error| format!("Desktop worker failed: {error}"))?
+    .map_err(worker_error)?
+}
+
+#[tauri::command]
+async fn list_sessions(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Vec<DesktopSession>, DesktopError> {
+    let workspace_file = state.workspace_file.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        with_saved_client(&workspace_file, None, |client| {
+            client
+                .sessions_list()
+                .map(|sessions| sessions.into_iter().map(DesktopSession::from).collect())
+                .map_err(|error| DesktopError::daemon("Unable to list daemon sessions", error))
+        })
+    })
+    .await
+    .map_err(worker_error)?
+}
+
+#[tauri::command]
+async fn read_session(
+    session_id: String,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<DesktopTranscript, DesktopError> {
+    let workspace_file = state.workspace_file.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        read_session_from_store(&workspace_file, &session_id, None)
+    })
+    .await
+    .map_err(worker_error)?
+}
+
+#[tauri::command]
+async fn submit_message(
+    message: String,
+    session_id: Option<String>,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<DesktopSubmission, DesktopError> {
+    let workspace_file = state.workspace_file.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        submit_message_from_store(&workspace_file, message, session_id, None)
+    })
+    .await
+    .map_err(worker_error)?
+}
+
+#[tauri::command]
+async fn poll_run(
+    run_id: String,
+    from_offset: u64,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<DesktopEventPage, DesktopError> {
+    let workspace_file = state.workspace_file.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        poll_run_from_store(&workspace_file, &run_id, from_offset, None)
+    })
+    .await
+    .map_err(worker_error)?
+}
+
+#[tauri::command]
+async fn recover_run(
+    run_id: String,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<DesktopRecovery, DesktopError> {
+    let workspace_file = state.workspace_file.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        recover_run_from_store(&workspace_file, &run_id, None)
+    })
+    .await
+    .map_err(worker_error)?
+}
+
+#[tauri::command]
+async fn decide_approval(
+    run_id: String,
+    tool_call_id: String,
+    decision: DesktopApprovalDecision,
+    reason: Option<String>,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<DesktopCommandStatus, DesktopError> {
+    let workspace_file = state.workspace_file.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        decide_approval_from_store(
+            &workspace_file,
+            &run_id,
+            &tool_call_id,
+            decision,
+            reason,
+            None,
+        )
+    })
+    .await
+    .map_err(worker_error)?
+}
+
+#[tauri::command]
+async fn cancel_run(
+    run_id: String,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<DesktopCommandStatus, DesktopError> {
+    let workspace_file = state.workspace_file.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        cancel_run_from_store(&workspace_file, &run_id, None)
+    })
+    .await
+    .map_err(worker_error)?
+}
+
+fn worker_error(error: impl std::fmt::Display) -> DesktopError {
+    DesktopError::new("desktop_worker", format!("Desktop worker failed: {error}"))
 }
 
 fn bootstrap_from_store(
     workspace_file: &Path,
     socket_path: Option<PathBuf>,
-) -> Result<BootstrapView, String> {
+) -> Result<BootstrapView, DesktopError> {
     match load_saved_workspace(workspace_file) {
         SavedWorkspaceState::Missing => Ok(BootstrapView::NeedsWorkspace { reason: None }),
         SavedWorkspaceState::Invalid(reason) => Ok(BootstrapView::NeedsWorkspace {
@@ -234,19 +570,18 @@ fn bootstrap_from_store(
 fn connect_workspace(
     workspace_root: &Path,
     socket_path: Option<PathBuf>,
-) -> Result<BootstrapView, String> {
+) -> Result<BootstrapView, DesktopError> {
     let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
-        .map_err(|error| format!("Workspace is invalid: {error}"))?;
-    let mut client = DaemonClient::connect(&config.socket_path)
-        .map_err(|error| format!("Unable to connect to plato-agentd: {error}"))?;
+        .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
+    let mut client = connect_client(&config)?;
     let hello = client
         .hello(&config.workspace_root)
-        .map_err(|error| format!("Daemon hello failed: {error}"))?;
+        .map_err(|error| DesktopError::daemon("Daemon hello failed", error))?;
     validate_hello(&config.workspace_root, &hello)?;
     let daemon_version = hello.daemon_version;
     let session_summaries = client
         .sessions_list()
-        .map_err(|error| format!("Unable to list daemon sessions: {error}"))?;
+        .map_err(|error| DesktopError::daemon("Unable to list daemon sessions", error))?;
     let selected_run = session_summaries
         .first()
         .map(|session| read_typed_run(&mut client, &session.run_id))
@@ -266,74 +601,593 @@ fn read_run_from_store(
     workspace_file: &Path,
     run_id: &str,
     socket_path: Option<PathBuf>,
-) -> Result<DesktopRun, String> {
+) -> Result<DesktopRun, DesktopError> {
     let SavedWorkspaceState::Ready(workspace_root) = load_saved_workspace(workspace_file) else {
-        return Err("No valid workspace is selected".into());
+        return Err(DesktopError::new(
+            "workspace_not_selected",
+            "No valid workspace is selected",
+        ));
     };
     let config = DaemonConnectionConfig::resolve(&workspace_root, socket_path)
-        .map_err(|error| format!("Workspace is invalid: {error}"))?;
-    let mut client = DaemonClient::connect(&config.socket_path)
-        .map_err(|error| format!("Unable to connect to plato-agentd: {error}"))?;
+        .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
+    let mut client = connect_client(&config)?;
     let hello = client
         .hello(&config.workspace_root)
-        .map_err(|error| format!("Daemon hello failed: {error}"))?;
+        .map_err(|error| DesktopError::daemon("Daemon hello failed", error))?;
     validate_hello(&config.workspace_root, &hello)?;
     read_typed_run(&mut client, run_id)
 }
 
-fn validate_hello(workspace_root: &Path, hello: &HelloResult) -> Result<(), String> {
+fn validate_hello(workspace_root: &Path, hello: &HelloResult) -> Result<(), DesktopError> {
     let expected_workspace_id = paths::workspace_id(workspace_root)
-        .map_err(|error| format!("Workspace is invalid: {error}"))?;
+        .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
     if hello.workspace_id != expected_workspace_id {
-        return Err(format!(
-            "Incompatible daemon: expected workspace {expected_workspace_id}, got {}",
-            hello.workspace_id
+        return Err(DesktopError::new(
+            "incompatible_daemon",
+            format!(
+                "Incompatible daemon: expected workspace {expected_workspace_id}, got {}",
+                hello.workspace_id
+            ),
         ));
     }
     require_capabilities(&hello.capabilities)
 }
 
-fn require_capabilities(capabilities: &[String]) -> Result<(), String> {
+fn require_capabilities(capabilities: &[String]) -> Result<(), DesktopError> {
     if let Some(missing) = REQUIRED_CAPABILITIES.iter().find(|required| {
         !capabilities
             .iter()
             .any(|capability| capability == **required)
     }) {
-        return Err(format!(
-            "Incompatible daemon: missing required capability {missing}"
+        return Err(DesktopError::new(
+            "incompatible_daemon",
+            format!("Incompatible daemon: missing required capability {missing}"),
         ));
     }
     Ok(())
 }
 
-fn read_typed_run(client: &mut DaemonClient, run_id: &str) -> Result<DesktopRun, String> {
+fn read_typed_run(client: &mut DaemonClient, run_id: &str) -> Result<DesktopRun, DesktopError> {
     let transcript = client
         .transcript_read(run_id)
-        .map_err(|error| format!("Unable to read run {run_id}: {error}"))?;
+        .map_err(|error| DesktopError::daemon(&format!("Unable to read run {run_id}"), error))?;
     extract_typed_run(run_id, transcript)
 }
 
 fn extract_typed_run(
     expected_run_id: &str,
     transcript: TranscriptReadResult,
-) -> Result<DesktopRun, String> {
+) -> Result<DesktopRun, DesktopError> {
+    if transcript.run_id != expected_run_id {
+        return Err(DesktopError::new(
+            "incompatible_daemon",
+            format!(
+                "Incompatible daemon: requested run {expected_run_id}, got {}",
+                transcript.run_id
+            ),
+        ));
+    }
     let typed = transcript.typed.ok_or_else(|| {
-        "Incompatible daemon: transcript.read returned no typed payload".to_string()
+        DesktopError::new(
+            "incompatible_daemon",
+            "Incompatible daemon: transcript.read returned no typed payload",
+        )
     })?;
     if typed.runs.len() != 1 {
-        return Err(format!(
-            "Incompatible daemon: exact-run transcript returned {} runs",
-            typed.runs.len()
+        return Err(DesktopError::new(
+            "incompatible_daemon",
+            format!(
+                "Incompatible daemon: exact-run transcript returned {} runs",
+                typed.runs.len()
+            ),
         ));
     }
     let run = typed.runs.into_iter().next().expect("length checked");
     if run.run_id != expected_run_id {
-        return Err(format!(
-            "Incompatible daemon: requested run {expected_run_id}, got {}",
-            run.run_id
+        return Err(DesktopError::new(
+            "incompatible_daemon",
+            format!(
+                "Incompatible daemon: requested run {expected_run_id}, got {}",
+                run.run_id
+            ),
         ));
     }
-    Ok(DesktopRun::from(run))
+    DesktopRun::try_from(run)
+}
+
+fn connect_client(config: &DaemonConnectionConfig) -> Result<DaemonClient, DesktopError> {
+    DaemonClient::connect(&config.socket_path)
+        .map_err(|error| DesktopError::daemon("Unable to connect to plato-agentd", error))
+}
+
+fn with_saved_client<T>(
+    workspace_file: &Path,
+    socket_path: Option<PathBuf>,
+    run: impl FnOnce(&mut DaemonClient) -> Result<T, DesktopError>,
+) -> Result<T, DesktopError> {
+    let SavedWorkspaceState::Ready(workspace_root) = load_saved_workspace(workspace_file) else {
+        return Err(DesktopError::new(
+            "workspace_not_selected",
+            "No valid workspace is selected",
+        ));
+    };
+    let config = DaemonConnectionConfig::resolve(&workspace_root, socket_path)
+        .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
+    let mut client = connect_client(&config)?;
+    let hello = client
+        .hello(&config.workspace_root)
+        .map_err(|error| DesktopError::daemon("Daemon hello failed", error))?;
+    validate_hello(&config.workspace_root, &hello)?;
+    run(&mut client)
+}
+
+fn read_session_from_store(
+    workspace_file: &Path,
+    session_id: &str,
+    socket_path: Option<PathBuf>,
+) -> Result<DesktopTranscript, DesktopError> {
+    with_saved_client(workspace_file, socket_path, |client| {
+        let transcript = client
+            .transcript_read_session(session_id)
+            .map_err(|error| {
+                DesktopError::daemon(&format!("Unable to read session {session_id}"), error)
+            })?;
+        let latest_run_id = transcript.run_id;
+        let typed = transcript.typed.ok_or_else(|| {
+            DesktopError::new(
+                "incompatible_daemon",
+                "Incompatible daemon: transcript.read returned no typed payload",
+            )
+        })?;
+        if typed.runs.is_empty() {
+            return Err(DesktopError::new(
+                "incompatible_daemon",
+                "Incompatible daemon: session transcript returned no runs",
+            ));
+        }
+        let mut runs = typed
+            .runs
+            .into_iter()
+            .map(DesktopRun::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        runs.sort_by_key(|run| run.session_index);
+        if runs
+            .windows(2)
+            .any(|pair| pair[0].session_index == pair[1].session_index)
+        {
+            return Err(DesktopError::new(
+                "incompatible_daemon",
+                "Incompatible daemon: session transcript contains duplicate session indexes",
+            ));
+        }
+        for (index, run) in runs.iter().enumerate() {
+            if runs[..index].iter().any(|prior| prior.run_id == run.run_id) {
+                return Err(DesktopError::new(
+                    "incompatible_daemon",
+                    format!(
+                        "Incompatible daemon: session transcript repeats run {}",
+                        run.run_id
+                    ),
+                ));
+            }
+        }
+        if runs.last().map(|run| run.run_id.as_str()) != Some(latest_run_id.as_str()) {
+            return Err(DesktopError::new(
+                "incompatible_daemon",
+                format!(
+                    "Incompatible daemon: session transcript latest run is not {latest_run_id}"
+                ),
+            ));
+        }
+        Ok(DesktopTranscript { runs })
+    })
+}
+
+fn submit_message_from_store(
+    workspace_file: &Path,
+    message: String,
+    session_id: Option<String>,
+    socket_path: Option<PathBuf>,
+) -> Result<DesktopSubmission, DesktopError> {
+    with_saved_client(workspace_file, socket_path, |client| {
+        let expected_session_id = session_id.clone();
+        let result = match session_id {
+            Some(session_id) => {
+                client.message_append_to_session(message, Some(session_id), None, false)
+            }
+            None => client.run_start(message, None, false),
+        }
+        .map_err(|error| DesktopError::daemon("Unable to submit message", error))?;
+        if let Some(expected_session_id) = expected_session_id
+            && result.session_id != expected_session_id
+        {
+            return Err(DesktopError::new(
+                "incompatible_daemon",
+                format!(
+                    "Incompatible daemon: appended session {expected_session_id}, got {}",
+                    result.session_id
+                ),
+            ));
+        }
+        Ok(DesktopSubmission::from(result))
+    })
+}
+
+fn decide_approval_from_store(
+    workspace_file: &Path,
+    run_id: &str,
+    tool_call_id: &str,
+    decision: DesktopApprovalDecision,
+    reason: Option<String>,
+    socket_path: Option<PathBuf>,
+) -> Result<DesktopCommandStatus, DesktopError> {
+    with_saved_client(workspace_file, socket_path, |client| {
+        let result = match decision {
+            DesktopApprovalDecision::Grant => client.approval_grant(run_id, tool_call_id),
+            DesktopApprovalDecision::Deny => client.approval_deny(
+                run_id,
+                tool_call_id,
+                reason.unwrap_or_else(|| "approval denied by desktop client".into()),
+            ),
+        };
+        let result =
+            result.map_err(|error| DesktopError::daemon("Unable to decide approval", error))?;
+        if result.run_id != run_id {
+            return Err(DesktopError::new(
+                "incompatible_daemon",
+                format!(
+                    "Incompatible daemon: decided approval for {run_id}, got {}",
+                    result.run_id
+                ),
+            ));
+        }
+        Ok(DesktopCommandStatus::from(result))
+    })
+}
+
+fn cancel_run_from_store(
+    workspace_file: &Path,
+    run_id: &str,
+    socket_path: Option<PathBuf>,
+) -> Result<DesktopCommandStatus, DesktopError> {
+    with_saved_client(workspace_file, socket_path, |client| {
+        let result = client
+            .run_cancel(run_id)
+            .map_err(|error| DesktopError::daemon("Unable to cancel run", error))?;
+        if result.run_id != run_id {
+            return Err(DesktopError::new(
+                "incompatible_daemon",
+                format!(
+                    "Incompatible daemon: canceled run {run_id}, got {}",
+                    result.run_id
+                ),
+            ));
+        }
+        Ok(DesktopCommandStatus::from(result))
+    })
+}
+
+fn poll_run_from_store(
+    workspace_file: &Path,
+    run_id: &str,
+    from_offset: u64,
+    socket_path: Option<PathBuf>,
+) -> Result<DesktopEventPage, DesktopError> {
+    with_saved_client(workspace_file, socket_path, |client| {
+        let page = client
+            .events_stream(run_id, Some(from_offset), EVENT_PAGE_SIZE)
+            .map_err(|error| DesktopError::daemon("Unable to poll run events", error))?;
+        normalize_event_page(run_id, page)
+    })
+}
+
+fn recover_run_from_store(
+    workspace_file: &Path,
+    run_id: &str,
+    socket_path: Option<PathBuf>,
+) -> Result<DesktopRecovery, DesktopError> {
+    with_saved_client(workspace_file, socket_path, |client| {
+        let anchor = client
+            .events_stream(run_id, None, EVENT_PAGE_SIZE)
+            .map_err(|error| DesktopError::daemon("Unable to anchor run recovery", error))?;
+        validate_stream_run(run_id, &anchor)?;
+        let anchor_offset = anchor.next_offset;
+
+        let transcript = client.transcript_read(run_id).map_err(|error| {
+            DesktopError::daemon(&format!("Unable to recover run {run_id}"), error)
+        })?;
+        let pending_approval = transcript
+            .pending_approval
+            .clone()
+            .map(DesktopPendingApproval::try_from)
+            .transpose()?;
+        if let Some(pending) = &pending_approval
+            && pending.run_id != run_id
+        {
+            return Err(DesktopError::new(
+                "incompatible_daemon",
+                format!(
+                    "Incompatible daemon: pending approval belongs to {}, expected {run_id}",
+                    pending.run_id
+                ),
+            ));
+        }
+        let run = extract_typed_run(run_id, transcript)?;
+
+        let page = client
+            .events_stream(run_id, Some(anchor_offset), EVENT_PAGE_SIZE)
+            .map_err(|error| DesktopError::daemon("Unable to continue run recovery", error))?;
+        let page = normalize_event_page(run_id, page)?;
+        Ok(DesktopRecovery {
+            anchor_offset,
+            run,
+            pending_approval,
+            page,
+        })
+    })
+}
+
+fn normalize_event_page(
+    expected_run_id: &str,
+    page: EventsStreamResult,
+) -> Result<DesktopEventPage, DesktopError> {
+    validate_stream_run(expected_run_id, &page)?;
+    if page.next_offset < page.from_offset {
+        return Err(DesktopError::new(
+            "incompatible_daemon",
+            "Incompatible daemon: events.stream next_offset precedes from_offset",
+        ));
+    }
+    let event_count = u64::try_from(page.events.len()).map_err(|_| {
+        DesktopError::new(
+            "incompatible_daemon",
+            "Incompatible daemon: events.stream page is too large",
+        )
+    })?;
+    if page.from_offset.checked_add(event_count) != Some(page.next_offset) {
+        return Err(DesktopError::new(
+            "incompatible_daemon",
+            "Incompatible daemon: events.stream offsets do not match its page length",
+        ));
+    }
+    let mut events = Vec::new();
+    for (index, value) in page.events.into_iter().enumerate() {
+        let buffered = serde_json::from_value::<BufferedDaemonEvent>(value).map_err(|error| {
+            DesktopError::new(
+                "incompatible_daemon",
+                format!("Incompatible daemon: malformed run event: {error}"),
+            )
+        })?;
+        let expected_offset = page.from_offset + index as u64;
+        if buffered.offset != expected_offset {
+            return Err(DesktopError::new(
+                "incompatible_daemon",
+                format!(
+                    "Incompatible daemon: event offset {} is not expected offset {expected_offset}",
+                    buffered.offset
+                ),
+            ));
+        }
+        if let Some(event) = buffered.into_desktop()? {
+            events.push(event);
+        }
+    }
+    Ok(DesktopEventPage {
+        run_id: page.run_id,
+        from_offset: page.from_offset,
+        next_offset: page.next_offset,
+        status: page.status,
+        events,
+    })
+}
+
+fn validate_stream_run(
+    expected_run_id: &str,
+    page: &EventsStreamResult,
+) -> Result<(), DesktopError> {
+    if page.run_id == expected_run_id {
+        return Ok(());
+    }
+    Err(DesktopError::new(
+        "incompatible_daemon",
+        format!(
+            "Incompatible daemon: requested events for {expected_run_id}, got {}",
+            page.run_id
+        ),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct BufferedDaemonEvent {
+    offset: u64,
+    event: DaemonEvent,
+}
+
+impl BufferedDaemonEvent {
+    fn into_desktop(self) -> Result<Option<DesktopEvent>, DesktopError> {
+        let offset = self.offset;
+        let event = match self.event {
+            DaemonEvent::AssistantDelta {
+                step,
+                delta_index,
+                text,
+            } => Some(DesktopEvent::AssistantDelta {
+                offset,
+                step,
+                delta_index,
+                text,
+            }),
+            DaemonEvent::ApprovalRequested { tool_call_id } => {
+                Some(DesktopEvent::ApprovalRequested {
+                    offset,
+                    tool_call_id,
+                })
+            }
+            DaemonEvent::Canceled => Some(DesktopEvent::CancelRequested { offset }),
+            DaemonEvent::Ledger { record } => record.event.into_desktop(offset),
+            DaemonEvent::Ignored => None,
+        };
+        Ok(event)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DaemonEvent {
+    AssistantDelta {
+        step: u32,
+        delta_index: u64,
+        text: String,
+    },
+    ApprovalRequested {
+        tool_call_id: String,
+    },
+    Canceled,
+    Ledger {
+        record: DaemonRecordedEvent,
+    },
+    #[serde(other)]
+    Ignored,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonRecordedEvent {
+    event: DaemonLedgerEvent,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum DaemonLedgerEvent {
+    ModelResponded {
+        step: u32,
+        output: DaemonMessage,
+    },
+    ToolCallProposed {
+        call: DaemonToolCall,
+    },
+    PolicyEvaluated {
+        call_id: String,
+        decision: DaemonPolicyDecision,
+    },
+    ApprovalGranted {
+        call_id: String,
+        actor_id: String,
+    },
+    ApprovalDenied {
+        call_id: String,
+        actor_id: String,
+        reason: String,
+    },
+    ToolFinished {
+        result: DaemonToolResult,
+    },
+    ToolFailed {
+        call_id: String,
+        reason: String,
+    },
+    #[serde(other)]
+    Ignored,
+}
+
+impl DaemonLedgerEvent {
+    fn into_desktop(self, offset: u64) -> Option<DesktopEvent> {
+        match self {
+            Self::ModelResponded { step, output } => Some(DesktopEvent::AssistantCommitted {
+                offset,
+                step,
+                text: output.content,
+            }),
+            Self::ToolCallProposed { call } => Some(DesktopEvent::ToolCall {
+                offset,
+                call_id: call.id,
+                tool: call.tool,
+                input_preview: json_preview(&call.input),
+            }),
+            Self::PolicyEvaluated {
+                call_id,
+                decision: DaemonPolicyDecision::Deny { reason },
+            } => Some(DesktopEvent::PolicyDenied {
+                offset,
+                call_id,
+                reason,
+            }),
+            Self::PolicyEvaluated { .. } => None,
+            Self::ApprovalGranted { call_id, actor_id } => Some(DesktopEvent::Approval {
+                offset,
+                call_id,
+                decision: ApprovalDecisionName::Granted,
+                actor_id,
+                reason: None,
+            }),
+            Self::ApprovalDenied {
+                call_id,
+                actor_id,
+                reason,
+            } => Some(DesktopEvent::Approval {
+                offset,
+                call_id,
+                decision: ApprovalDecisionName::Denied,
+                actor_id,
+                reason: Some(reason),
+            }),
+            Self::ToolFinished { result } => Some(DesktopEvent::ToolResult {
+                offset,
+                call_id: result.call_id,
+                summary: result.summary,
+            }),
+            Self::ToolFailed { call_id, reason } => Some(DesktopEvent::ToolFailed {
+                offset,
+                call_id,
+                error: reason,
+            }),
+            Self::Ignored => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonMessage {
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonToolCall {
+    id: String,
+    tool: String,
+    input: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonToolResult {
+    call_id: String,
+    summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+enum DaemonPolicyDecision {
+    Allow,
+    RequireApproval {
+        #[serde(rename = "reason")]
+        _reason: String,
+    },
+    Deny {
+        reason: String,
+    },
+}
+
+fn json_preview(value: &Value) -> String {
+    let encoded = serde_json::to_string(value).expect("JSON value serializes");
+    if encoded.chars().count() <= INPUT_PREVIEW_MAX_CHARS {
+        return encoded;
+    }
+    format!(
+        "{}...",
+        encoded
+            .chars()
+            .take(INPUT_PREVIEW_MAX_CHARS)
+            .collect::<String>()
+    )
 }
 
 fn load_saved_workspace(workspace_file: &Path) -> SavedWorkspaceState {
@@ -359,29 +1213,55 @@ fn load_saved_workspace(workspace_file: &Path) -> SavedWorkspaceState {
     }
 }
 
-fn persist_workspace(workspace_file: &Path, workspace_root: &Path) -> Result<PathBuf, String> {
-    let canonical = workspace_root
-        .canonicalize()
-        .map_err(|error| format!("Workspace cannot be resolved: {error}"))?;
+fn persist_workspace(
+    workspace_file: &Path,
+    workspace_root: &Path,
+) -> Result<PathBuf, DesktopError> {
+    let canonical = workspace_root.canonicalize().map_err(|error| {
+        DesktopError::new(
+            "invalid_workspace",
+            format!("Workspace cannot be resolved: {error}"),
+        )
+    })?;
     if !canonical.is_dir() {
-        return Err("Selected workspace is not a directory".into());
+        return Err(DesktopError::new(
+            "invalid_workspace",
+            "Selected workspace is not a directory",
+        ));
     }
-    let workspace_root = canonical
-        .to_str()
-        .ok_or_else(|| "Workspace path must be valid UTF-8".to_string())?;
+    let workspace_root = canonical.to_str().ok_or_else(|| {
+        DesktopError::new("invalid_workspace", "Workspace path must be valid UTF-8")
+    })?;
     if let Some(parent) = workspace_file.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Workspace selection could not be saved: {error}"))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            DesktopError::new(
+                "workspace_save_failed",
+                format!("Workspace selection could not be saved: {error}"),
+            )
+        })?;
     }
     let temporary = workspace_file.with_extension("json.tmp");
     let bytes = serde_json::to_vec(&SavedWorkspace {
         workspace_root: workspace_root.into(),
     })
-    .map_err(|error| format!("Workspace selection could not be encoded: {error}"))?;
-    fs::write(&temporary, bytes)
-        .map_err(|error| format!("Workspace selection could not be saved: {error}"))?;
-    fs::rename(&temporary, workspace_file)
-        .map_err(|error| format!("Workspace selection could not be saved: {error}"))?;
+    .map_err(|error| {
+        DesktopError::new(
+            "workspace_save_failed",
+            format!("Workspace selection could not be encoded: {error}"),
+        )
+    })?;
+    fs::write(&temporary, bytes).map_err(|error| {
+        DesktopError::new(
+            "workspace_save_failed",
+            format!("Workspace selection could not be saved: {error}"),
+        )
+    })?;
+    fs::rename(&temporary, workspace_file).map_err(|error| {
+        DesktopError::new(
+            "workspace_save_failed",
+            format!("Workspace selection could not be saved: {error}"),
+        )
+    })?;
     Ok(canonical)
 }
 
@@ -397,7 +1277,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             bootstrap,
             pick_workspace,
-            read_run
+            read_run,
+            list_sessions,
+            read_session,
+            submit_message,
+            poll_run,
+            recover_run,
+            decide_approval,
+            cancel_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running Plato desktop");
@@ -456,24 +1343,50 @@ mod tests {
 
         let error = persist_workspace(&workspace_file, &file).unwrap_err();
 
-        assert_eq!(error, "Selected workspace is not a directory");
+        assert_eq!(
+            error,
+            DesktopError::new("invalid_workspace", "Selected workspace is not a directory")
+        );
         assert!(!workspace_file.exists());
     }
 
     #[test]
-    fn capability_manifest_exposes_only_the_three_typed_commands() {
+    fn capability_manifest_exposes_only_the_ten_typed_commands() {
         let capability: Value =
             serde_json::from_str(include_str!("../capabilities/main.json")).unwrap();
+        let commands = [
+            "bootstrap",
+            "pick_workspace",
+            "read_run",
+            "list_sessions",
+            "read_session",
+            "submit_message",
+            "poll_run",
+            "recover_run",
+            "decide_approval",
+            "cancel_run",
+        ];
         assert_eq!(
             capability["permissions"],
-            json!(["allow-bootstrap", "allow-pick-workspace", "allow-read-run"])
+            json!([
+                "allow-bootstrap",
+                "allow-pick-workspace",
+                "allow-read-run",
+                "allow-list-sessions",
+                "allow-read-session",
+                "allow-submit-message",
+                "allow-poll-run",
+                "allow-recover-run",
+                "allow-decide-approval",
+                "allow-cancel-run"
+            ])
         );
         let serialized = serde_json::to_string(&capability).unwrap();
         for forbidden in ["dialog:", "fs:", "shell:", "http:", "core:", "remote"] {
             assert!(!serialized.contains(forbidden), "found {forbidden}");
         }
         let build = include_str!("../build.rs");
-        for command in ["bootstrap", "pick_workspace", "read_run"] {
+        for command in commands {
             assert!(build.contains(&format!("\"{command}\"")));
         }
     }
@@ -565,6 +1478,11 @@ mod tests {
         let socket_path = socket_dir.path().join("agent.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let workspace_id = paths::workspace_id(workspace.path()).unwrap();
+        let capabilities = REQUIRED_CAPABILITIES
+            .iter()
+            .filter(|capability| **capability != "transcript.read.typed")
+            .copied()
+            .collect::<Vec<_>>();
         let handle = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut writer = stream.try_clone().unwrap();
@@ -578,7 +1496,7 @@ mod tests {
                     "daemon_version": "old",
                     "workspace_id": workspace_id,
                     "ledger_path": "/tmp/ledger.db",
-                    "capabilities": ["hello", "sessions.list", "transcript.read"]
+                    "capabilities": capabilities
                 }),
             );
         });
@@ -588,7 +1506,10 @@ mod tests {
 
         assert_eq!(
             error,
-            "Incompatible daemon: missing required capability transcript.read.typed"
+            DesktopError::new(
+                "incompatible_daemon",
+                "Incompatible daemon: missing required capability transcript.read.typed"
+            )
         );
     }
 
@@ -607,9 +1528,14 @@ mod tests {
 
         let error = validate_hello(workspace.path(), &hello).unwrap_err();
 
-        assert!(error.starts_with("Incompatible daemon: expected workspace "));
-        assert!(error.ends_with(", got other-workspace"));
-        assert!(!error.contains("ledger.db"));
+        assert_eq!(error.code, "incompatible_daemon");
+        assert!(
+            error
+                .message
+                .starts_with("Incompatible daemon: expected workspace ")
+        );
+        assert!(error.message.ends_with(", got other-workspace"));
+        assert!(!error.message.contains("ledger.db"));
     }
 
     #[test]
@@ -623,7 +1549,9 @@ mod tests {
             pending_approval: None,
         };
         assert_eq!(
-            extract_typed_run("run_1", base.clone()).unwrap_err(),
+            extract_typed_run("run_1", base.clone())
+                .unwrap_err()
+                .message,
             "Incompatible daemon: transcript.read returned no typed payload"
         );
 
@@ -632,7 +1560,7 @@ mod tests {
             runs: vec![typed_run("run_1"), typed_run("run_2")],
         });
         assert_eq!(
-            extract_typed_run("run_1", multiple).unwrap_err(),
+            extract_typed_run("run_1", multiple).unwrap_err().message,
             "Incompatible daemon: exact-run transcript returned 2 runs"
         );
 
@@ -641,9 +1569,655 @@ mod tests {
             runs: vec![typed_run("run_2")],
         });
         assert_eq!(
-            extract_typed_run("run_1", wrong).unwrap_err(),
+            extract_typed_run("run_1", wrong).unwrap_err().message,
             "Incompatible daemon: requested run run_1, got run_2"
         );
+    }
+
+    #[test]
+    fn typed_runs_assign_every_assistant_step_before_display_filtering() {
+        let run = TypedRun {
+            run_id: "run_1".into(),
+            session_index: 2,
+            status: RunStateName::Finished,
+            entries: vec![
+                TypedTranscriptEntry::User {
+                    text: "question".into(),
+                },
+                TypedTranscriptEntry::Assistant {
+                    text: String::new(),
+                },
+                TypedTranscriptEntry::ToolCall {
+                    call_id: "call_1".into(),
+                    tool: "file.read".into(),
+                    input: json!({"path": "README.md"}),
+                },
+                TypedTranscriptEntry::Assistant {
+                    text: "answer".into(),
+                },
+            ],
+        };
+
+        let run = DesktopRun::try_from(run).unwrap();
+
+        assert!(matches!(
+            &run.entries[1],
+            DesktopEntry::Assistant { step: 0, text } if text.is_empty()
+        ));
+        assert!(matches!(
+            &run.entries[3],
+            DesktopEntry::Assistant { step: 1, text } if text == "answer"
+        ));
+        let serialized = serde_json::to_value(run).unwrap();
+        assert_eq!(
+            serialized["entries"][2]["inputPreview"],
+            r#"{"path":"README.md"}"#
+        );
+        assert!(serialized["entries"][2].get("input").is_none());
+    }
+
+    #[test]
+    fn presentation_events_cover_deltas_commits_calls_approvals_and_cancel() {
+        let page = EventsStreamResult {
+            run_id: "run_1".into(),
+            from_offset: 0,
+            next_offset: 10,
+            status: RunStateName::CancelRequested,
+            events: vec![
+                buffered_event(
+                    0,
+                    json!({
+                        "kind": "assistant_delta",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 0,
+                        "delta_index": 0,
+                        "text": "hel"
+                    }),
+                ),
+                ledger_event(
+                    1,
+                    json!({
+                        "event": "model_responded",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "step": 0,
+                        "output": {"role": "assistant", "content": "hello"},
+                        "proposed_calls": [],
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }),
+                ),
+                ledger_event(
+                    2,
+                    json!({
+                        "event": "tool_call_proposed",
+                        "run_id": "run_1",
+                        "turn_id": "turn_1",
+                        "call": {
+                            "id": "call_1",
+                            "tool": "file.read",
+                            "effect": "read_only",
+                            "input": {"path": "README.md"}
+                        }
+                    }),
+                ),
+                ledger_event(
+                    3,
+                    json!({
+                        "event": "policy_evaluated",
+                        "run_id": "run_1",
+                        "call_id": "call_2",
+                        "decision": {"decision": "deny", "reason": "no"}
+                    }),
+                ),
+                ledger_event(
+                    4,
+                    json!({
+                        "event": "approval_granted",
+                        "run_id": "run_1",
+                        "call_id": "call_1",
+                        "actor_id": "human_1"
+                    }),
+                ),
+                ledger_event(
+                    5,
+                    json!({
+                        "event": "approval_denied",
+                        "run_id": "run_1",
+                        "call_id": "call_2",
+                        "actor_id": "human_1",
+                        "reason": "not now"
+                    }),
+                ),
+                ledger_event(
+                    6,
+                    json!({
+                        "event": "tool_finished",
+                        "run_id": "run_1",
+                        "result": {
+                            "call_id": "call_1",
+                            "summary": "read file",
+                            "data": {"secret_raw": true},
+                            "artifacts": [],
+                            "visibility": "both"
+                        }
+                    }),
+                ),
+                ledger_event(
+                    7,
+                    json!({
+                        "event": "tool_failed",
+                        "run_id": "run_1",
+                        "call_id": "call_3",
+                        "reason": "failed"
+                    }),
+                ),
+                buffered_event(
+                    8,
+                    json!({
+                        "kind": "approval_requested",
+                        "run_id": "run_1",
+                        "tool_call_id": "call_4",
+                        "tool_name": "file.write",
+                        "effect": "workspace_write",
+                        "reason": "approval needed"
+                    }),
+                ),
+                buffered_event(9, json!({"kind": "canceled", "run_id": "run_1"})),
+            ],
+        };
+
+        let page = normalize_event_page("run_1", page).unwrap();
+
+        assert_eq!(page.events.len(), 10);
+        assert!(matches!(
+            page.events[0],
+            DesktopEvent::AssistantDelta {
+                offset: 0,
+                step: 0,
+                delta_index: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            page.events[1],
+            DesktopEvent::AssistantCommitted {
+                offset: 1,
+                step: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            page.events[3],
+            DesktopEvent::PolicyDenied { ref call_id, .. } if call_id == "call_2"
+        ));
+        assert!(matches!(
+            page.events[8],
+            DesktopEvent::ApprovalRequested { ref tool_call_id, .. }
+                if tool_call_id == "call_4"
+        ));
+        assert!(matches!(
+            page.events[9],
+            DesktopEvent::CancelRequested { offset: 9 }
+        ));
+        let serialized = serde_json::to_string(&page).unwrap();
+        for forbidden in ["secret_raw", "occurred_at_ms", "record", "turn_id"] {
+            assert!(!serialized.contains(forbidden), "found {forbidden}");
+        }
+    }
+
+    #[test]
+    fn session_read_returns_all_runs_in_session_index_order() {
+        let fixture = bridge_fixture();
+        let listener = UnixListener::bind(&fixture.socket_path).unwrap();
+        let workspace_id = fixture.workspace_id.clone();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            answer_hello(&mut reader, &mut writer, workspace_id);
+
+            let transcript = read_request(&mut reader);
+            assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
+            assert_eq!(
+                transcript.params.as_ref().unwrap()["session_id"],
+                "session_1"
+            );
+            assert!(transcript.params.as_ref().unwrap()["run_id"].is_null());
+            write_response(
+                &mut writer,
+                transcript.id,
+                "transcript.read",
+                json!({
+                    "run_id": "run_2",
+                    "status": "running",
+                    "final_answer": null,
+                    "transcript": "POISON",
+                    "typed": {"runs": [
+                        typed_run_json("run_2", 1, "running", "second"),
+                        typed_run_json("run_1", 0, "finished", "first")
+                    ]},
+                    "pending_approval": null
+                }),
+            );
+        });
+
+        let transcript = read_session_from_store(
+            &fixture.workspace_file,
+            "session_1",
+            Some(fixture.socket_path),
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(transcript.runs.len(), 2);
+        assert_eq!(transcript.runs[0].run_id, "run_1");
+        assert_eq!(transcript.runs[1].run_id, "run_2");
+        assert_eq!(transcript.runs[1].status, RunStateName::Running);
+        assert!(
+            !serde_json::to_string(&transcript)
+                .unwrap()
+                .contains("POISON")
+        );
+    }
+
+    #[test]
+    fn composer_uses_new_or_selected_session_and_never_waits() {
+        let fixture = bridge_fixture();
+        let listener = UnixListener::bind(&fixture.socket_path).unwrap();
+        let workspace_id = fixture.workspace_id.clone();
+        let handle = thread::spawn(move || {
+            for (method, message, session_id, run_id) in [
+                ("run.start", "new question", None, "run_1"),
+                ("message.append", "follow up", Some("session_1"), "run_2"),
+            ] {
+                let (stream, _) = listener.accept().unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                answer_hello(&mut reader, &mut writer, workspace_id.clone());
+
+                let request = read_request(&mut reader);
+                assert_eq!(request.method.as_deref(), Some(method));
+                let params = request.params.as_ref().unwrap();
+                let message_field = if method == "run.start" {
+                    "question"
+                } else {
+                    "message"
+                };
+                assert_eq!(params[message_field], message);
+                assert_eq!(params["wait"], false);
+                match session_id {
+                    Some(session_id) => assert_eq!(params["session_id"], session_id),
+                    None => assert!(params.get("session_id").is_none()),
+                }
+                write_response(
+                    &mut writer,
+                    request.id,
+                    method,
+                    json!({
+                        "run_id": run_id,
+                        "session_id": "session_1",
+                        "ledger_path": "/secret/ledger.db",
+                        "status": "running",
+                        "final_answer": null
+                    }),
+                );
+            }
+        });
+
+        let started = submit_message_from_store(
+            &fixture.workspace_file,
+            "new question".into(),
+            None,
+            Some(fixture.socket_path.clone()),
+        )
+        .unwrap();
+        let appended = submit_message_from_store(
+            &fixture.workspace_file,
+            "follow up".into(),
+            Some("session_1".into()),
+            Some(fixture.socket_path),
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(started.run_id, "run_1");
+        assert_eq!(appended.run_id, "run_2");
+        assert_eq!(started.status, RunStateName::Running);
+    }
+
+    #[test]
+    fn command_responses_must_match_the_requested_session_or_run() {
+        let fixture = bridge_fixture();
+        let listener = UnixListener::bind(&fixture.socket_path).unwrap();
+        let workspace_id = fixture.workspace_id.clone();
+        let handle = thread::spawn(move || {
+            for (method, result) in [
+                (
+                    "message.append",
+                    json!({
+                        "run_id": "run_2",
+                        "session_id": "session_other",
+                        "ledger_path": "/secret/ledger.db",
+                        "status": "running",
+                        "final_answer": null
+                    }),
+                ),
+                (
+                    "approval.decide",
+                    json!({"run_id": "run_other", "status": "running"}),
+                ),
+                (
+                    "run.cancel",
+                    json!({"run_id": "run_other", "status": "cancel_requested"}),
+                ),
+            ] {
+                let (stream, _) = listener.accept().unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                answer_hello(&mut reader, &mut writer, workspace_id.clone());
+                let request = read_request(&mut reader);
+                assert_eq!(request.method.as_deref(), Some(method));
+                write_response(&mut writer, request.id, method, result);
+            }
+        });
+
+        let append_error = submit_message_from_store(
+            &fixture.workspace_file,
+            "follow up".into(),
+            Some("session_1".into()),
+            Some(fixture.socket_path.clone()),
+        )
+        .unwrap_err();
+        let approval_error = decide_approval_from_store(
+            &fixture.workspace_file,
+            "run_1",
+            "call_1",
+            DesktopApprovalDecision::Grant,
+            None,
+            Some(fixture.socket_path.clone()),
+        )
+        .unwrap_err();
+        let cancel_error =
+            cancel_run_from_store(&fixture.workspace_file, "run_1", Some(fixture.socket_path))
+                .unwrap_err();
+        handle.join().unwrap();
+
+        assert_eq!(append_error.code, "incompatible_daemon");
+        assert_eq!(
+            append_error.message,
+            "Incompatible daemon: appended session session_1, got session_other"
+        );
+        assert_eq!(approval_error.code, "incompatible_daemon");
+        assert_eq!(
+            approval_error.message,
+            "Incompatible daemon: decided approval for run_1, got run_other"
+        );
+        assert_eq!(cancel_error.code, "incompatible_daemon");
+        assert_eq!(
+            cancel_error.message,
+            "Incompatible daemon: canceled run run_1, got run_other"
+        );
+    }
+
+    #[test]
+    fn poll_requests_a_full_page_and_keeps_every_delta_key() {
+        let fixture = bridge_fixture();
+        let listener = UnixListener::bind(&fixture.socket_path).unwrap();
+        let workspace_id = fixture.workspace_id.clone();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            answer_hello(&mut reader, &mut writer, workspace_id);
+
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("events.stream"));
+            assert_eq!(request.params.as_ref().unwrap()["from_offset"], 0);
+            assert_eq!(request.params.as_ref().unwrap()["limit"], EVENT_PAGE_SIZE);
+            let events = (0..EVENT_PAGE_SIZE as u64)
+                .map(|offset| {
+                    buffered_event(
+                        offset,
+                        json!({
+                            "kind": "assistant_delta",
+                            "run_id": "run_1",
+                            "turn_id": "turn_1",
+                            "step": 0,
+                            "delta_index": offset,
+                            "text": "x"
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            write_response(
+                &mut writer,
+                request.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 0,
+                    "next_offset": EVENT_PAGE_SIZE,
+                    "status": "running",
+                    "events": events
+                }),
+            );
+        });
+
+        let page = poll_run_from_store(
+            &fixture.workspace_file,
+            "run_1",
+            0,
+            Some(fixture.socket_path),
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(page.events.len(), EVENT_PAGE_SIZE);
+        assert_eq!(page.next_offset, EVENT_PAGE_SIZE as u64);
+        assert!(matches!(
+            page.events.last(),
+            Some(DesktopEvent::AssistantDelta {
+                offset: 127,
+                delta_index: 127,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn lag_recovery_anchors_then_snapshots_then_continues_from_anchor() {
+        let fixture = bridge_fixture();
+        let listener = UnixListener::bind(&fixture.socket_path).unwrap();
+        let workspace_id = fixture.workspace_id.clone();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            answer_hello(&mut reader, &mut writer, workspace_id);
+
+            let anchor = read_request(&mut reader);
+            assert_eq!(anchor.method.as_deref(), Some("events.stream"));
+            assert!(anchor.params.as_ref().unwrap()["from_offset"].is_null());
+            write_response(
+                &mut writer,
+                anchor.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 4,
+                    "next_offset": 4,
+                    "status": "running",
+                    "events": []
+                }),
+            );
+
+            let transcript = read_request(&mut reader);
+            assert_eq!(transcript.method.as_deref(), Some("transcript.read"));
+            assert_eq!(transcript.params.as_ref().unwrap()["run_id"], "run_1");
+            write_response(
+                &mut writer,
+                transcript.id,
+                "transcript.read",
+                json!({
+                    "run_id": "run_1",
+                    "status": "running",
+                    "final_answer": null,
+                    "transcript": "POISON",
+                    "typed": {"runs": [typed_run_json("run_1", 0, "running", "hello")]},
+                    "pending_approval": {
+                        "run_id": "run_1",
+                        "tool_call_id": "call_1",
+                        "tool_name": "file.write",
+                        "effect": "workspace_write",
+                        "reason": "approval needed",
+                        "input_preview": "{path: out.txt}"
+                    }
+                }),
+            );
+
+            let continued = read_request(&mut reader);
+            assert_eq!(continued.method.as_deref(), Some("events.stream"));
+            assert_eq!(continued.params.as_ref().unwrap()["from_offset"], 4);
+            write_response(
+                &mut writer,
+                continued.id,
+                "events.stream",
+                json!({
+                    "run_id": "run_1",
+                    "from_offset": 4,
+                    "next_offset": 5,
+                    "status": "running",
+                    "events": [buffered_event(4, json!({
+                        "kind": "approval_requested",
+                        "run_id": "run_1",
+                        "tool_call_id": "call_1",
+                        "tool_name": "file.write",
+                        "effect": "workspace_write",
+                        "reason": "approval needed"
+                    }))]
+                }),
+            );
+        });
+
+        let recovery =
+            recover_run_from_store(&fixture.workspace_file, "run_1", Some(fixture.socket_path))
+                .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(recovery.anchor_offset, 4);
+        assert_eq!(recovery.run.run_id, "run_1");
+        assert_eq!(
+            recovery
+                .pending_approval
+                .as_ref()
+                .map(|pending| pending.tool_call_id.as_str()),
+            Some("call_1")
+        );
+        assert_eq!(recovery.page.from_offset, 4);
+        assert!(matches!(
+            recovery.page.events.as_slice(),
+            [DesktopEvent::ApprovalRequested { offset: 4, tool_call_id }] if tool_call_id == "call_1"
+        ));
+    }
+
+    #[test]
+    fn protocol_errors_keep_typed_code_and_message() {
+        let error = DesktopError::daemon(
+            "Unable to decide approval",
+            AppError::DaemonResponse(plato_agent::daemon::protocol::ProtocolError {
+                code: "not_found".into(),
+                message: "pending approval not found: call_1".into(),
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            json!({
+                "code": "not_found",
+                "message": "pending approval not found: call_1"
+            })
+        );
+    }
+
+    #[test]
+    fn raced_approval_error_and_cancel_status_stay_typed() {
+        let fixture = bridge_fixture();
+        let listener = UnixListener::bind(&fixture.socket_path).unwrap();
+        let workspace_id = fixture.workspace_id.clone();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            answer_hello(&mut reader, &mut writer, workspace_id.clone());
+            let approval = read_request(&mut reader);
+            assert_eq!(approval.method.as_deref(), Some("approval.decide"));
+            assert_eq!(approval.params.as_ref().unwrap()["run_id"], "run_1");
+            assert_eq!(approval.params.as_ref().unwrap()["tool_call_id"], "call_1");
+            write_error(
+                &mut writer,
+                approval.id,
+                "approval.decide",
+                "not_found",
+                "pending approval not found: call_1",
+            );
+
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            answer_hello(&mut reader, &mut writer, workspace_id);
+            let cancel = read_request(&mut reader);
+            assert_eq!(cancel.method.as_deref(), Some("run.cancel"));
+            assert_eq!(cancel.params.as_ref().unwrap()["run_id"], "run_1");
+            write_response(
+                &mut writer,
+                cancel.id,
+                "run.cancel",
+                json!({"run_id": "run_1", "status": "cancel_requested"}),
+            );
+        });
+
+        let error = decide_approval_from_store(
+            &fixture.workspace_file,
+            "run_1",
+            "call_1",
+            DesktopApprovalDecision::Grant,
+            None,
+            Some(fixture.socket_path.clone()),
+        )
+        .unwrap_err();
+        let canceled =
+            cancel_run_from_store(&fixture.workspace_file, "run_1", Some(fixture.socket_path))
+                .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(error.code, "not_found");
+        assert_eq!(error.message, "pending approval not found: call_1");
+        assert_eq!(canceled.status, RunStateName::CancelRequested);
+    }
+
+    #[test]
+    fn all_run_state_names_cross_the_bridge_as_typed_wire_values() {
+        for status in [
+            RunStateName::Running,
+            RunStateName::Finished,
+            RunStateName::Failed,
+            RunStateName::Canceled,
+            RunStateName::CancelRequested,
+            RunStateName::Interrupted,
+        ] {
+            let page = DesktopEventPage {
+                run_id: "run_1".into(),
+                from_offset: 0,
+                next_offset: 0,
+                status,
+                events: vec![],
+            };
+            assert_eq!(
+                serde_json::to_value(page).unwrap()["status"],
+                status.as_str()
+            );
+        }
     }
 
     fn typed_run(run_id: &str) -> TypedRun {
@@ -653,6 +2227,80 @@ mod tests {
             status: RunStateName::Finished,
             entries: vec![],
         }
+    }
+
+    struct BridgeFixture {
+        _state: tempfile::TempDir,
+        _workspace: tempfile::TempDir,
+        workspace_file: PathBuf,
+        socket_path: PathBuf,
+        workspace_id: String,
+    }
+
+    fn bridge_fixture() -> BridgeFixture {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_file = state.path().join("workspace.json");
+        persist_workspace(&workspace_file, workspace.path()).unwrap();
+        let socket_path = state.path().join("agent.sock");
+        let workspace_id = paths::workspace_id(workspace.path()).unwrap();
+        BridgeFixture {
+            _state: state,
+            _workspace: workspace,
+            workspace_file,
+            socket_path,
+            workspace_id,
+        }
+    }
+
+    fn answer_hello(
+        reader: &mut BufReader<UnixStream>,
+        writer: &mut UnixStream,
+        workspace_id: String,
+    ) {
+        let hello = read_request(reader);
+        assert_eq!(hello.method.as_deref(), Some("hello"));
+        write_response(
+            writer,
+            hello.id,
+            "hello",
+            json!({
+                "daemon_version": "0.1.0",
+                "workspace_id": workspace_id,
+                "ledger_path": "/secret/ledger.db",
+                "capabilities": REQUIRED_CAPABILITIES
+            }),
+        );
+    }
+
+    fn typed_run_json(run_id: &str, session_index: u64, status: &str, assistant: &str) -> Value {
+        json!({
+            "run_id": run_id,
+            "session_index": session_index,
+            "status": status,
+            "entries": [
+                {"kind": "user", "text": "question"},
+                {"kind": "assistant", "text": assistant}
+            ]
+        })
+    }
+
+    fn buffered_event(offset: u64, event: Value) -> Value {
+        json!({"offset": offset, "event": event})
+    }
+
+    fn ledger_event(offset: u64, event: Value) -> Value {
+        buffered_event(
+            offset,
+            json!({
+                "kind": "ledger",
+                "record": {
+                    "seq": offset,
+                    "occurred_at_ms": offset,
+                    "event": event
+                }
+            }),
+        )
     }
 
     fn read_request(reader: &mut BufReader<UnixStream>) -> Envelope {
@@ -673,6 +2321,19 @@ mod tests {
             result: Some(result),
             error: None,
         };
+        serde_json::to_writer(writer.by_ref(), &response).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+    }
+
+    fn write_error(
+        writer: &mut UnixStream,
+        id: Option<String>,
+        method: &str,
+        code: &str,
+        message: &str,
+    ) {
+        let response = Envelope::error(id, Some(method.into()), code, message);
         serde_json::to_writer(writer.by_ref(), &response).unwrap();
         writer.write_all(b"\n").unwrap();
         writer.flush().unwrap();

@@ -179,8 +179,9 @@ block until the run finishes.
 
 ## Desktop (Development)
 
-The read-only desktop shell attaches to an existing workspace daemon. It shows
-sessions and typed, exact-run history; provider credentials remain with the
+The desktop shell attaches to an existing workspace daemon. It renders full
+typed session history, streams the selected run, and supports new or continued
+messages, approval decisions, and cancel. Provider credentials remain with the
 daemon.
 
 ![Plato desktop showing an exact-run transcript](docs/images/desktop-phase-1.png)
@@ -196,8 +197,10 @@ npm run tauri:dev
 ```
 
 On first launch, choose the daemon workspace. The shell remembers its canonical
-path and returns to the picker if that directory disappears. Linux development
-requires the [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/#linux).
+path and returns to the picker if that directory disappears. **New chat** clears
+the selected session; otherwise the composer continues it. Switching chats does
+not cancel their active runs. Linux development requires the
+[Tauri system dependencies](https://v2.tauri.app/start/prerequisites/#linux).
 
 ## Discord Gateway
 
