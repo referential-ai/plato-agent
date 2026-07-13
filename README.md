@@ -119,6 +119,9 @@ the socket and lock before exiting. Do not remove a lock for a live daemon.
 Live assistant deltas are transient `events.stream` events and are not written
 to the ledger. After a `lagged` response, omitting `from_offset` resumes at the
 current tip; `transcript.read` returns ledger-backed status and final answer.
+`hello` advertises `transcript.read.typed`. Successful `transcript.read`
+responses preserve the legacy `transcript` string and add ordered `typed.runs`
+with structured chat, tool, policy, and approval entries.
 
 Minimal NDJSON-over-Unix-socket check, using the `workspace_id` and
 `socket_path` printed by the daemon:

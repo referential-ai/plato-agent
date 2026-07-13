@@ -2,20 +2,23 @@ use crate::{
     AppError, AppResult, ApprovalMode, RunEvent, RunLedger, RunOptions, RunSession,
     daemon::{
         protocol::{
-            ApprovalDecideParams, CommandAcceptedResult, ERROR_INTERNAL, ERROR_LAGGED,
-            ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED,
-            ERROR_SESSIONS_LIST_FAILED, ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH,
-            Envelope, EventsStreamParams, EventsStreamResult, HelloParams, HelloResult,
-            MessageAppendParams, RunCancelParams, RunStartParams, RunStartResult, RunStateName,
-            SessionSummary, SessionsListResult, TranscriptReadParams, TranscriptReadResult,
-            decode_request,
+            ApprovalDecideParams, ApprovalDecisionName, CommandAcceptedResult, ERROR_INTERNAL,
+            ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD,
+            ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED, ERROR_UNSUPPORTED_METHOD,
+            ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams, EventsStreamResult,
+            HelloParams, HelloResult, MessageAppendParams, RunCancelParams, RunStartParams,
+            RunStartResult, RunStateName, SessionSummary, SessionsListResult, TranscriptReadParams,
+            TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry, decode_request,
         },
         runtime::{DaemonRuntime, RunRecord, approval_handler},
     },
-    ledger::SqliteLedger,
-    new_run_id, new_session_id, replay_sqlite, replay_sqlite_session, run_question,
+    ledger::{SessionRunRecords, SqliteLedger},
+    new_run_id, new_session_id,
+    replay::{format_readback, format_session_readback},
+    run_question,
     tools::ApprovalOutcome,
 };
+use platonic_core::{ReadbackEntry, RunReadback};
 use serde_json::json;
 use std::{
     path::{Path, PathBuf},
@@ -120,6 +123,7 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams)
                 "run.cancel".into(),
                 "sessions.list".into(),
                 "transcript.read".into(),
+                "transcript.read.typed".into(),
             ],
         },
     )
@@ -526,12 +530,17 @@ fn read_run_transcript(path: &Path, run_id: &str) -> AppResult<TranscriptReadRes
     if !path.exists() {
         return Err(AppError::RunNotFound(run_id.into()));
     }
-    let status = SqliteLedger::open_readonly(path)?.run_status(run_id)?;
+    let run = SqliteLedger::open_readonly(path)?.read_session_run(run_id)?;
+    let readback = RunReadback::from_events(&run.records)?;
+    let transcript = format_readback(&readback);
     Ok(TranscriptReadResult {
-        run_id: status.run_id,
-        status: status.status,
-        final_answer: status.final_answer,
-        transcript: replay_sqlite(path, Some(run_id))?,
+        run_id: run.run_id.clone(),
+        status: run.status,
+        final_answer: run.final_answer.clone(),
+        transcript,
+        typed: Some(TypedTranscript {
+            runs: vec![typed_run(&run, readback.entries)],
+        }),
     })
 }
 
@@ -539,13 +548,91 @@ fn read_session_transcript(path: &Path, session_id: &str) -> AppResult<Transcrip
     if !path.exists() {
         return Err(AppError::SessionNotFound(session_id.into()));
     }
-    let status = SqliteLedger::open_readonly(path)?.latest_session_run_status(session_id)?;
+    let session = SqliteLedger::open_readonly(path)?.read_session(session_id)?;
+    let latest = session
+        .runs
+        .last()
+        .ok_or_else(|| AppError::SessionNotFound(session_id.into()))?;
+    let transcript = format_session_readback(&session)?;
+    let typed_runs = session
+        .runs
+        .iter()
+        .map(|run| {
+            let readback = RunReadback::from_events(&run.records)?;
+            Ok(typed_run(run, readback.entries))
+        })
+        .collect::<AppResult<Vec<_>>>()?;
     Ok(TranscriptReadResult {
-        run_id: status.run_id,
-        status: status.status,
-        final_answer: status.final_answer,
-        transcript: replay_sqlite_session(path, session_id)?,
+        run_id: latest.run_id.clone(),
+        status: latest.status,
+        final_answer: latest.final_answer.clone(),
+        transcript,
+        typed: Some(TypedTranscript { runs: typed_runs }),
     })
+}
+
+fn typed_run(run: &SessionRunRecords, readback_entries: Vec<ReadbackEntry>) -> TypedRun {
+    TypedRun {
+        run_id: run.run_id.clone(),
+        session_index: run.session_index,
+        status: run.status,
+        entries: typed_entries(&run.question, readback_entries),
+    }
+}
+
+fn typed_entries(
+    question: &str,
+    readback_entries: Vec<ReadbackEntry>,
+) -> Vec<TypedTranscriptEntry> {
+    let mut entries = Vec::with_capacity(readback_entries.len() + 1);
+    entries.push(TypedTranscriptEntry::User {
+        text: question.into(),
+    });
+    for entry in readback_entries {
+        let entry = match entry {
+            ReadbackEntry::ContextFragment { .. } => continue,
+            ReadbackEntry::ModelMessage { message, .. } => TypedTranscriptEntry::Assistant {
+                text: message.content,
+            },
+            ReadbackEntry::ToolCall { call, .. } => TypedTranscriptEntry::ToolCall {
+                call_id: call.id.to_string(),
+                tool: call.tool.to_string(),
+                input: call.input,
+            },
+            ReadbackEntry::ToolResult { result } => TypedTranscriptEntry::ToolResult {
+                call_id: result.call_id.to_string(),
+                summary: result.summary,
+            },
+            ReadbackEntry::PolicyDenied { call_id, reason } => TypedTranscriptEntry::PolicyDenied {
+                call_id: call_id.to_string(),
+                reason,
+            },
+            ReadbackEntry::ApprovalGranted { call_id, actor_id } => {
+                TypedTranscriptEntry::Approval {
+                    call_id: call_id.to_string(),
+                    decision: ApprovalDecisionName::Granted,
+                    actor_id: actor_id.to_string(),
+                    reason: None,
+                }
+            }
+            ReadbackEntry::ApprovalDenied {
+                call_id,
+                actor_id,
+                reason,
+            } => TypedTranscriptEntry::Approval {
+                call_id: call_id.to_string(),
+                decision: ApprovalDecisionName::Denied,
+                actor_id: actor_id.to_string(),
+                reason: Some(reason),
+            },
+            ReadbackEntry::ToolFailed { call_id, reason } => TypedTranscriptEntry::ToolFailed {
+                call_id: call_id.to_string(),
+                error: reason,
+            },
+        };
+        entries.push(entry);
+    }
+    entries
 }
 
 fn transcript_error_code(error: &AppError) -> &'static str {
@@ -621,4 +708,117 @@ fn find_run(runtime: &DaemonRuntime, run_id: &str) -> Result<Arc<RunRecord>, Str
 
 fn error_response(request_id: Option<String>, method: &'static str, message: String) -> Envelope {
     Envelope::error(request_id, Some(method.into()), ERROR_NOT_FOUND, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use platonic_core::{
+        ActorId, ContextFragment, ContextLane, EffectClass, Message, MessageRole, ResultVisibility,
+        ToolCall, ToolCallId, ToolName, ToolResult, TurnId,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn typed_entries_map_all_human_readback_facts_in_order() {
+        let turn_id = TurnId::new("turn_1").unwrap();
+        let call_id = ToolCallId::new("call_1").unwrap();
+        let entries = typed_entries(
+            "do work",
+            vec![
+                ReadbackEntry::ContextFragment {
+                    turn_id: turn_id.clone(),
+                    fragment: ContextFragment {
+                        lane: ContextLane::CurrentTask,
+                        source: "user".into(),
+                        content: "diagnostic context".into(),
+                        estimated_tokens: 2,
+                    },
+                },
+                ReadbackEntry::ModelMessage {
+                    turn_id: turn_id.clone(),
+                    message: Message {
+                        role: MessageRole::Assistant,
+                        content: "working".into(),
+                    },
+                },
+                ReadbackEntry::ToolCall {
+                    turn_id,
+                    call: ToolCall {
+                        id: call_id.clone(),
+                        tool: ToolName::new("file.write").unwrap(),
+                        effect: EffectClass::WorkspaceWrite,
+                        input: json!({"path": "out.txt", "content": "done"}),
+                    },
+                },
+                ReadbackEntry::ApprovalGranted {
+                    call_id: call_id.clone(),
+                    actor_id: ActorId::new("human_1").unwrap(),
+                },
+                ReadbackEntry::ToolResult {
+                    result: ToolResult {
+                        call_id: call_id.clone(),
+                        summary: "wrote out.txt".into(),
+                        data: json!({"bytes": 4}),
+                        artifacts: vec![],
+                        visibility: ResultVisibility::Both,
+                    },
+                },
+                ReadbackEntry::ApprovalDenied {
+                    call_id: ToolCallId::new("call_2").unwrap(),
+                    actor_id: ActorId::new("human_2").unwrap(),
+                    reason: "not now".into(),
+                },
+                ReadbackEntry::PolicyDenied {
+                    call_id: ToolCallId::new("call_3").unwrap(),
+                    reason: "secret access denied".into(),
+                },
+                ReadbackEntry::ToolFailed {
+                    call_id: ToolCallId::new("call_4").unwrap(),
+                    reason: "tool crashed".into(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            entries,
+            vec![
+                TypedTranscriptEntry::User {
+                    text: "do work".into()
+                },
+                TypedTranscriptEntry::Assistant {
+                    text: "working".into()
+                },
+                TypedTranscriptEntry::ToolCall {
+                    call_id: "call_1".into(),
+                    tool: "file.write".into(),
+                    input: json!({"path": "out.txt", "content": "done"}),
+                },
+                TypedTranscriptEntry::Approval {
+                    call_id: "call_1".into(),
+                    decision: ApprovalDecisionName::Granted,
+                    actor_id: "human_1".into(),
+                    reason: None,
+                },
+                TypedTranscriptEntry::ToolResult {
+                    call_id: "call_1".into(),
+                    summary: "wrote out.txt".into(),
+                },
+                TypedTranscriptEntry::Approval {
+                    call_id: "call_2".into(),
+                    decision: ApprovalDecisionName::Denied,
+                    actor_id: "human_2".into(),
+                    reason: Some("not now".into()),
+                },
+                TypedTranscriptEntry::PolicyDenied {
+                    call_id: "call_3".into(),
+                    reason: "secret access denied".into(),
+                },
+                TypedTranscriptEntry::ToolFailed {
+                    call_id: "call_4".into(),
+                    error: "tool crashed".into(),
+                },
+            ]
+        );
+    }
 }

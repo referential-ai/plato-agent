@@ -118,6 +118,10 @@ pub struct SessionTurn {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionRunRecords {
     pub run_id: String,
+    pub session_index: u64,
+    pub question: String,
+    pub status: RunStateName,
+    pub final_answer: Option<String>,
     pub records: Vec<RecordedEvent>,
 }
 
@@ -133,13 +137,6 @@ pub struct PersistedSessionSummary {
     pub run_id: String,
     pub status: RunStateName,
     pub latest_question: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PersistedRunStatus {
-    pub run_id: String,
-    pub status: RunStateName,
-    pub final_answer: Option<String>,
 }
 
 impl SqliteLedger {
@@ -201,20 +198,7 @@ impl SqliteLedger {
     }
 
     pub fn read_run(&self, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
-        let mut statement = self.connection.prepare(
-            "SELECT seq, occurred_at_ms, v, event_json
-             FROM ledger_events
-             WHERE run_id = ?1
-             ORDER BY seq ASC",
-        )?;
-        let records = statement
-            .query_map(params![run_id], sqlite_record_from_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        if records.is_empty() {
-            Err(AppError::RunNotFound(run_id.into()))
-        } else {
-            Ok(records)
-        }
+        read_run_from(&self.connection, run_id)
     }
 
     pub fn read_latest_run(&self) -> AppResult<(String, Vec<RecordedEvent>)> {
@@ -376,27 +360,35 @@ impl SqliteLedger {
     }
 
     pub fn read_session(&self, session_id: &str) -> AppResult<SessionRecords> {
-        if !self.session_exists(session_id)? {
+        let transaction = self.connection.unchecked_transaction()?;
+        if !session_exists_in(&transaction, session_id)? {
             return Err(AppError::SessionNotFound(session_id.into()));
         }
-        let mut statement = self.connection.prepare(
-            "SELECT run_id
-             FROM session_runs
-             WHERE session_id = ?1
-             ORDER BY session_index ASC",
-        )?;
-        let run_ids = statement
-            .query_map(params![session_id], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        let runs = run_ids
+        let runs = {
+            let mut statement = transaction.prepare(
+                "SELECT run_id, session_index, question, status, final_answer
+                 FROM session_runs
+                 WHERE session_id = ?1
+                 ORDER BY session_index ASC",
+            )?;
+            statement
+                .query_map(params![session_id], session_run_metadata_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let runs = runs
             .into_iter()
-            .map(|run_id| {
+            .map(|run| {
                 Ok(SessionRunRecords {
-                    records: self.read_run(&run_id)?,
-                    run_id,
+                    records: read_run_from(&transaction, &run.run_id)?,
+                    run_id: run.run_id,
+                    session_index: run.session_index,
+                    question: run.question,
+                    status: run.status,
+                    final_answer: run.final_answer,
                 })
             })
             .collect::<AppResult<Vec<_>>>()?;
+        transaction.commit()?;
         Ok(SessionRecords {
             session_id: session_id.into(),
             runs,
@@ -406,6 +398,30 @@ impl SqliteLedger {
     pub fn read_latest_session(&self) -> AppResult<SessionRecords> {
         let session_id = self.latest_session_id()?;
         self.read_session(&session_id)
+    }
+
+    pub(crate) fn read_session_run(&self, run_id: &str) -> AppResult<SessionRunRecords> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let run = transaction
+            .query_row(
+                "SELECT run_id, session_index, question, status, final_answer
+                 FROM session_runs
+                 WHERE run_id = ?1",
+                params![run_id],
+                session_run_metadata_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| AppError::RunNotFound(run_id.into()))?;
+        let records = read_run_from(&transaction, &run.run_id)?;
+        transaction.commit()?;
+        Ok(SessionRunRecords {
+            records,
+            run_id: run.run_id,
+            session_index: run.session_index,
+            question: run.question,
+            status: run.status,
+            final_answer: run.final_answer,
+        })
     }
 
     pub fn session_summaries(&self) -> AppResult<Vec<PersistedSessionSummary>> {
@@ -430,36 +446,6 @@ impl SqliteLedger {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
-    }
-
-    pub(crate) fn run_status(&self, run_id: &str) -> AppResult<PersistedRunStatus> {
-        self.query_run_status(
-            "SELECT run_id, status, final_answer FROM session_runs WHERE run_id = ?1",
-            run_id,
-        )?
-        .ok_or_else(|| AppError::RunNotFound(run_id.into()))
-    }
-
-    pub(crate) fn latest_session_run_status(
-        &self,
-        session_id: &str,
-    ) -> AppResult<PersistedRunStatus> {
-        self.query_run_status(
-            "SELECT run_id, status, final_answer
-                 FROM session_runs
-                 WHERE session_id = ?1
-                 ORDER BY session_index DESC
-                 LIMIT 1",
-            session_id,
-        )?
-        .ok_or_else(|| AppError::SessionNotFound(session_id.into()))
-    }
-
-    fn query_run_status(&self, query: &str, id: &str) -> AppResult<Option<PersistedRunStatus>> {
-        Ok(self
-            .connection
-            .query_row(query, params![id], persisted_run_status)
-            .optional()?)
     }
 
     fn session_exists(&self, session_id: &str) -> AppResult<bool> {
@@ -509,12 +495,21 @@ impl SqliteLedger {
     }
 }
 
-fn persisted_run_status(row: &rusqlite::Row<'_>) -> rusqlite::Result<PersistedRunStatus> {
-    Ok(PersistedRunStatus {
-        run_id: row.get(0)?,
-        status: status_from_row(row, 1)?,
-        final_answer: row.get(2)?,
-    })
+fn read_run_from(connection: &Connection, run_id: &str) -> AppResult<Vec<RecordedEvent>> {
+    let mut statement = connection.prepare(
+        "SELECT seq, occurred_at_ms, v, event_json
+             FROM ledger_events
+             WHERE run_id = ?1
+             ORDER BY seq ASC",
+    )?;
+    let records = statement
+        .query_map(params![run_id], sqlite_record_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if records.is_empty() {
+        Err(AppError::RunNotFound(run_id.into()))
+    } else {
+        Ok(records)
+    }
 }
 
 fn status_from_row(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<RunStateName> {
@@ -528,6 +523,24 @@ struct ExistingEvent {
     occurred_at_ms: u64,
     version: u32,
     event_json: String,
+}
+
+struct SessionRunMetadata {
+    run_id: String,
+    session_index: u64,
+    question: String,
+    status: RunStateName,
+    final_answer: Option<String>,
+}
+
+fn session_run_metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRunMetadata> {
+    Ok(SessionRunMetadata {
+        run_id: row.get(0)?,
+        session_index: row_u64(row, 1, "session_index")?,
+        question: row.get(2)?,
+        status: status_from_row(row, 3)?,
+        final_answer: row.get(4)?,
+    })
 }
 
 fn sqlite_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecordedEvent> {
@@ -863,6 +876,50 @@ mod tests {
                 final_answer: "hi".into(),
             }]
         );
+    }
+
+    #[test]
+    fn sqlite_session_records_keep_run_metadata_in_session_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let first = RunId::new("run_1").unwrap();
+        let second = RunId::new("run_2").unwrap();
+
+        ledger
+            .begin_session_run("session_1", &first, "first question", true)
+            .unwrap();
+        ledger
+            .append("run_1", &started_record("run_1", 0, 10))
+            .unwrap();
+        ledger.finish_session_run(&first, "first answer").unwrap();
+        ledger
+            .begin_session_run("session_1", &second, "second question", false)
+            .unwrap();
+        ledger
+            .append("run_2", &started_record("run_2", 0, 20))
+            .unwrap();
+        ledger
+            .fail_session_run(&second, "synthetic failure", false)
+            .unwrap();
+
+        let session = ledger.read_session("session_1").unwrap();
+        assert_eq!(session.runs.len(), 2);
+        assert_eq!(session.runs[0].run_id, "run_1");
+        assert_eq!(session.runs[0].session_index, 0);
+        assert_eq!(session.runs[0].question, "first question");
+        assert_eq!(session.runs[0].status, RunStateName::Finished);
+        assert_eq!(
+            session.runs[0].final_answer.as_deref(),
+            Some("first answer")
+        );
+        assert_eq!(session.runs[0].records[0].event.run_id().as_str(), "run_1");
+        assert_eq!(session.runs[1].run_id, "run_2");
+        assert_eq!(session.runs[1].session_index, 1);
+        assert_eq!(session.runs[1].question, "second question");
+        assert_eq!(session.runs[1].status, RunStateName::Failed);
+        assert_eq!(session.runs[1].final_answer, None);
+        assert_eq!(session.runs[1].records[0].event.run_id().as_str(), "run_2");
     }
 
     #[test]

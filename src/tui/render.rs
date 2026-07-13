@@ -739,6 +739,7 @@ mod tests {
                     transcript:
                         "final_phase: Finished\nnext_seq: 5\n[turn_1] context ToolSchemas model.tools: [{\"name\":\"file_read\"}]\n[turn_1] user: read README\n[turn_1] assistant: README summary\n"
                             .into(),
+                    typed: None,
                 }
                 .into(),
             ),
