@@ -87,7 +87,7 @@ pub fn format_readback(readback: &RunReadback) -> String {
     lines.join("\n")
 }
 
-fn format_session_readback(session: &ledger::SessionRecords) -> AppResult<String> {
+pub(crate) fn format_session_readback(session: &ledger::SessionRecords) -> AppResult<String> {
     let mut lines = vec![format!("session_id: {}", session.session_id)];
     for run in &session.runs {
         lines.push(format!("run_id: {}", run.run_id));

@@ -1171,6 +1171,7 @@ mod tests {
                     status,
                     final_answer: None,
                     transcript: String::new(),
+                    typed: None,
                 })
                 .unwrap(),
                 None

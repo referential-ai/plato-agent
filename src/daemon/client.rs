@@ -525,6 +525,7 @@ mod tests {
         assert_eq!(transcript.run_id, "run_1");
         assert_eq!(transcript.status, RunStateName::Finished);
         assert_eq!(transcript.final_answer.as_deref(), Some("hello"));
+        assert_eq!(transcript.typed, None);
         assert_eq!(run.session_id, "session_1");
         assert_eq!(run.run_id, "run_2");
     }

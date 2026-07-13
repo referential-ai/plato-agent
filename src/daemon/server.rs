@@ -369,7 +369,8 @@ mod tests {
                 "approval.decide",
                 "run.cancel",
                 "sessions.list",
-                "transcript.read"
+                "transcript.read",
+                "transcript.read.typed"
             ])
         );
     }
@@ -872,6 +873,102 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         drop(client);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn transcript_read_returns_one_typed_run_or_all_session_runs_in_order() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let server =
+            DaemonServer::bind(workspace.path(), Some(socket_dir.path().join("agent.sock")))
+                .unwrap();
+        seed_finished_session_run(
+            &server.paths().ledger_path,
+            "run_1",
+            "session_1",
+            "first question",
+            "first answer",
+            true,
+        );
+        seed_finished_session_run(
+            &server.paths().ledger_path,
+            "run_2",
+            "session_1",
+            "second question",
+            "second answer",
+            false,
+        );
+
+        let run = server.handle_line(
+            r#"{"v":1,"id":"run_read","kind":"request","method":"transcript.read","params":{"run_id":"run_2"}}"#,
+        );
+        assert_eq!(run.kind, EnvelopeKind::Response);
+        assert_eq!(
+            run.result.unwrap(),
+            json!({
+                "run_id": "run_2",
+                "status": "finished",
+                "final_answer": "second answer",
+                "transcript": "final_phase: Finished\nnext_seq: 5\n[turn_run_2] assistant: second answer",
+                "typed": {
+                    "runs": [{
+                        "run_id": "run_2",
+                        "session_index": 1,
+                        "status": "finished",
+                        "entries": [
+                            {"kind": "user", "text": "second question"},
+                            {"kind": "assistant", "text": "second answer"}
+                        ]
+                    }]
+                }
+            })
+        );
+
+        let session = server.handle_line(
+            r#"{"v":1,"id":"session_read","kind":"request","method":"transcript.read","params":{"session_id":"session_1"}}"#,
+        );
+        assert_eq!(session.kind, EnvelopeKind::Response);
+        assert_eq!(
+            session.result.unwrap(),
+            json!({
+                "run_id": "run_2",
+                "status": "finished",
+                "final_answer": "second answer",
+                "transcript": concat!(
+                    "session_id: session_1\n",
+                    "run_id: run_1\n",
+                    "final_phase: Finished\n",
+                    "next_seq: 5\n",
+                    "[turn_run_1] assistant: first answer\n",
+                    "run_id: run_2\n",
+                    "final_phase: Finished\n",
+                    "next_seq: 5\n",
+                    "[turn_run_2] assistant: second answer"
+                ),
+                "typed": {
+                    "runs": [
+                        {
+                            "run_id": "run_1",
+                            "session_index": 0,
+                            "status": "finished",
+                            "entries": [
+                                {"kind": "user", "text": "first question"},
+                                {"kind": "assistant", "text": "first answer"}
+                            ]
+                        },
+                        {
+                            "run_id": "run_2",
+                            "session_index": 1,
+                            "status": "finished",
+                            "entries": [
+                                {"kind": "user", "text": "second question"},
+                                {"kind": "assistant", "text": "second answer"}
+                            ]
+                        }
+                    ]
+                }
+            })
+        );
     }
 
     #[test]
@@ -1447,11 +1544,22 @@ enabled = ["{enabled_tool}"]
     }
 
     fn seed_finished_session(path: &Path, run_id: &str, session_id: &str, answer: &str) {
+        seed_finished_session_run(path, run_id, session_id, "question", answer, true);
+    }
+
+    fn seed_finished_session_run(
+        path: &Path,
+        run_id: &str,
+        session_id: &str,
+        question: &str,
+        answer: &str,
+        create_session: bool,
+    ) {
         let run_id = RunId::new(run_id).unwrap();
-        let turn_id = TurnId::new("turn_1").unwrap();
+        let turn_id = TurnId::new(format!("turn_{}", run_id.as_str())).unwrap();
         let mut ledger = SqliteLedger::open_or_create(path).unwrap();
         ledger
-            .begin_session_run(session_id, &run_id, "question", true)
+            .begin_session_run(session_id, &run_id, question, create_session)
             .unwrap();
         let events = vec![
             HarnessEvent::RunStarted {

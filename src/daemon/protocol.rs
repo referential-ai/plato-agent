@@ -239,6 +239,63 @@ pub struct TranscriptReadResult {
     pub status: RunStateName,
     pub final_answer: Option<String>,
     pub transcript: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed: Option<TypedTranscript>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TypedTranscript {
+    pub runs: Vec<TypedRun>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TypedRun {
+    pub run_id: String,
+    pub session_index: u64,
+    pub status: RunStateName,
+    pub entries: Vec<TypedTranscriptEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecisionName {
+    Granted,
+    Denied,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TypedTranscriptEntry {
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    ToolCall {
+        call_id: String,
+        tool: String,
+        input: Value,
+    },
+    ToolResult {
+        call_id: String,
+        summary: String,
+    },
+    Approval {
+        call_id: String,
+        decision: ApprovalDecisionName,
+        actor_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    PolicyDenied {
+        call_id: String,
+        reason: String,
+    },
+    ToolFailed {
+        call_id: String,
+        error: String,
+    },
 }
 
 pub fn decode_request(line: &str) -> Result<Envelope, Box<Envelope>> {
@@ -282,6 +339,7 @@ pub fn decode_request(line: &str) -> Result<Envelope, Box<Envelope>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn run_state_names_keep_wire_values() {
@@ -340,5 +398,139 @@ mod tests {
 
         assert!(raw.contains(r#""kind":"response""#));
         assert!(!raw.contains("params"));
+    }
+
+    #[test]
+    fn typed_transcript_keeps_exact_wire_shape_and_both_compat_directions() {
+        let current = TranscriptReadResult {
+            run_id: "run_1".into(),
+            status: RunStateName::Finished,
+            final_answer: Some("done".into()),
+            transcript: "legacy replay".into(),
+            typed: Some(TypedTranscript {
+                runs: vec![TypedRun {
+                    run_id: "run_1".into(),
+                    session_index: 0,
+                    status: RunStateName::Finished,
+                    entries: vec![
+                        TypedTranscriptEntry::User {
+                            text: "do work".into(),
+                        },
+                        TypedTranscriptEntry::Assistant {
+                            text: "working".into(),
+                        },
+                        TypedTranscriptEntry::ToolCall {
+                            call_id: "call_1".into(),
+                            tool: "file.write".into(),
+                            input: json!({"path": "out.txt", "content": "done"}),
+                        },
+                        TypedTranscriptEntry::ToolResult {
+                            call_id: "call_1".into(),
+                            summary: "wrote out.txt".into(),
+                        },
+                        TypedTranscriptEntry::Approval {
+                            call_id: "call_1".into(),
+                            decision: ApprovalDecisionName::Granted,
+                            actor_id: "human_1".into(),
+                            reason: None,
+                        },
+                        TypedTranscriptEntry::Approval {
+                            call_id: "call_2".into(),
+                            decision: ApprovalDecisionName::Denied,
+                            actor_id: "human_2".into(),
+                            reason: Some("not now".into()),
+                        },
+                        TypedTranscriptEntry::PolicyDenied {
+                            call_id: "call_3".into(),
+                            reason: "secret access denied".into(),
+                        },
+                        TypedTranscriptEntry::ToolFailed {
+                            call_id: "call_4".into(),
+                            error: "tool crashed".into(),
+                        },
+                    ],
+                }],
+            }),
+        };
+
+        let wire = serde_json::to_value(&current).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "run_id": "run_1",
+                "status": "finished",
+                "final_answer": "done",
+                "transcript": "legacy replay",
+                "typed": {
+                    "runs": [{
+                        "run_id": "run_1",
+                        "session_index": 0,
+                        "status": "finished",
+                        "entries": [
+                            {"kind": "user", "text": "do work"},
+                            {"kind": "assistant", "text": "working"},
+                            {
+                                "kind": "tool_call",
+                                "call_id": "call_1",
+                                "tool": "file.write",
+                                "input": {"path": "out.txt", "content": "done"}
+                            },
+                            {
+                                "kind": "tool_result",
+                                "call_id": "call_1",
+                                "summary": "wrote out.txt"
+                            },
+                            {
+                                "kind": "approval",
+                                "call_id": "call_1",
+                                "decision": "granted",
+                                "actor_id": "human_1"
+                            },
+                            {
+                                "kind": "approval",
+                                "call_id": "call_2",
+                                "decision": "denied",
+                                "actor_id": "human_2",
+                                "reason": "not now"
+                            },
+                            {
+                                "kind": "policy_denied",
+                                "call_id": "call_3",
+                                "reason": "secret access denied"
+                            },
+                            {
+                                "kind": "tool_failed",
+                                "call_id": "call_4",
+                                "error": "tool crashed"
+                            }
+                        ]
+                    }]
+                }
+            })
+        );
+
+        #[derive(Deserialize)]
+        struct LegacyTranscriptReadResult {
+            run_id: String,
+            status: RunStateName,
+            final_answer: Option<String>,
+            transcript: String,
+        }
+
+        let legacy_client: LegacyTranscriptReadResult =
+            serde_json::from_value(wire).expect("legacy clients ignore typed");
+        assert_eq!(legacy_client.run_id, "run_1");
+        assert_eq!(legacy_client.status, RunStateName::Finished);
+        assert_eq!(legacy_client.final_answer.as_deref(), Some("done"));
+        assert_eq!(legacy_client.transcript, "legacy replay");
+
+        let current_client: TranscriptReadResult = serde_json::from_value(json!({
+            "run_id": "run_1",
+            "status": "finished",
+            "final_answer": "done",
+            "transcript": "legacy replay"
+        }))
+        .expect("current clients decode typed-less daemon responses");
+        assert_eq!(current_client.typed, None);
     }
 }
