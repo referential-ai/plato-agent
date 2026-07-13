@@ -620,6 +620,7 @@ mod tests {
             final_answer: Some("answer".into()),
             transcript: "legacy".into(),
             typed: None,
+            pending_approval: None,
         };
         assert_eq!(
             extract_typed_run("run_1", base.clone()).unwrap_err(),

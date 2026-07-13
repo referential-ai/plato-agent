@@ -124,6 +124,7 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams)
                 "sessions.list".into(),
                 "transcript.read".into(),
                 "transcript.read.typed".into(),
+                "transcript.read.pending_approval".into(),
             ],
         },
     )
@@ -341,6 +342,14 @@ fn handle_approval_decide(
         Err(error) => return error_response(request.id, "approval.decide", error),
     };
     let mut approvals = record.approvals.lock().expect("approvals lock poisoned");
+    if record.cancel.load(Ordering::SeqCst) {
+        return Envelope::error(
+            request.id,
+            Some("approval.decide".into()),
+            ERROR_NOT_FOUND,
+            format!("pending approval not found: {}", params.tool_call_id),
+        );
+    }
     let pending = match approvals.get_mut(&params.tool_call_id) {
         Some(pending) => pending,
         None => {
@@ -352,6 +361,14 @@ fn handle_approval_decide(
             );
         }
     };
+    if pending.decision.is_some() {
+        return Envelope::error(
+            request.id,
+            Some("approval.decide".into()),
+            ERROR_NOT_FOUND,
+            format!("pending approval not found: {}", params.tool_call_id),
+        );
+    }
     pending.decision = Some(match params.decision.as_str() {
         "grant" => ApprovalOutcome::Granted,
         "deny" => ApprovalOutcome::Denied {
@@ -389,12 +406,13 @@ fn handle_run_cancel(
         Ok(record) => record,
         Err(error) => return error_response(request.id, "run.cancel", error),
     };
-    let approvals = record.approvals.lock().expect("approvals lock poisoned");
+    let mut approvals = record.approvals.lock().expect("approvals lock poisoned");
     record.cancel.store(true, Ordering::SeqCst);
     record.push_event(json!({
         "kind": "canceled",
         "run_id": record.run_id,
     }));
+    approvals.clear();
     record.approval_changed.notify_all();
     drop(approvals);
     Envelope::response_from(
@@ -514,7 +532,8 @@ fn handle_transcript_read(
         );
     };
     match transcript {
-        Ok(transcript) => {
+        Ok(mut transcript) => {
+            transcript.pending_approval = runtime_pending_approval(runtime, &transcript.run_id);
             Envelope::response_from(request.id, Some("transcript.read".into()), transcript)
         }
         Err(error) => Envelope::error(
@@ -524,6 +543,19 @@ fn handle_transcript_read(
             error.to_string(),
         ),
     }
+}
+
+fn runtime_pending_approval(
+    runtime: &DaemonRuntime,
+    run_id: &str,
+) -> Option<crate::daemon::protocol::PendingApprovalSnapshot> {
+    let record = runtime
+        .runs
+        .lock()
+        .expect("runs lock poisoned")
+        .get(run_id)
+        .cloned()?;
+    record.pending_approval()
 }
 
 fn read_run_transcript(path: &Path, run_id: &str) -> AppResult<TranscriptReadResult> {
@@ -541,6 +573,7 @@ fn read_run_transcript(path: &Path, run_id: &str) -> AppResult<TranscriptReadRes
         typed: Some(TypedTranscript {
             runs: vec![typed_run(&run, readback.entries)],
         }),
+        pending_approval: None,
     })
 }
 
@@ -568,6 +601,7 @@ fn read_session_transcript(path: &Path, session_id: &str) -> AppResult<Transcrip
         final_answer: latest.final_answer.clone(),
         transcript,
         typed: Some(TypedTranscript { runs: typed_runs }),
+        pending_approval: None,
     })
 }
 

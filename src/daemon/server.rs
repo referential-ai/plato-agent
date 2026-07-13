@@ -224,7 +224,7 @@ impl Drop for DaemonServer {
 mod tests {
     use super::*;
     use crate::{
-        AppError,
+        AppError, ApprovalRequest,
         daemon::{
             client::DaemonClient,
             protocol::{
@@ -238,8 +238,8 @@ mod tests {
         tools::ApprovalOutcome,
     };
     use platonic_core::{
-        AgentId, ContextPack, HarnessEvent, Message, MessageRole, ModelName, ModelUsage,
-        RecordedEvent, RunId, TurnId,
+        AgentId, ContextPack, EffectClass, HarnessEvent, Message, MessageRole, ModelName,
+        ModelUsage, RecordedEvent, RunId, ToolCallId, TurnId,
     };
     use serde_json::json;
     use std::{
@@ -252,6 +252,19 @@ mod tests {
     };
 
     const FAKE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
+
+    fn pending_request(run_id: &str, call_id: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            run_id: RunId::new(run_id).unwrap(),
+            call_id: ToolCallId::new(call_id).unwrap(),
+            tool_name: "file.write".into(),
+            effect: EffectClass::WorkspaceWrite,
+            reason: "file.write requires approval".into(),
+            input_preview: Some(r#"{"path":"out.txt"}"#.into()),
+            approval_preview: None,
+            diff_preview: None,
+        }
+    }
 
     #[test]
     fn bind_sets_private_socket_permissions() {
@@ -370,7 +383,8 @@ mod tests {
                 "run.cancel",
                 "sessions.list",
                 "transcript.read",
-                "transcript.read.typed"
+                "transcript.read.typed",
+                "transcript.read.pending_approval"
             ])
         );
     }
@@ -434,7 +448,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
     }
 
     #[test]
-    fn run_start_without_wait_returns_while_approval_is_pending_on_same_connection() {
+    fn run_start_without_wait_exposes_and_clears_approval_on_same_connection() {
         let provider = spawn_tool_call_provider();
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
@@ -485,13 +499,43 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
 
         writeln!(
             stream,
-            r#"{{"v":1,"id":"deny_1","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"deny","reason":"test done"}}}}"#,
+            r#"{{"v":1,"id":"transcript_pending","kind":"request","method":"transcript.read","params":{{"run_id":"{}"}}}}"#,
+            run_id
+        )
+        .unwrap();
+        let response = read_envelope(&mut reader);
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        let pending = response.result.unwrap()["pending_approval"].clone();
+        assert_eq!(pending["run_id"], run_id);
+        assert_eq!(pending["tool_call_id"], "call_1");
+        assert_eq!(pending["tool_name"], "file.write");
+        assert_eq!(pending["effect"], "workspace_write");
+        assert!(
+            pending["input_preview"]
+                .as_str()
+                .unwrap()
+                .contains("out.txt")
+        );
+
+        writeln!(
+            stream,
+            r#"{{"v":1,"id":"grant_1","kind":"request","method":"approval.decide","params":{{"run_id":"{}","tool_call_id":"call_1","decision":"grant"}}}}"#,
             run_id
         )
         .unwrap();
         let response = read_envelope(&mut reader);
         assert_eq!(response.kind, EnvelopeKind::Response);
         assert_eq!(response.result.unwrap()["status"], "running");
+
+        writeln!(
+            stream,
+            r#"{{"v":1,"id":"transcript_resolved","kind":"request","method":"transcript.read","params":{{"run_id":"{}"}}}}"#,
+            run_id
+        )
+        .unwrap();
+        let response = read_envelope(&mut reader);
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert!(response.result.unwrap().get("pending_approval").is_none());
 
         stream.shutdown(std::net::Shutdown::Write).unwrap();
         handle.join().unwrap();
@@ -527,6 +571,18 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             r#"{{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{run_id}"}}}}"#
         ));
         assert_eq!(response.kind, EnvelopeKind::Response);
+        assert!(record.approvals.lock().unwrap().is_empty());
+        assert_eq!(record.pending_approval(), None);
+        let transcript = server.handle_line(&format!(
+            r#"{{"v":1,"id":"transcript_1","kind":"request","method":"transcript.read","params":{{"run_id":"{run_id}"}}}}"#
+        ));
+        assert_eq!(transcript.kind, EnvelopeKind::Response);
+        assert!(transcript.result.unwrap().get("pending_approval").is_none());
+        let stale = server.handle_line(&format!(
+            r#"{{"v":1,"id":"approval_1","kind":"request","method":"approval.decide","params":{{"run_id":"{run_id}","tool_call_id":"call_1","decision":"grant"}}}}"#
+        ));
+        assert_eq!(stale.kind, EnvelopeKind::Error);
+        assert_eq!(stale.error.unwrap().code, ERROR_NOT_FOUND);
         let deadline = Instant::now() + Duration::from_secs(2);
         while record.status().state == RunStateName::Running {
             assert!(
@@ -537,6 +593,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         }
 
         assert_eq!(record.status().state, RunStateName::Canceled);
+        assert_eq!(record.pending_approval(), None);
         provider.handle.join().unwrap();
     }
 
@@ -843,6 +900,113 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
     }
 
     #[test]
+    fn client_recovers_pending_approval_after_lag_and_reconnect() {
+        let provider = spawn_tool_call_provider();
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_provider_config(&config_path, &provider.base_url, "file.write");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let runtime = server.runtime.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || server.serve_forever(server_shutdown).unwrap());
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+
+        let started = client
+            .run_start(
+                "write a file".into(),
+                Some(config_path.to_string_lossy().into_owned()),
+                false,
+            )
+            .unwrap();
+        let deadline = Instant::now() + FAKE_PROVIDER_TIMEOUT;
+        let pending = loop {
+            match client.transcript_read(&started.run_id) {
+                Ok(transcript) if transcript.pending_approval.is_some() => {
+                    break transcript.pending_approval.unwrap();
+                }
+                Ok(_) | Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "approval snapshot did not appear"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        assert_eq!(pending.run_id, started.run_id);
+        assert_eq!(pending.tool_call_id, "call_1");
+        assert_eq!(pending.tool_name, "file.write");
+        assert_eq!(pending.effect, EffectClass::WorkspaceWrite);
+        assert!(
+            pending
+                .reason
+                .as_deref()
+                .is_some_and(|reason| !reason.is_empty())
+        );
+        let input_preview = pending.input_preview.as_deref().unwrap();
+        assert!(input_preview.contains("out.txt"));
+        assert!(input_preview.contains("hello"));
+        assert_eq!(pending.approval_preview, None);
+        assert_eq!(pending.diff_preview, None);
+
+        let record = runtime.runs.lock().unwrap()[&started.run_id].clone();
+        for index in 0..(MAX_EVENT_BUFFER + 1) {
+            record.push_event(json!({"kind": "filler", "index": index}));
+        }
+        let error = client
+            .events_stream(&started.run_id, Some(0), 16)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::DaemonResponse(ProtocolError { code, .. }) if code == ERROR_LAGGED
+        ));
+        drop(client);
+
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        let anchor = client.events_stream(&started.run_id, None, 16).unwrap();
+        assert!(anchor.events.is_empty());
+        let run = client.transcript_read(&started.run_id).unwrap();
+        assert_eq!(run.pending_approval.as_ref(), Some(&pending));
+        let session = client.transcript_read_session(&started.session_id).unwrap();
+        assert_eq!(session.run_id, started.run_id);
+        assert_eq!(session.pending_approval.as_ref(), Some(&pending));
+
+        client
+            .approval_deny(&started.run_id, "call_1", "proof complete".into())
+            .unwrap();
+        assert_eq!(
+            client
+                .transcript_read(&started.run_id)
+                .unwrap()
+                .pending_approval,
+            None
+        );
+        let stale = client
+            .approval_grant(&started.run_id, "call_1")
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            AppError::DaemonResponse(ProtocolError { code, .. }) if code == ERROR_NOT_FOUND
+        ));
+        assert_eq!(
+            client
+                .transcript_read(&started.run_id)
+                .unwrap()
+                .pending_approval,
+            None
+        );
+
+        drop(client);
+        shutdown.store(true, Ordering::SeqCst);
+        UnixStream::connect(&socket_path).unwrap();
+        handle.join().unwrap();
+        provider.handle.join().unwrap();
+    }
+
+    #[test]
     fn client_recovers_typed_final_answer_after_daemon_restart() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
@@ -1005,17 +1169,17 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             "session_1".into(),
             server.paths().ledger_path.clone(),
         ));
-        record
-            .approvals
-            .lock()
-            .unwrap()
-            .insert("call_1".into(), PendingApproval::new());
+        record.approvals.lock().unwrap().insert(
+            "call_1".into(),
+            PendingApproval::new(pending_request("run_1", "call_1")),
+        );
         server
             .runtime
             .runs
             .lock()
             .unwrap()
             .insert("run_1".into(), record.clone());
+        assert!(record.pending_approval().is_some());
 
         let response = server.handle_line(
             r#"{"v":1,"id":"approval_1","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"grant"}}"#,
@@ -1026,6 +1190,18 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             record.approvals.lock().unwrap()["call_1"].decision,
             Some(ApprovalOutcome::Granted)
         );
+        assert_eq!(record.pending_approval(), None);
+
+        let stale = server.handle_line(
+            r#"{"v":1,"id":"approval_2","kind":"request","method":"approval.decide","params":{"run_id":"run_1","tool_call_id":"call_1","decision":"deny","reason":"too late"}}"#,
+        );
+        assert_eq!(stale.kind, EnvelopeKind::Error);
+        assert_eq!(stale.error.unwrap().code, ERROR_NOT_FOUND);
+        assert_eq!(
+            record.approvals.lock().unwrap()["call_1"].decision,
+            Some(ApprovalOutcome::Granted)
+        );
+        assert_eq!(record.pending_approval(), None);
     }
 
     #[test]
@@ -1046,7 +1222,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .unwrap()
             .insert("run_1".into(), record.clone());
         let mut approvals = record.approvals.lock().unwrap();
-        approvals.insert("call_1".into(), PendingApproval::new());
+        approvals.insert(
+            "call_1".into(),
+            PendingApproval::new(pending_request("run_1", "call_1")),
+        );
         let (sender, receiver) = mpsc::channel();
         let (started_sender, started_receiver) = mpsc::channel();
         let cancel_server = Arc::clone(&server);

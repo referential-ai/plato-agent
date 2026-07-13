@@ -122,6 +122,9 @@ current tip; `transcript.read` returns ledger-backed status and final answer.
 `hello` advertises `transcript.read.typed`. Successful `transcript.read`
 responses preserve the legacy `transcript` string and add ordered `typed.runs`
 with structured chat, tool, policy, and approval entries.
+`hello` also advertises `transcript.read.pending_approval`; while a run is
+paused, its transcript response includes the complete pending approval and
+omits it immediately after a decision or cancellation.
 
 Minimal NDJSON-over-Unix-socket check, using the `workspace_id` and
 `socket_path` printed by the daemon:

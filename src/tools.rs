@@ -554,7 +554,7 @@ fn truncate_utf8(content: &str, max_bytes: usize) -> &str {
     &content[..boundary]
 }
 
-fn approval_preview_json(input: &Value) -> String {
+pub fn approval_input_preview(input: &Value) -> String {
     let input = input.to_string();
     if input.chars().count() <= APPROVAL_PREVIEW_CHARS {
         return input;
@@ -572,7 +572,7 @@ fn approval_prompt(tool_name: &str, input: &Value, approval_preview: Option<&str
         return format!("Approve {tool_name}?\n{approval_preview}\n[y/N] ");
     }
 
-    let preview = approval_preview_json(input);
+    let preview = approval_input_preview(input);
     format!("Approve {tool_name} {preview}? [y/N] ")
 }
 
@@ -981,6 +981,21 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, AppError::PathEscapesWorkspace(_)));
+    }
+
+    #[test]
+    fn approval_input_preview_is_bounded() {
+        let preview = approval_input_preview(&json!({"content": "x".repeat(2_000)}));
+
+        assert!(preview.ends_with("...(truncated)"));
+        assert_eq!(
+            preview
+                .strip_suffix("...(truncated)")
+                .unwrap()
+                .chars()
+                .count(),
+            APPROVAL_PREVIEW_CHARS
+        );
     }
 
     #[test]

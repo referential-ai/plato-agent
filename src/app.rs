@@ -7,7 +7,7 @@ use crate::{
     tool_catalog::{SHELL_EXEC, ToolSpec, effect_for_tool, tool_specs},
     tools::{
         ApprovalOutcome, ToolExecutionContext, approval_command_preview, approval_diff_preview,
-        ask_for_approval, execute_tool_with_context,
+        approval_input_preview, ask_for_approval, execute_tool_with_context,
     },
 };
 use platonic_core::{
@@ -136,6 +136,7 @@ pub struct ApprovalRequest {
     pub tool_name: String,
     pub effect: EffectClass,
     pub reason: String,
+    pub input_preview: Option<String>,
     pub approval_preview: Option<String>,
     pub diff_preview: Option<String>,
 }
@@ -599,6 +600,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                         tool_name: call.tool.to_string(),
                         effect: call.effect.clone(),
                         reason: reason.clone(),
+                        input_preview: Some(approval_input_preview(&call.input)),
                         approval_preview,
                         diff_preview: approval_diff_preview(
                             &options.workspace_root,
