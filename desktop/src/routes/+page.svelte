@@ -16,6 +16,7 @@
 	let screen = $state<Screen>({ state: 'loading' });
 	let selectingWorkspace = $state(false);
 	let loadingRunId: string | null = $state(null);
+	let viewGeneration = 0;
 
 	const workspaceName = $derived(
 		screen.state === 'ready'
@@ -32,6 +33,8 @@
 	}
 
 	function applyBootstrap(result: BootstrapView): void {
+		viewGeneration += 1;
+		loadingRunId = null;
 		if (result.state === 'needs_workspace') {
 			screen = result;
 			return;
@@ -40,21 +43,30 @@
 	}
 
 	async function loadBootstrap(): Promise<void> {
+		const generation = ++viewGeneration;
+		loadingRunId = null;
 		screen = { state: 'loading' };
 		try {
-			applyBootstrap(await bootstrap());
+			const result = await bootstrap();
+			if (generation === viewGeneration) applyBootstrap(result);
 		} catch (error) {
-			screen = { state: 'unavailable', message: errorMessage(error) };
+			if (generation === viewGeneration) {
+				screen = { state: 'unavailable', message: errorMessage(error) };
+			}
 		}
 	}
 
 	async function chooseWorkspace(): Promise<void> {
+		const generation = ++viewGeneration;
+		loadingRunId = null;
 		selectingWorkspace = true;
 		try {
 			const result = await pickWorkspace();
-			if (result) applyBootstrap(result);
+			if (result && generation === viewGeneration) applyBootstrap(result);
 		} catch (error) {
-			screen = { state: 'unavailable', message: errorMessage(error) };
+			if (generation === viewGeneration) {
+				screen = { state: 'unavailable', message: errorMessage(error) };
+			}
 		} finally {
 			selectingWorkspace = false;
 		}
@@ -62,16 +74,23 @@
 
 	async function selectRun(runId: string): Promise<void> {
 		if (screen.state !== 'ready' || runId === screen.run?.runId) return;
+		const generation = viewGeneration;
 		loadingRunId = runId;
 		try {
 			const run = await readRun(runId);
-			if (loadingRunId === runId && screen.state === 'ready') {
+			if (
+				generation === viewGeneration &&
+				loadingRunId === runId &&
+				screen.state === 'ready'
+			) {
 				screen = { ...screen, run };
 			}
 		} catch (error) {
-			screen = { state: 'unavailable', message: errorMessage(error) };
+			if (generation === viewGeneration) {
+				screen = { state: 'unavailable', message: errorMessage(error) };
+			}
 		} finally {
-			if (loadingRunId === runId) loadingRunId = null;
+			if (generation === viewGeneration && loadingRunId === runId) loadingRunId = null;
 		}
 	}
 </script>

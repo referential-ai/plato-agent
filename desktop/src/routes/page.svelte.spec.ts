@@ -47,6 +47,44 @@ const ready: Extract<BootstrapView, { state: 'ready' }> = {
 	selectedRun: firstRun
 };
 
+const otherReady: Extract<BootstrapView, { state: 'ready' }> = {
+	state: 'ready',
+	workspaceRoot: '/home/jerome/projects/other-workspace',
+	daemonVersion: '0.1.0',
+	sessions: [
+		{
+			sessionId: 'session-other',
+			runId: 'run-other',
+			status: 'finished',
+			latestQuestion: 'Question from the other workspace'
+		}
+	],
+	selectedRun: {
+		runId: 'run-other',
+		sessionIndex: 0,
+		status: 'finished',
+		entries: [{ kind: 'assistant', text: 'Other workspace answer.' }]
+	}
+};
+
+function deferred<T>(): {
+	promise: Promise<T>;
+	resolve: (value: T) => void;
+	reject: (reason: unknown) => void;
+} {
+	let resolve!: (value: T) => void;
+	let reject!: (reason: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
+}
+
+function nextTask(): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 afterEach(() => {
 	clearMocks();
 });
@@ -125,6 +163,55 @@ describe('desktop readback', () => {
 		await page.getByRole('button', { name: /Run the focused proof/ }).click();
 		await expect.element(page.getByText('Focused proof is running.')).toBeVisible();
 		expect(readPayload).toEqual({ runId: 'run-2' });
+	});
+
+	it('ignores a stale run result after the workspace changes', async () => {
+		const oldRead = deferred<DesktopRun>();
+		mockIPC((command) => {
+			if (command === 'bootstrap') return ready;
+			if (command === 'read_run') return oldRead.promise;
+			if (command === 'pick_workspace') return otherReady;
+			throw new Error(`unexpected command ${command}`);
+		});
+
+		render(Page);
+
+		await page.getByRole('button', { name: /Run the focused proof/ }).click();
+		await expect.element(page.getByText('Loading run...')).toBeVisible();
+		await page.getByRole('button', { name: 'Choose workspace' }).click();
+		await expect.element(page.getByText('other-workspace', { exact: true })).toBeVisible();
+		oldRead.resolve({
+			runId: 'run-2',
+			sessionIndex: 2,
+			status: 'finished',
+			entries: [{ kind: 'assistant', text: 'Old workspace answer.' }]
+		});
+		await nextTask();
+
+		await expect.element(page.getByText('Other workspace answer.')).toBeVisible();
+		await expect.element(page.getByText('Old workspace answer.')).not.toBeInTheDocument();
+	});
+
+	it('ignores a stale run error after the workspace changes', async () => {
+		const oldRead = deferred<DesktopRun>();
+		mockIPC((command) => {
+			if (command === 'bootstrap') return ready;
+			if (command === 'read_run') return oldRead.promise;
+			if (command === 'pick_workspace') return otherReady;
+			throw new Error(`unexpected command ${command}`);
+		});
+
+		render(Page);
+
+		await page.getByRole('button', { name: /Run the focused proof/ }).click();
+		await expect.element(page.getByText('Loading run...')).toBeVisible();
+		await page.getByRole('button', { name: 'Choose workspace' }).click();
+		await expect.element(page.getByText('Other workspace answer.')).toBeVisible();
+		oldRead.reject(new Error('old workspace socket failed'));
+		await nextTask();
+
+		await expect.element(page.getByText('Other workspace answer.')).toBeVisible();
+		await expect.element(page.getByText('Daemon unavailable')).not.toBeInTheDocument();
 	});
 
 	it('surfaces daemon errors and retries through bootstrap', async () => {
