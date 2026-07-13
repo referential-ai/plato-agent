@@ -5,6 +5,7 @@ use std::fmt;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
+pub const ERROR_DAEMON_SHUTTING_DOWN: &str = "daemon_shutting_down";
 pub const ERROR_MALFORMED_REQUEST: &str = "malformed_request";
 pub const ERROR_LAGGED: &str = "lagged";
 pub const ERROR_INTERNAL: &str = "internal_error";
@@ -209,6 +210,18 @@ pub struct RunCancelParams {
 pub struct CommandAcceptedResult {
     pub run_id: String,
     pub status: RunStateName,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownIfIdleResultName {
+    Shutdown,
+    RefusedActive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ShutdownIfIdleResult {
+    pub result: ShutdownIfIdleResultName,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

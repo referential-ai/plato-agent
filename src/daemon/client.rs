@@ -4,7 +4,7 @@ use crate::{
         ApprovalDecideParams, CommandAcceptedResult, Envelope, EnvelopeKind, EventsStreamParams,
         EventsStreamResult, HelloParams, HelloResult, MessageAppendParams, PROTOCOL_VERSION,
         RunCancelParams, RunStartParams, RunStartResult, SessionSummary, SessionsListResult,
-        TranscriptReadParams, TranscriptReadResult,
+        ShutdownIfIdleResult, TranscriptReadParams, TranscriptReadResult,
     },
     paths,
 };
@@ -48,6 +48,10 @@ impl DaemonClient {
     pub fn sessions_list(&mut self) -> AppResult<Vec<SessionSummary>> {
         let result: SessionsListResult = self.request_without_params("sessions.list")?;
         Ok(result.sessions)
+    }
+
+    pub fn shutdown_if_idle(&mut self) -> AppResult<ShutdownIfIdleResult> {
+        self.request_without_params("daemon.shutdown_if_idle")
     }
 
     pub fn transcript_read(&mut self, run_id: &str) -> AppResult<TranscriptReadResult> {
@@ -269,7 +273,9 @@ impl DaemonConnectionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::protocol::{ProtocolError, RunStateName, SessionSummary};
+    use crate::daemon::protocol::{
+        ProtocolError, RunStateName, SessionSummary, ShutdownIfIdleResultName,
+    };
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -346,6 +352,40 @@ mod tests {
                 ledger_path: "/tmp/agent.db".into(),
             }]
         );
+    }
+
+    #[test]
+    fn client_omits_shutdown_params_and_decodes_both_outcomes() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            for outcome in ["shutdown", "refused_active"] {
+                let request = read_request(&mut reader);
+                assert_eq!(request.method.as_deref(), Some("daemon.shutdown_if_idle"));
+                assert!(request.params.is_none());
+                write_response(
+                    &mut writer,
+                    request.id,
+                    "daemon.shutdown_if_idle",
+                    json!({"result": outcome}),
+                );
+            }
+        });
+
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        assert_eq!(
+            client.shutdown_if_idle().unwrap().result,
+            ShutdownIfIdleResultName::Shutdown
+        );
+        assert_eq!(
+            client.shutdown_if_idle().unwrap().result,
+            ShutdownIfIdleResultName::RefusedActive
+        );
+        handle.join().unwrap();
     }
 
     #[test]

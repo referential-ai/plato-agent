@@ -125,6 +125,13 @@ with structured chat, tool, policy, and approval entries.
 `hello` also advertises `transcript.read.pending_approval`; while a run is
 paused, its transcript response includes the complete pending approval and
 omits it immediately after a decision or cancellation.
+`hello` advertises `daemon.shutdown_if_idle` for graceful control. The request
+omits `params` (an empty object is also accepted). It returns `refused_active`
+without changing the daemon while a run or approval is active; otherwise it
+closes run admission, returns `shutdown`, then exits and removes its socket and
+lock. Requests dispatched after admission closes but before teardown fail with
+`daemon_shutting_down`; after the `shutdown` response, connection close is
+expected and lock removal confirms success.
 
 Minimal NDJSON-over-Unix-socket check, using the `workspace_id` and
 `socket_path` printed by the daemon:
