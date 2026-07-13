@@ -8,6 +8,8 @@ use crate::{
 };
 use platonic_core::RecordedEvent;
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::sync::Barrier;
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
@@ -22,14 +24,99 @@ pub(super) const MAX_EVENT_BUFFER: usize = 256;
 #[derive(Clone, Debug)]
 pub(super) struct DaemonRuntime {
     pub(super) paths: DaemonPaths,
-    pub(super) runs: Arc<Mutex<HashMap<String, Arc<RunRecord>>>>,
+    pub(super) state: Arc<Mutex<RuntimeState>>,
+    pub(super) stop_requested: Arc<AtomicBool>,
+    #[cfg(test)]
+    shutdown_flush_barrier: Arc<Mutex<Option<Arc<Barrier>>>>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RuntimeState {
+    pub(super) runs: HashMap<String, Arc<RunRecord>>,
+    shutdown_accepted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum RunAdmissionError {
+    ShuttingDown,
+    SessionActive { run_id: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ShutdownIfIdleDecision {
+    Shutdown,
+    RefusedActive,
+    AlreadyShuttingDown,
 }
 
 impl DaemonRuntime {
     pub(super) fn new(paths: DaemonPaths) -> Self {
         Self {
             paths,
-            runs: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(RuntimeState::default())),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            shutdown_flush_barrier: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(super) fn reserve_run(&self, record: Arc<RunRecord>) -> Result<(), RunAdmissionError> {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        if state.shutdown_accepted {
+            return Err(RunAdmissionError::ShuttingDown);
+        }
+        if let Some(run_id) = state
+            .runs
+            .values()
+            .find(|active| {
+                active.session_id == record.session_id
+                    && matches!(
+                        active.status().state,
+                        RunStateName::Running | RunStateName::CancelRequested
+                    )
+            })
+            .map(|active| active.run_id.clone())
+        {
+            return Err(RunAdmissionError::SessionActive { run_id });
+        }
+        state.runs.insert(record.run_id.clone(), record);
+        Ok(())
+    }
+
+    pub(super) fn shutdown_if_idle(&self) -> ShutdownIfIdleDecision {
+        let mut state = self.state.lock().expect("runtime state lock poisoned");
+        if state.shutdown_accepted {
+            return ShutdownIfIdleDecision::AlreadyShuttingDown;
+        }
+        if state.runs.values().any(|record| {
+            matches!(
+                record.status().state,
+                RunStateName::Running | RunStateName::CancelRequested
+            )
+        }) {
+            return ShutdownIfIdleDecision::RefusedActive;
+        }
+        state.shutdown_accepted = true;
+        ShutdownIfIdleDecision::Shutdown
+    }
+
+    pub(super) fn shutdown_accepted(&self) -> bool {
+        self.state
+            .lock()
+            .expect("runtime state lock poisoned")
+            .shutdown_accepted
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_shutdown_flush_barrier(&self, barrier: Arc<Barrier>) {
+        *self.shutdown_flush_barrier.lock().unwrap() = Some(barrier);
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_after_shutdown_flush(&self) {
+        let barrier = self.shutdown_flush_barrier.lock().unwrap().clone();
+        if let Some(barrier) = barrier {
+            barrier.wait();
         }
     }
 }
@@ -235,7 +322,96 @@ fn approval_requested_event(request: &ApprovalRequest) -> Value {
 mod tests {
     use super::*;
     use platonic_core::{EffectClass, RunId, ToolCallId};
-    use std::{path::PathBuf, thread};
+    use std::{path::PathBuf, sync::Barrier, thread};
+
+    fn runtime() -> DaemonRuntime {
+        DaemonRuntime::new(DaemonPaths {
+            workspace_root: PathBuf::from("/tmp/workspace"),
+            workspace_id: "workspace-1".into(),
+            socket_path: PathBuf::from("/tmp/agent.sock"),
+            lock_path: PathBuf::from("/tmp/agent.lock"),
+            ledger_path: PathBuf::from("/tmp/agent.db"),
+        })
+    }
+
+    fn run_record(index: usize) -> Arc<RunRecord> {
+        Arc::new(RunRecord::new(
+            format!("run_{index}"),
+            format!("session_{index}"),
+            PathBuf::from("/tmp/agent.db"),
+        ))
+    }
+
+    #[test]
+    fn shutdown_and_run_admission_linearize() {
+        for index in 0..256 {
+            let runtime = runtime();
+            let barrier = Arc::new(Barrier::new(3));
+            let admit_runtime = runtime.clone();
+            let admit_barrier = barrier.clone();
+            let admission = thread::spawn(move || {
+                admit_barrier.wait();
+                admit_runtime.reserve_run(run_record(index))
+            });
+            let shutdown_runtime = runtime.clone();
+            let shutdown_barrier = barrier.clone();
+            let shutdown = thread::spawn(move || {
+                shutdown_barrier.wait();
+                shutdown_runtime.shutdown_if_idle()
+            });
+
+            barrier.wait();
+            let admission = admission.join().unwrap();
+            let shutdown = shutdown.join().unwrap();
+            assert!(matches!(
+                (admission, shutdown),
+                (Ok(()), ShutdownIfIdleDecision::RefusedActive)
+                    | (
+                        Err(RunAdmissionError::ShuttingDown),
+                        ShutdownIfIdleDecision::Shutdown
+                    )
+            ));
+        }
+    }
+
+    #[test]
+    fn approval_paused_run_refuses_shutdown_until_terminal() {
+        let runtime = runtime();
+        let record = run_record(1);
+        record.approvals.lock().unwrap().insert(
+            "call_1".into(),
+            PendingApproval::new(ApprovalRequest {
+                run_id: RunId::new("run_1").unwrap(),
+                call_id: ToolCallId::new("call_1").unwrap(),
+                tool_name: "file.write".into(),
+                effect: EffectClass::WorkspaceWrite,
+                reason: "file.write requires approval".into(),
+                input_preview: None,
+                approval_preview: None,
+                diff_preview: None,
+            }),
+        );
+        runtime.reserve_run(record.clone()).unwrap();
+
+        assert_eq!(
+            runtime.shutdown_if_idle(),
+            ShutdownIfIdleDecision::RefusedActive
+        );
+        assert!(!runtime.shutdown_accepted());
+
+        record.status.lock().unwrap().state = RunStateName::CancelRequested;
+        assert_eq!(
+            runtime.shutdown_if_idle(),
+            ShutdownIfIdleDecision::RefusedActive
+        );
+
+        record.set_finished("done".into());
+        assert_eq!(runtime.shutdown_if_idle(), ShutdownIfIdleDecision::Shutdown);
+        assert_eq!(
+            runtime.shutdown_if_idle(),
+            ShutdownIfIdleDecision::AlreadyShuttingDown
+        );
+    }
 
     #[test]
     fn approval_requested_event_carries_diff_preview_when_present() {

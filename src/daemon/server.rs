@@ -92,7 +92,8 @@ impl DaemonServer {
 
     pub fn serve_forever(&self, shutdown: Arc<AtomicBool>) -> AppResult<()> {
         for stream in self.listener.incoming() {
-            if shutdown.load(Ordering::SeqCst) {
+            if shutdown.load(Ordering::SeqCst) || self.runtime.stop_requested.load(Ordering::SeqCst)
+            {
                 break;
             }
             let stream = stream?;
@@ -207,9 +208,28 @@ fn handle_stream(runtime: DaemonRuntime, stream: UnixStream) -> AppResult<()> {
             continue;
         }
         let response = handle_line(&runtime, &line);
-        serde_json::to_writer(&mut writer, &response)?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
+        let stop_after_response = response.method.as_deref() == Some("daemon.shutdown_if_idle")
+            && response.kind == crate::daemon::protocol::EnvelopeKind::Response
+            && response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("result"))
+                .and_then(serde_json::Value::as_str)
+                == Some("shutdown");
+        let write_result = (|| -> AppResult<()> {
+            serde_json::to_writer(&mut writer, &response)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
+            Ok(())
+        })();
+        if stop_after_response {
+            #[cfg(test)]
+            runtime.wait_after_shutdown_flush();
+            runtime.stop_requested.store(true, Ordering::SeqCst);
+            let _ = UnixStream::connect(&runtime.paths.socket_path);
+            return write_result;
+        }
+        write_result?;
     }
     Ok(())
 }
@@ -228,9 +248,10 @@ mod tests {
         daemon::{
             client::DaemonClient,
             protocol::{
-                ERROR_INTERNAL, ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND,
-                ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
+                ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
+                ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
                 ERROR_WORKSPACE_MISMATCH, Envelope, EnvelopeKind, ProtocolError, RunStateName,
+                ShutdownIfIdleResultName,
             },
             runtime::{MAX_EVENT_BUFFER, PendingApproval, RunRecord},
         },
@@ -384,9 +405,239 @@ mod tests {
                 "sessions.list",
                 "transcript.read",
                 "transcript.read.typed",
-                "transcript.read.pending_approval"
+                "transcript.read.pending_approval",
+                "daemon.shutdown_if_idle"
             ])
         );
+    }
+
+    #[test]
+    fn shutdown_if_idle_keeps_the_exact_wire_contract() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let server = DaemonServer::bind(
+            workspace.path(),
+            Some(socket_dir.path().join("omitted.sock")),
+        )
+        .unwrap();
+
+        let response = server.handle_line(
+            r#"{"v":1,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}"#,
+        );
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "v": 1,
+                "id": "shutdown_1",
+                "kind": "response",
+                "method": "daemon.shutdown_if_idle",
+                "result": {"result": "shutdown"}
+            })
+        );
+
+        let duplicate = server.handle_line(
+            r#"{"v":1,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle","params":{}}"#,
+        );
+        assert_eq!(duplicate.kind, EnvelopeKind::Error);
+        assert_eq!(duplicate.error.unwrap().code, ERROR_DAEMON_SHUTTING_DOWN);
+        for request in [
+            r#"{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{"question":"hello"}}"#,
+            r#"{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{"message":"hello"}}"#,
+            r#"{"v":1,"id":"append_2","kind":"request","method":"message.append","params":{"session_id":"session_1","message":"hello"}}"#,
+        ] {
+            let response = server.handle_line(request);
+            assert_eq!(response.kind, EnvelopeKind::Error);
+            assert_eq!(response.error.unwrap().code, ERROR_DAEMON_SHUTTING_DOWN);
+        }
+        assert!(server.runtime.state.lock().unwrap().runs.is_empty());
+
+        let empty_server =
+            DaemonServer::bind(workspace.path(), Some(socket_dir.path().join("empty.sock")));
+        assert!(
+            empty_server.is_err(),
+            "the first server still owns the lock"
+        );
+        drop(server);
+        let empty_server =
+            DaemonServer::bind(workspace.path(), Some(socket_dir.path().join("empty.sock")))
+                .unwrap();
+        let invalid = empty_server.handle_line(
+            r#"{"v":1,"id":"invalid","kind":"request","method":"daemon.shutdown_if_idle","params":{"force":true}}"#,
+        );
+        assert_eq!(invalid.kind, EnvelopeKind::Error);
+        assert_eq!(invalid.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+        let invalid = empty_server.handle_line(
+            r#"{"v":1,"id":"invalid_array","kind":"request","method":"daemon.shutdown_if_idle","params":[]}"#,
+        );
+        assert_eq!(invalid.kind, EnvelopeKind::Error);
+        assert_eq!(invalid.error.unwrap().code, ERROR_MALFORMED_REQUEST);
+        let response = empty_server.handle_line(
+            r#"{"v":1,"id":"shutdown_3","kind":"request","method":"daemon.shutdown_if_idle","params":{}}"#,
+        );
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(response.result.unwrap(), json!({"result": "shutdown"}));
+    }
+
+    #[test]
+    fn admission_closed_window_returns_typed_errors_before_teardown() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let lock_path = server.paths().lock_path.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        server.runtime.set_shutdown_flush_barrier(barrier.clone());
+        let handle = thread::spawn(move || {
+            server
+                .serve_forever(Arc::new(AtomicBool::new(false)))
+                .unwrap()
+        });
+        let mut shutdown_stream = UnixStream::connect(&socket_path).unwrap();
+        let mut shutdown_reader = BufReader::new(shutdown_stream.try_clone().unwrap());
+
+        writeln!(
+            shutdown_stream,
+            r#"{{"v":1,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}}"#
+        )
+        .unwrap();
+        let response = read_envelope(&mut shutdown_reader);
+        assert_eq!(response.result.unwrap(), json!({"result": "shutdown"}));
+        assert!(socket_path.exists());
+        assert!(lock_path.exists());
+
+        for request in [
+            r#"{"v":1,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle"}"#,
+            r#"{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{"question":"hello"}}"#,
+            r#"{"v":1,"id":"append_1","kind":"request","method":"message.append","params":{"session_id":"session_1","message":"hello"}}"#,
+        ] {
+            let mut stream = UnixStream::connect(&socket_path).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            writeln!(stream, "{request}").unwrap();
+            let response = read_envelope(&mut reader);
+            assert_eq!(response.kind, EnvelopeKind::Error);
+            assert_eq!(response.error.unwrap().code, ERROR_DAEMON_SHUTTING_DOWN);
+        }
+
+        barrier.wait();
+        handle.join().unwrap();
+        shutdown_reader
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut trailing = String::new();
+        match shutdown_reader.read_line(&mut trailing) {
+            Ok(0) => {}
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+            outcome => panic!("post-ack connection did not close: {outcome:?}"),
+        }
+        assert!(!socket_path.exists());
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn two_workspaces_flush_shutdown_responses_then_remove_their_paths() {
+        let first_workspace = tempfile::tempdir().unwrap();
+        let second_workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let first_socket = socket_dir.path().join("first.sock");
+        let second_socket = socket_dir.path().join("second.sock");
+        let first_server =
+            DaemonServer::bind(first_workspace.path(), Some(first_socket.clone())).unwrap();
+        let second_server =
+            DaemonServer::bind(second_workspace.path(), Some(second_socket.clone())).unwrap();
+        let first_lock = first_server.paths().lock_path.clone();
+        let second_lock = second_server.paths().lock_path.clone();
+        let first_handle = thread::spawn(move || {
+            first_server
+                .serve_forever(Arc::new(AtomicBool::new(false)))
+                .unwrap()
+        });
+        let second_handle = thread::spawn(move || {
+            second_server
+                .serve_forever(Arc::new(AtomicBool::new(false)))
+                .unwrap()
+        });
+        let mut first_client = DaemonClient::connect(&first_socket).unwrap();
+        let mut second_client = DaemonClient::connect(&second_socket).unwrap();
+
+        assert_eq!(
+            first_client.shutdown_if_idle().unwrap().result,
+            ShutdownIfIdleResultName::Shutdown
+        );
+        assert_eq!(
+            second_client.shutdown_if_idle().unwrap().result,
+            ShutdownIfIdleResultName::Shutdown
+        );
+        first_handle.join().unwrap();
+        second_handle.join().unwrap();
+
+        for path in [first_socket, first_lock, second_socket, second_lock] {
+            assert!(!path.exists(), "shutdown left {}", path.display());
+        }
+    }
+
+    #[test]
+    fn approval_paused_refusal_keeps_daemon_usable_until_retry() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path.clone())).unwrap();
+        let paths = server.paths().clone();
+        let record = Arc::new(RunRecord::new(
+            "run_1".into(),
+            "session_1".into(),
+            paths.ledger_path.clone(),
+        ));
+        record.approvals.lock().unwrap().insert(
+            "call_1".into(),
+            PendingApproval::new(pending_request("run_1", "call_1")),
+        );
+        server.runtime.reserve_run(record.clone()).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = thread::spawn(move || server.serve_forever(shutdown).unwrap());
+        let mut stream = UnixStream::connect(&socket_path).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+        writeln!(
+            stream,
+            r#"{{"v":1,"id":"shutdown_1","kind":"request","method":"daemon.shutdown_if_idle"}}"#
+        )
+        .unwrap();
+        let refused = read_envelope(&mut reader);
+        assert_eq!(refused.kind, EnvelopeKind::Response);
+        assert_eq!(refused.result.unwrap(), json!({"result": "refused_active"}));
+        assert!(socket_path.exists());
+        assert!(paths.lock_path.exists());
+
+        writeln!(
+            stream,
+            r#"{{"v":1,"id":"hello_1","kind":"request","method":"hello","params":{{"workspace_root":"{}","workspace_id":"{}"}}}}"#,
+            paths.workspace_root.display(),
+            paths.workspace_id
+        )
+        .unwrap();
+        assert_eq!(read_envelope(&mut reader).kind, EnvelopeKind::Response);
+
+        writeln!(
+            stream,
+            r#"{{"v":1,"id":"deny_1","kind":"request","method":"approval.decide","params":{{"run_id":"run_1","tool_call_id":"call_1","decision":"deny"}}}}"#
+        )
+        .unwrap();
+        assert_eq!(read_envelope(&mut reader).kind, EnvelopeKind::Response);
+        record.approvals.lock().unwrap().clear();
+        record.set_finished("done".into());
+        writeln!(
+            stream,
+            r#"{{"v":1,"id":"shutdown_2","kind":"request","method":"daemon.shutdown_if_idle","params":{{}}}}"#
+        )
+        .unwrap();
+        let accepted = read_envelope(&mut reader);
+        assert_eq!(accepted.kind, EnvelopeKind::Response);
+        assert_eq!(accepted.result.unwrap(), json!({"result": "shutdown"}));
+
+        handle.join().unwrap();
+        assert!(!socket_path.exists());
+        assert!(!paths.lock_path.exists());
     }
 
     #[test]
@@ -560,7 +811,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             .as_str()
             .unwrap()
             .to_string();
-        let record = server.runtime.runs.lock().unwrap()[&run_id].clone();
+        let record = server.runtime.state.lock().unwrap().runs[&run_id].clone();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !record.approvals.lock().unwrap().contains_key("call_1") {
             assert!(Instant::now() < deadline, "approval did not become pending");
@@ -707,7 +958,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let pending = admitted_run_ids.iter().any(|run_id| {
-                server.runtime.runs.lock().unwrap()[run_id]
+                server.runtime.state.lock().unwrap().runs[run_id]
                     .approvals
                     .lock()
                     .unwrap()
@@ -773,9 +1024,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         record.push_event(json!({"kind": "test"}));
         server
             .runtime
-            .runs
+            .state
             .lock()
             .unwrap()
+            .runs
             .insert("run_1".into(), record);
 
         let response = server.handle_line(
@@ -804,9 +1056,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         record.push_event(json!({"kind": "second"}));
         server
             .runtime
-            .runs
+            .state
             .lock()
             .unwrap()
+            .runs
             .insert("run_1".into(), record);
 
         let first = server.handle_line(
@@ -840,9 +1093,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         }
         server
             .runtime
-            .runs
+            .state
             .lock()
             .unwrap()
+            .runs
             .insert("run_1".into(), record);
 
         let response = server.handle_line(
@@ -872,9 +1126,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         }
         server
             .runtime
-            .runs
+            .state
             .lock()
             .unwrap()
+            .runs
             .insert("run_1".into(), record);
         let handle = thread::spawn(move || server.serve_next().unwrap());
         let mut client = DaemonClient::connect(&socket_path).unwrap();
@@ -952,7 +1207,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         assert_eq!(pending.approval_preview, None);
         assert_eq!(pending.diff_preview, None);
 
-        let record = runtime.runs.lock().unwrap()[&started.run_id].clone();
+        let record = runtime.state.lock().unwrap().runs[&started.run_id].clone();
         for index in 0..(MAX_EVENT_BUFFER + 1) {
             record.push_event(json!({"kind": "filler", "index": index}));
         }
@@ -1175,9 +1430,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         );
         server
             .runtime
-            .runs
+            .state
             .lock()
             .unwrap()
+            .runs
             .insert("run_1".into(), record.clone());
         assert!(record.pending_approval().is_some());
 
@@ -1217,9 +1473,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         ));
         server
             .runtime
-            .runs
+            .state
             .lock()
             .unwrap()
+            .runs
             .insert("run_1".into(), record.clone());
         let mut approvals = record.approvals.lock().unwrap();
         approvals.insert(
@@ -1264,9 +1521,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         ));
         server
             .runtime
-            .runs
+            .state
             .lock()
             .unwrap()
+            .runs
             .insert("run_1".into(), record);
 
         let response = server
@@ -1448,9 +1706,10 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
         ));
         server
             .runtime
-            .runs
+            .state
             .lock()
             .unwrap()
+            .runs
             .insert("run_1".into(), record);
 
         let response = server.handle_line(
@@ -1710,7 +1969,7 @@ enabled = ["{enabled_tool}"]
                 "finished" => return,
                 "running" => {}
                 status => {
-                    let record = server.runtime.runs.lock().unwrap()[run_id].clone();
+                    let record = server.runtime.state.lock().unwrap().runs[run_id].clone();
                     panic!(
                         "run {run_id} ended as {status}: {:?}",
                         record.status().error

@@ -2,15 +2,18 @@ use crate::{
     AppError, AppResult, ApprovalMode, RunEvent, RunLedger, RunOptions, RunSession,
     daemon::{
         protocol::{
-            ApprovalDecideParams, ApprovalDecisionName, CommandAcceptedResult, ERROR_INTERNAL,
-            ERROR_LAGGED, ERROR_MALFORMED_REQUEST, ERROR_NOT_FOUND, ERROR_OVERLOAD,
-            ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED, ERROR_UNSUPPORTED_METHOD,
-            ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams, EventsStreamResult,
-            HelloParams, HelloResult, MessageAppendParams, RunCancelParams, RunStartParams,
-            RunStartResult, RunStateName, SessionSummary, SessionsListResult, TranscriptReadParams,
+            ApprovalDecideParams, ApprovalDecisionName, CommandAcceptedResult,
+            ERROR_DAEMON_SHUTTING_DOWN, ERROR_INTERNAL, ERROR_LAGGED, ERROR_MALFORMED_REQUEST,
+            ERROR_NOT_FOUND, ERROR_OVERLOAD, ERROR_RUN_FAILED, ERROR_SESSIONS_LIST_FAILED,
+            ERROR_UNSUPPORTED_METHOD, ERROR_WORKSPACE_MISMATCH, Envelope, EventsStreamParams,
+            EventsStreamResult, HelloParams, HelloResult, MessageAppendParams, RunCancelParams,
+            RunStartParams, RunStartResult, RunStateName, SessionSummary, SessionsListResult,
+            ShutdownIfIdleResult, ShutdownIfIdleResultName, TranscriptReadParams,
             TranscriptReadResult, TypedRun, TypedTranscript, TypedTranscriptEntry, decode_request,
         },
-        runtime::{DaemonRuntime, RunRecord, approval_handler},
+        runtime::{
+            DaemonRuntime, RunAdmissionError, RunRecord, ShutdownIfIdleDecision, approval_handler,
+        },
     },
     ledger::{SessionRunRecords, SqliteLedger},
     new_run_id, new_session_id,
@@ -52,6 +55,7 @@ fn handle_request(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
         }
         Some("run.cancel") => handle_with_params(runtime, request, "run.cancel", handle_run_cancel),
         Some("sessions.list") => handle_sessions_list(runtime, request),
+        Some("daemon.shutdown_if_idle") => handle_shutdown_if_idle(runtime, request),
         Some("transcript.read") => {
             handle_with_params(runtime, request, "transcript.read", handle_transcript_read)
         }
@@ -125,6 +129,7 @@ fn handle_hello(runtime: &DaemonRuntime, request: Envelope, params: HelloParams)
                 "transcript.read".into(),
                 "transcript.read.typed".into(),
                 "transcript.read.pending_approval".into(),
+                "daemon.shutdown_if_idle".into(),
             ],
         },
     )
@@ -153,11 +158,17 @@ fn handle_message_append(
     request: Envelope,
     params: MessageAppendParams,
 ) -> Envelope {
+    if runtime.shutdown_accepted() {
+        return shutting_down_response(request.id, "message.append");
+    }
     let session_id = match params.session_id {
         Some(session_id) => session_id,
         None => match latest_session_id(runtime) {
             Ok(session_id) => session_id,
             Err(error) => {
+                if runtime.shutdown_accepted() {
+                    return shutting_down_response(request.id, "message.append");
+                }
                 return Envelope::error(
                     request.id,
                     Some("message.append".into()),
@@ -188,21 +199,6 @@ fn start_run(
     wait: Option<bool>,
 ) -> Envelope {
     let session_id = session.session_id().to_string();
-    let mut runs = runtime.runs.lock().expect("runs lock poisoned");
-    if let Some(active_run_id) = runs
-        .values()
-        .find(|record| {
-            record.session_id == session_id && record.status().state == RunStateName::Running
-        })
-        .map(|record| record.run_id.clone())
-    {
-        return Envelope::error(
-            request_id,
-            Some(method.into()),
-            ERROR_OVERLOAD,
-            format!("session already has an active run: {session_id} ({active_run_id})"),
-        );
-    }
     let run_id = match new_run_id() {
         Ok(run_id) => run_id,
         Err(error) => {
@@ -220,8 +216,23 @@ fn start_run(
         session_id,
         runtime.paths.ledger_path.clone(),
     ));
-    runs.insert(run_id_string.clone(), record.clone());
-    drop(runs);
+    match runtime.reserve_run(record.clone()) {
+        Ok(()) => {}
+        Err(RunAdmissionError::ShuttingDown) => {
+            return shutting_down_response(request_id, method);
+        }
+        Err(RunAdmissionError::SessionActive { run_id }) => {
+            return Envelope::error(
+                request_id,
+                Some(method.into()),
+                ERROR_OVERLOAD,
+                format!(
+                    "session already has an active run: {} ({run_id})",
+                    record.session_id
+                ),
+            );
+        }
+    }
 
     let (event_sender, event_receiver) = mpsc::channel::<RunEvent>();
     spawn_event_collector(record.clone(), event_receiver);
@@ -262,6 +273,50 @@ fn start_run(
         });
         run_start_response(request_id, method, &record)
     }
+}
+
+fn handle_shutdown_if_idle(runtime: &DaemonRuntime, request: Envelope) -> Envelope {
+    let valid_params = match request.params.as_ref() {
+        None => true,
+        Some(serde_json::Value::Object(params)) => params.is_empty(),
+        Some(_) => false,
+    };
+    if !valid_params {
+        return Envelope::error(
+            request.id,
+            request.method,
+            ERROR_MALFORMED_REQUEST,
+            "daemon.shutdown_if_idle params must be omitted or an empty object",
+        );
+    }
+    match runtime.shutdown_if_idle() {
+        ShutdownIfIdleDecision::Shutdown => Envelope::response_from(
+            request.id,
+            Some("daemon.shutdown_if_idle".into()),
+            ShutdownIfIdleResult {
+                result: ShutdownIfIdleResultName::Shutdown,
+            },
+        ),
+        ShutdownIfIdleDecision::RefusedActive => Envelope::response_from(
+            request.id,
+            Some("daemon.shutdown_if_idle".into()),
+            ShutdownIfIdleResult {
+                result: ShutdownIfIdleResultName::RefusedActive,
+            },
+        ),
+        ShutdownIfIdleDecision::AlreadyShuttingDown => {
+            shutting_down_response(request.id, "daemon.shutdown_if_idle")
+        }
+    }
+}
+
+fn shutting_down_response(request_id: Option<String>, method: &'static str) -> Envelope {
+    Envelope::error(
+        request_id,
+        Some(method.into()),
+        ERROR_DAEMON_SHUTTING_DOWN,
+        "daemon shutdown is already in progress",
+    )
 }
 
 fn run_start_response(request_id: Option<String>, method: &str, record: &RunRecord) -> Envelope {
@@ -454,10 +509,9 @@ fn session_summaries(runtime: &DaemonRuntime) -> crate::AppResult<Vec<SessionSum
         })
         .collect::<Vec<_>>();
 
-    let active_sessions = runtime
+    let state = runtime.state.lock().expect("runtime state lock poisoned");
+    let active_sessions = state
         .runs
-        .lock()
-        .expect("runs lock poisoned")
         .values()
         .filter_map(|record| {
             let status = record.status();
@@ -550,9 +604,10 @@ fn runtime_pending_approval(
     run_id: &str,
 ) -> Option<crate::daemon::protocol::PendingApprovalSnapshot> {
     let record = runtime
-        .runs
+        .state
         .lock()
-        .expect("runs lock poisoned")
+        .expect("runtime state lock poisoned")
+        .runs
         .get(run_id)
         .cloned()?;
     record.pending_approval()
@@ -732,9 +787,10 @@ fn spawn_event_collector(record: Arc<RunRecord>, receiver: mpsc::Receiver<RunEve
 
 fn find_run(runtime: &DaemonRuntime, run_id: &str) -> Result<Arc<RunRecord>, String> {
     runtime
-        .runs
+        .state
         .lock()
-        .expect("runs lock poisoned")
+        .expect("runtime state lock poisoned")
+        .runs
         .get(run_id)
         .cloned()
         .ok_or_else(|| format!("run not found: {run_id}"))
