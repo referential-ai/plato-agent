@@ -30,7 +30,8 @@ jobs:
           try {
             $env:PLATO_WINDOWS_SECOND_USER = $user
             $env:PLATO_WINDOWS_SECOND_PASSWORD = $password
-            cargo run --manifest-path spikes/windows-pipe/Cargo.toml
+            cargo run --locked --manifest-path spikes/windows-pipe/Cargo.toml
+            if ($LASTEXITCODE -ne 0) { throw "named-pipe security spike failed" }
           } finally {
             net user $user /delete | Out-Null
           }

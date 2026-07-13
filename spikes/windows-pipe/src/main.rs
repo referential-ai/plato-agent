@@ -68,7 +68,10 @@ mod windows {
                 io::ErrorKind::PermissionDenied,
                 "remote named-pipe client unexpectedly connected",
             )),
-            Err(_) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(5) => Ok(()),
+            Err(error) => Err(io::Error::other(format!(
+                "remote connect failed with {error}, expected ERROR_ACCESS_DENIED"
+            ))),
         }
     }
 
@@ -161,11 +164,12 @@ mod windows {
 
         let result = Stream::connect(pipe_name.to_owned().to_ns_name::<GenericNamespaced>()?);
         let revert = unsafe { RevertToSelf() };
+        let revert_error = (revert == 0).then(io::Error::last_os_error);
         unsafe {
             CloseHandle(token);
         }
-        if revert == 0 {
-            return Err(io::Error::last_os_error());
+        if let Some(error) = revert_error {
+            return Err(error);
         }
         match result {
             Err(error) if error.raw_os_error() == Some(5) => {}
