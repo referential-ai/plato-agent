@@ -166,6 +166,28 @@ NDJSON `run.start` and `message.append` default to `wait: false`, returning a
 `running` response immediately. Send `"wait": true` only when the connection can
 block until the run finishes.
 
+## Desktop (Development)
+
+The read-only desktop shell attaches to an existing workspace daemon. It shows
+sessions and typed, exact-run history; provider credentials remain with the
+daemon.
+
+![Plato desktop showing an exact-run transcript](docs/images/desktop-phase-1.png)
+
+```bash
+# Terminal 1, from the repository root
+cargo run --bin plato-agentd -- --workspace "$PWD"
+
+# Terminal 2
+cd desktop
+npm ci
+npm run tauri:dev
+```
+
+On first launch, choose the daemon workspace. The shell remembers its canonical
+path and returns to the picker if that directory disappears. Linux development
+requires the [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/#linux).
+
 ## Discord Gateway
 
 `plato-gateway-discord` receives Discord messages over an outbound WebSocket

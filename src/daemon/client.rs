@@ -211,6 +211,12 @@ impl DaemonClient {
             ));
         }
         let response = serde_json::from_str::<Envelope>(line.trim())?;
+        if response.v != PROTOCOL_VERSION {
+            return Err(AppError::DaemonProtocol(format!(
+                "unsupported response protocol version: {}",
+                response.v
+            )));
+        }
         if response.id.as_deref() != Some(&id) {
             return Err(AppError::DaemonProtocol(format!(
                 "response id mismatch: expected {id}, got {:?}",
@@ -376,6 +382,37 @@ mod tests {
             error,
             AppError::DaemonResponse(ProtocolError { code, message })
                 if code == "not_found" && message == "missing"
+        ));
+    }
+
+    #[test]
+    fn client_rejects_an_unsupported_response_protocol_version() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let request = read_request(&mut reader);
+            let mut response = Envelope::response(
+                request.id,
+                Some("sessions.list".into()),
+                json!({"sessions": []}),
+            );
+            response.v = PROTOCOL_VERSION + 1;
+            serde_json::to_writer(&mut writer, &response).unwrap();
+            writer.write_all(b"\n").unwrap();
+        });
+
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        let error = client.sessions_list().unwrap_err();
+        handle.join().unwrap();
+
+        assert!(matches!(
+            error,
+            AppError::DaemonProtocol(message)
+                if message == "unsupported response protocol version: 2"
         ));
     }
 

@@ -1,0 +1,11 @@
+{
+  "identifier": "main",
+  "description": "Typed read-only Plato desktop commands for the main window",
+  "local": true,
+  "windows": ["main"],
+  "permissions": [
+    "allow-bootstrap",
+    "allow-pick-workspace",
+    "allow-read-run"
+  ]
+}
