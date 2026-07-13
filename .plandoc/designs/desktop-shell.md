@@ -5,7 +5,7 @@ issue: https://github.com/referential-ai/plato-agent/issues/139
 
 # Plato Desktop Shell (Tauri + Web UI over plato-agentd)
 
-Revision 5 — **Draft**, not adopted. Rev 2 folded R1–R9 (direction confirmed: Tauri client, shared daemon ownership, in-repo home, Windows named pipes); rev 3 added cross-platform scope per human direction (Windows, macOS, Linux all ship; Windows first); rev 4 folded C10–C12; rev 5 folded C13–C16; rev 6 folds C17 (C18 is reconciled on issue #139). The final pre-merge revision flips this header to **Active** only on explicit human merge/adopt instruction. No phase goes `Ready for dev` against a Draft.
+Revision 6 — **Draft**, not adopted. Rev 2 folded R1–R9 (direction confirmed: Tauri client, shared daemon ownership, in-repo home, Windows named pipes); rev 3 added cross-platform scope per human direction (Windows, macOS, Linux all ship; Windows first); rev 4 folded C10–C12; rev 5 folded C13–C16; rev 6 folds C17 (C18 is reconciled on issue #139). The final pre-merge revision flips this header to **Active** only on explicit human merge/adopt instruction. No phase goes `Ready for dev` against a Draft.
 
 ## Authority
 - Human direction 2026-07-12: Codex-desktop-style app; Tauri accepted; web UI in the stack already in use (Svelte 5 / Tailwind 4 / shadcn-svelte); distribution must feel natural to a Windows user; C# path declined.
