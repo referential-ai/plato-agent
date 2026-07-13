@@ -1,0 +1,36 @@
+name: Windows CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  pipe-security-spike:
+    name: Pipe security spike
+    runs-on: windows-2025
+    steps:
+      - name: Check out plato-agent
+        uses: actions/checkout@v4
+
+      - name: Prove named-pipe security gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $user = "plato-pipe-test"
+          $password = "P1pe-$([guid]::NewGuid().ToString())-aA1!"
+          Write-Output "::add-mask::$password"
+          net user $user /delete 2>$null | Out-Null
+          net user $user $password /add | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "failed to create second local user" }
+          try {
+            $env:PLATO_WINDOWS_SECOND_USER = $user
+            $env:PLATO_WINDOWS_SECOND_PASSWORD = $password
+            cargo run --manifest-path spikes/windows-pipe/Cargo.toml
+          } finally {
+            net user $user /delete | Out-Null
+          }
