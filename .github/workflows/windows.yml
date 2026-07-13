@@ -22,7 +22,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $user = "plato-pipe-test"
-          $password = "P1pe-$([guid]::NewGuid().ToString())-aA1!"
+          $password = "P1pe147!Aa2"
           Write-Output "::add-mask::$password"
           net user $user /delete 2>$null | Out-Null
           net user $user $password /add | Out-Null
