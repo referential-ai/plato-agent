@@ -518,7 +518,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
 
         messages.push(ModelMessage::assistant_blocks(response.content.clone()));
         let (tool_use_id, tool_name, input) = tool_uses.into_iter().next().expect("checked len");
-        let call_id = ToolCallId::new(tool_use_id.clone())?;
+        let call_id = mint_tool_call_id(turn_index)?;
         let call = tool_call(call_id.clone(), &tool_name, input)?;
         record_event(
             &mut recorder,
@@ -916,6 +916,10 @@ fn tool_call(call_id: ToolCallId, name: &str, input: Value) -> AppResult<ToolCal
     })
 }
 
+fn mint_tool_call_id(step: u32) -> AppResult<ToolCallId> {
+    ToolCallId::new(format!("call_{}", u64::from(step) + 1)).map_err(Into::into)
+}
+
 fn evaluate_policy(enabled_tools: &[String], call: &ToolCall) -> PolicyDecision {
     if enabled_tools
         .iter()
@@ -1005,6 +1009,7 @@ mod tests {
         io::{Read, Write},
         net::TcpListener,
         path::Path,
+        sync::Mutex,
         thread,
     };
 
@@ -1322,6 +1327,193 @@ mod tests {
     }
 
     #[test]
+    fn reused_provider_tool_id_gets_unique_host_ids_and_keeps_provider_echo() {
+        let provider = spawn_provider_sequence(vec![
+            json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "provider_reused",
+                            "type": "function",
+                            "function": {
+                                "name": "file_write",
+                                "arguments": "{\"path\":\"first.txt\",\"content\":\"first\"}"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "provider_reused",
+                            "type": "function",
+                            "function": {
+                                "name": "file_read",
+                                "arguments": "{\"path\":\"README.md\"}"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "provider_reused",
+                            "type": "function",
+                            "function": {
+                                "name": "file_write",
+                                "arguments": "{\"path\":\"../outside.txt\",\"content\":\"blocked\"}"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": "done"}
+                }]
+            }),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("plato.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[provider]
+kind = "open_ai"
+model = "test-model"
+api_key_env = "PATH"
+base_url = "{}"
+timeout_ms = 5000
+
+[limits]
+token_budget = 4000
+max_output_tokens = 32
+max_turns = 4
+
+[tools]
+enabled = ["file.write"]
+"#,
+                provider.base_url
+            ),
+        )
+        .unwrap();
+        let ledger_path = dir.path().join("events.jsonl");
+        let approval_ids = Arc::new(Mutex::new(Vec::new()));
+        let captured_approval_ids = approval_ids.clone();
+
+        let outcome = run_question(RunOptions {
+            question: "write twice".into(),
+            config_path: Some(config_path),
+            ledger: RunLedger::Jsonl(ledger_path.clone()),
+            workspace_root: dir.path().to_path_buf(),
+            approval_mode: ApprovalMode::external("test", move |request| {
+                captured_approval_ids.lock().unwrap().push(request.call_id);
+                Ok(ApprovalOutcome::Granted)
+            }),
+            run_id: Some(RunId::new("run_reused_provider_id").unwrap()),
+            session: None,
+            event_sender: None,
+            stream_to_stderr: false,
+            cancel: None,
+        })
+        .unwrap();
+        let requests = provider.handle.join().unwrap();
+
+        assert_eq!(outcome.final_answer, "done");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("first.txt")).unwrap(),
+            "first"
+        );
+        let records = crate::ledger::read_records(&ledger_path).unwrap();
+        let proposed_ids = records
+            .iter()
+            .filter_map(|record| match &record.event {
+                HarnessEvent::ToolCallProposed { call, .. } => Some(call.id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(proposed_ids, vec!["call_1", "call_2", "call_3"]);
+        assert_eq!(
+            approval_ids
+                .lock()
+                .unwrap()
+                .iter()
+                .map(ToolCallId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["call_1", "call_3"]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    HarnessEvent::PolicyEvaluated { call_id, .. }
+                    | HarnessEvent::ApprovalGranted { call_id, .. }
+                    | HarnessEvent::ToolStarted { call_id, .. } => Some(call_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                "call_1", "call_1", "call_1", "call_2", "call_3", "call_3", "call_3",
+            ]
+        );
+        assert!(records.iter().any(|record| matches!(
+            &record.event,
+            HarnessEvent::ToolFinished { result, .. } if result.call_id.as_str() == "call_1"
+        )));
+        assert!(records.iter().any(|record| matches!(
+            &record.event,
+            HarnessEvent::ToolFailed { call_id, .. } if call_id.as_str() == "call_3"
+        )));
+
+        let provider_tool_result_ids = requests
+            .iter()
+            .map(|request| http_request_json(request))
+            .map(|body| {
+                body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|message| message["tool_call_id"].as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            provider_tool_result_ids,
+            vec![
+                Vec::<String>::new(),
+                vec!["provider_reused".into()],
+                vec!["provider_reused".into(), "provider_reused".into()],
+                vec![
+                    "provider_reused".into(),
+                    "provider_reused".into(),
+                    "provider_reused".into(),
+                ],
+            ]
+        );
+
+        let readback = RunReadback::from_events(&records).unwrap();
+        assert!(matches!(readback.final_phase, RunPhase::Finished));
+        let replay = crate::replay::replay_file(&ledger_path).unwrap();
+        assert!(replay.contains("approval_granted call_1 by test"));
+        assert!(replay.contains("tool_result call_1:"));
+        assert!(replay.contains("policy_denied call_2:"));
+        assert!(replay.contains("approval_granted call_3 by test"));
+        assert!(replay.contains("tool_failed call_3:"));
+    }
+
+    #[test]
     fn assistant_deltas_are_live_only_not_jsonl_ledger() {
         let server = spawn_streaming_provider(concat!(
             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
@@ -1622,6 +1814,35 @@ enabled = ["file.read"]
         handle: thread::JoinHandle<String>,
     }
 
+    struct SequenceProvider {
+        base_url: String,
+        handle: thread::JoinHandle<Vec<String>>,
+    }
+
+    fn spawn_provider_sequence(responses: Vec<Value>) -> SequenceProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            responses
+                .into_iter()
+                .map(|response| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_http_request(&mut stream);
+                    let body = serde_json::to_string(&response).unwrap();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                    request
+                })
+                .collect()
+        });
+        SequenceProvider { base_url, handle }
+    }
+
     fn spawn_streaming_provider(response_body: &'static str) -> StreamingProvider {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -1696,6 +1917,10 @@ enabled = ["file.read"]
             bytes.extend_from_slice(&buffer[..read]);
         }
         String::from_utf8(bytes).unwrap()
+    }
+
+    fn http_request_json(request: &str) -> Value {
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
     }
 
     fn find_header_end(bytes: &[u8]) -> Option<usize> {

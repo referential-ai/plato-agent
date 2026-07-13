@@ -498,6 +498,11 @@ impl ChatMessage {
 }
 
 fn tool_use_from_provider(id: String, name: String, arguments: String) -> AppResult<ModelBlock> {
+    if id.trim().is_empty() {
+        return Err(AppError::Provider(
+            "provider returned tool call without id".into(),
+        ));
+    }
     let tool_name = internal_name_for_provider(&name)
         .ok_or_else(|| AppError::Provider(format!("provider returned unknown tool {name}")))?;
     let input = serde_json::from_str(&arguments).map_err(|error| {
@@ -658,6 +663,34 @@ mod tests {
         assert!(matches!(
             err,
             AppError::Provider(message) if message == "provider returned unknown tool shell_delete"
+        ));
+    }
+
+    #[test]
+    fn provider_tool_calls_require_an_id() {
+        let response: ChatCompletionResponse = serde_json::from_value(json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "  ",
+                        "type": "function",
+                        "function": {
+                            "name": "file_read",
+                            "arguments": "{\"path\":\"README.md\"}"
+                        }
+                    }]
+                }
+            }]
+        }))
+        .unwrap();
+
+        let error = response.into_model_response().unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == "provider returned tool call without id"
         ));
     }
 
