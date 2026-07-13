@@ -196,6 +196,13 @@ aside {
 	border-bottom: 1px solid var(--sidebar-border);
 }
 
+.pane-title > div {
+	display: flex;
+	min-width: 0;
+	align-items: center;
+	gap: 7px;
+}
+
 .pane-title h1 {
 	margin: 0;
 	font-size: 12px;
@@ -205,6 +212,34 @@ aside {
 .pane-title span {
 	color: var(--muted-foreground);
 	font-size: 11px;
+}
+
+.new-chat,
+.icon-button {
+	display: inline-grid;
+	place-items: center;
+	flex: 0 0 auto;
+	width: 32px;
+	height: 32px;
+	border: 1px solid transparent;
+	border-radius: 6px;
+	background: transparent;
+	color: inherit;
+	cursor: pointer;
+}
+
+.new-chat:hover,
+.icon-button:hover:not(:disabled) {
+	border-color: var(--border);
+	background: var(--card);
+}
+
+.new-chat:focus-visible,
+.icon-button:focus-visible,
+.composer textarea:focus-visible,
+.approval-actions button:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
 }
 
 .session-list button {
@@ -229,6 +264,10 @@ aside {
 
 .session-list button.current {
 	box-shadow: inset 3px 0 var(--primary);
+}
+
+.session-list button.loading {
+	background: var(--sidebar-accent);
 }
 
 .session-question {
@@ -263,8 +302,15 @@ aside {
 	display: grid;
 	min-width: 0;
 	min-height: 0;
-	grid-template-rows: auto minmax(0, 1fr);
+	grid-template-rows: auto minmax(0, 1fr) auto;
 	background: var(--card);
+}
+
+.chat-body {
+	display: grid;
+	min-width: 0;
+	min-height: 0;
+	overflow: hidden;
 }
 
 .run-header {
@@ -319,9 +365,40 @@ aside {
 	color: oklch(0.46 0.14 28);
 }
 
+.status-cancel_requested,
+.status-interrupted {
+	border-color: oklch(0.8 0.09 80);
+	background: oklch(0.96 0.035 80);
+	color: oklch(0.43 0.1 65);
+}
+
 .transcript {
+	min-height: 0;
 	overflow: auto;
 	padding: 22px clamp(18px, 6vw, 70px) 40px;
+}
+
+.transcript-run + .transcript-run {
+	margin-top: 24px;
+}
+
+.run-boundary {
+	display: flex;
+	width: min(100%, 740px);
+	align-items: center;
+	justify-content: space-between;
+	margin: 0 auto 14px;
+	padding-top: 14px;
+	border-top: 1px solid var(--border);
+	color: var(--muted-foreground);
+	font-size: 10px;
+	text-transform: capitalize;
+}
+
+.live-label {
+	margin-left: 5px;
+	color: oklch(0.48 0.11 155);
+	font-size: 9px;
 }
 
 .message,
@@ -493,6 +570,201 @@ aside {
 	text-align: center;
 }
 
+.composer {
+	display: grid;
+	gap: 7px;
+	padding: 10px clamp(12px, 4vw, 32px) 12px;
+	border-top: 1px solid var(--border);
+	background: var(--card);
+}
+
+.composer textarea {
+	box-sizing: border-box;
+	width: 100%;
+	min-height: 42px;
+	max-height: 130px;
+	resize: vertical;
+	padding: 10px 12px;
+	border: 1px solid var(--input);
+	border-radius: 7px;
+	background: var(--background);
+	color: inherit;
+	font: inherit;
+	line-height: 1.4;
+}
+
+.composer textarea::placeholder {
+	color: var(--muted-foreground);
+}
+
+.composer-bar,
+.composer-actions {
+	display: flex;
+	align-items: center;
+}
+
+.composer-bar {
+	min-height: 32px;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.composer-state {
+	display: flex;
+	min-width: 0;
+	align-items: center;
+	gap: 8px;
+	color: var(--muted-foreground);
+	font-size: 10px;
+	text-transform: capitalize;
+}
+
+.composer-error {
+	overflow: hidden;
+	color: var(--destructive);
+	text-overflow: ellipsis;
+	text-transform: none;
+	white-space: nowrap;
+}
+
+.composer-actions {
+	flex-shrink: 0;
+	gap: 6px;
+}
+
+.icon-button.primary,
+.approval-actions button.primary {
+	border-color: var(--primary);
+	background: var(--primary);
+	color: var(--primary-foreground);
+}
+
+.icon-button:disabled,
+.approval-actions button:disabled {
+	cursor: not-allowed;
+	opacity: 0.45;
+}
+
+.approval-backdrop {
+	position: fixed;
+	z-index: 20;
+	inset: 0;
+	display: grid;
+	place-items: center;
+	padding: 18px;
+	background: oklch(0.18 0.01 260 / 45%);
+}
+
+.approval-dialog {
+	display: grid;
+	width: min(100%, 560px);
+	max-height: min(720px, calc(100vh - 36px));
+	overflow: hidden;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	background: var(--card);
+	box-shadow: 0 18px 50px oklch(0.2 0.01 260 / 22%);
+}
+
+.approval-header {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	padding: 14px 16px;
+	border-bottom: 1px solid var(--border);
+	color: var(--primary);
+}
+
+.dialog-label,
+.preview-label {
+	color: var(--muted-foreground);
+	font-size: 9px;
+	font-weight: 650;
+	text-transform: uppercase;
+}
+
+.approval-header h2 {
+	margin: 2px 0 0;
+	color: var(--foreground);
+	font-size: 14px;
+	font-weight: 680;
+}
+
+.approval-content {
+	display: grid;
+	gap: 11px;
+	overflow: auto;
+	padding: 14px 16px;
+}
+
+.approval-content p,
+.approval-error {
+	margin: 0;
+	font-size: 12px;
+	line-height: 1.45;
+}
+
+.approval-effect {
+	width: fit-content;
+	padding: 3px 7px;
+	border: 1px solid oklch(0.8 0.09 80);
+	border-radius: 999px;
+	background: oklch(0.96 0.035 80);
+	color: oklch(0.43 0.1 65);
+	font-size: 10px;
+}
+
+.approval-preview {
+	overflow: hidden;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+}
+
+.preview-label {
+	padding: 7px 9px;
+	border-bottom: 1px solid var(--border);
+	background: var(--muted);
+}
+
+.approval-preview pre {
+	max-height: 180px;
+	margin: 0;
+	overflow: auto;
+	padding: 9px;
+	font-family: ui-monospace, monospace;
+	font-size: 10px;
+	line-height: 1.45;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.approval-error {
+	padding: 0 16px 10px;
+	color: var(--destructive);
+}
+
+.approval-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	padding: 11px 16px;
+	border-top: 1px solid var(--border);
+}
+
+.approval-actions button {
+	display: inline-flex;
+	min-height: 34px;
+	align-items: center;
+	gap: 7px;
+	padding: 0 12px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	background: var(--card);
+	color: inherit;
+	font: inherit;
+	cursor: pointer;
+}
+
 @keyframes spin {
 	to {
 		transform: rotate(360deg);
@@ -509,10 +781,40 @@ aside {
 	}
 
 	.app-shell {
-		grid-template-columns: minmax(170px, 38vw) minmax(0, 1fr);
+		grid-template-columns: minmax(0, 1fr);
+		grid-template-rows: clamp(104px, 18vh, 132px) minmax(0, 1fr);
+	}
+
+	aside {
+		overflow: hidden;
+		border-right: 0;
+		border-bottom: 1px solid var(--border);
+	}
+
+	.session-list {
+		display: flex;
+		overflow-x: auto;
+	}
+
+	.session-list button {
+		flex: 0 0 190px;
+		min-height: 64px;
+		border-right: 1px solid var(--sidebar-border);
+	}
+
+	.session-list button.current {
+		box-shadow: inset 0 3px var(--primary);
 	}
 
 	.transcript {
 		padding: 16px 12px 28px;
+	}
+
+	.composer {
+		padding: 8px 10px 10px;
+	}
+
+	.approval-backdrop {
+		padding: 10px;
 	}
 }
