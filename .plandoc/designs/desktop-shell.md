@@ -5,60 +5,71 @@ issue: https://github.com/referential-ai/plato-agent/issues/139
 
 # Plato Desktop Shell (Tauri + Web UI over plato-agentd)
 
-Revision 1 — **Draft**, not adopted. Review gate: lead/human review folds findings in; no phase goes `Ready for dev` against a Draft.
+Revision 2 — **Draft**, not adopted. Folds PR #140 closure review R1–R9; direction confirmed there: Tauri client, shared daemon ownership, in-repo home, Windows named pipes. No phase goes `Ready for dev` against a Draft.
 
 ## Authority
 - Human direction 2026-07-12: Codex-desktop-style app; Tauri accepted; web UI in the stack already in use (Svelte 5 / Tailwind 4 / shadcn-svelte); distribution must feel natural to a Windows user; C# path declined.
 - Parent: `docs/ARCHITECTURE.md` runtime topology — daemon owns sessions, providers, tools, approvals; clients render only; connector rule binding (ARCHITECTURE.md:10-22).
-- Verified externals (2026-07): Codex desktop = Electron shell over the Rust Codex CLI (Windows release 2026-03) — the UX benchmark and the same shell+sidecar shape. Windows Reactor (WinUI 3 in Rust, microsoft/windows-rs, 2026-05) is experimental single-window — rejected for v1. Azure Artifact Signing open to US/CA individual developers (~$10/mo, since 2026-04); SmartScreen reputation still accumulates.
+- Lead closure review 2026-07-12 (PR #140, R1–R9) is design input for this revision.
+- Externals: Codex desktop (Electron shell over the Rust Codex CLI) is the UX benchmark and the same shell+sidecar shape. Windows Reactor (WinUI 3 in Rust) is experimental — rejected for v1.
 
 ## Source Grounding (main @ 3f02adb)
 - Daemon protocol v1, NDJSON envelopes; methods `hello`, `run.start`, `message.append`, `events.stream`, `approval.decide`, `run.cancel`, `sessions.list`, `transcript.read` (src/daemon/handlers.rs:39-54, src/daemon/protocol.rs:5). `run.start`/`message.append` default `wait: false` (ARCHITECTURE.md:20).
-- Transport is synchronous std Unix sockets only (src/daemon/server.rs:10,75; src/daemon/client.rs:15-27); thread-per-connection accept loop already serves multiple clients (server.rs:94-100); socket/lock/ledger paths are XDG, keyed by workspace-id, 0700/0600 (README.md Daemon; ARCHITECTURE.md:18).
-- Client precedent: `plato-tui` attaches, never spawns/supervises the daemon, never calls providers or touches SQLite (README.md TUI).
-- Live assistant deltas are transient `events.stream` events; ledger `model_responded` stays replay truth (ARCHITECTURE.md:21).
+- `TranscriptReadResult.transcript` is preformatted CLI replay text; the TUI recognizes entries by display prefixes (src/daemon/protocol.rs:227-242, src/daemon/handlers.rs:495-548, src/replay.rs:34-97, src/tui/render.rs:355-407). No typed history exists on the wire today (R1).
+- The event buffer is transient and capped at 256; `lagged` + omitted `from_offset` resumes after the current tip; pending-approval truth lives only in daemon memory/transient events; `transcript.read` has no pending snapshot (src/daemon/runtime.rs:17,42,93-122,151-195; src/daemon/handlers.rs:277-327) (R2).
+- Client precedent: `plato --tui` already attaches-or-starts and stops only its embedded daemon; only raw `plato-tui` is never-spawn (src/bin/plato.rs:126-180,230-249). Daemon bind/lock are atomic arbiters; stale locks are never reclaimed (src/daemon/server.rs:65-75, src/daemon/lock.rs:72-115,119-130,200-213) (R4).
+- Transport and process model are Unix-only (std UDS, signals, process groups, HOME/XDG paths); the daemon does not build natively on Windows today (src/daemon/client.rs:15-27, src/daemon/server.rs:9-10, src/bin/plato-agentd.rs:7,47, src/tools.rs:317-326, src/paths.rs:83-102, src/config.rs:274-309) (R9).
+- `plato replay` fails closed while the daemon lock is held (README.md:75) (R9).
+- Live assistant deltas are transient `events.stream` events; ledger `model_responded` stays replay truth (ARCHITECTURE.md:21). Thread-per-connection already serves multiple clients (server.rs:94-100).
 
 ## Design
 
-**D1 — Client, not runtime.** The shell is a pure daemon client with exactly the TUI's verb surface. Presentation state only: no provider calls, no SQLite, no run/policy/approval semantics. Anything semantic the shell seems to need becomes a daemon issue first, never a shell workaround.
+**D1 — Client, not runtime.** The shell is a pure daemon client. Presentation state only: no provider calls, no SQLite, no run/policy/approval semantics. Anything semantic the shell needs becomes a daemon issue first, never a shell workaround.
 
-**D2 — Protocol reuse.** NDJSON v1 verbatim over a local socket. No shell-private protocol extensions.
+**D2 — Protocol: v1 envelope and shared methods; no shell-private extensions.** Result shapes are not frozen: the extension path is daemon-owned, additive, backward-compatible fields/capabilities, each landed by its own daemon issue. Two are already required and gate the phases that consume them (R1, R2):
+- a typed transcript payload (structured user/assistant/tool history; clients never parse the preformatted `transcript` string);
+- a pending-approval snapshot readable after lag/reconnect, so a paused run always re-renders its approval modal.
 
-**D3 — Stack.** Tauri 2 shell (Rust) + Svelte 5 + SvelteKit static adapter (SPA) + Tailwind 4 + shadcn-svelte. Fluent-flavored theme: Segoe UI Variable, Windows 11 radii, OS dark-mode sync, Mica via Tauri window effects where available. Local assets only, strict CSP, no remote content.
+**D3 — Stack and privileged boundary.** Tauri 2 shell (Rust) + Svelte 5 + SvelteKit static adapter (SPA) + Tailwind 4 + shadcn-svelte; Fluent-flavored theme; local assets only, strict CSP. The security boundary is the Tauri capability model, not CSP (R3): the Rust shell exclusively owns `DaemonClient`, workspace validation, and the spawned child handle; the webview receives typed commands/events only and gets no generic shell, filesystem, raw-socket, or arbitrary-path capability. Phase-1 bridge tests prove this boundary.
 
-**D4 — Daemon lifecycle (deliberate divergence from plato-tui).** Double-click UX needs a running daemon: the shell may spawn `plato-agentd` for the selected workspace when the lock is free, adopts an already-running one, and stops only a daemon it spawned. It never removes locks or kills daemons it did not start. plato-tui's never-spawn rule is unchanged for the TUI.
+**D4 — Daemon lifecycle: attach-or-spawn with an explicit race and lifetime contract (R4).** This extends the existing `plato --tui` embedded precedent, not a new divergence. Contract:
+- Attach first: validate via `hello` (workspace, protocol version, required capabilities). Never pre-check the lock.
+- On connect failure: spawn `plato-agentd`; the daemon's atomic bind/lock arbitrates concurrent starters. On spawn conflict, bounded-retry `hello`; if it never validates, fail closed with the socket/lock paths in the error.
+- Stop only the exact child it spawned, and only on shell exit when the daemon is idle (no active or approval-paused runs) and no other client is attached; otherwise detach and leave it running — runs are daemon-owned and closing a UI must not kill work.
+- Spawned-child crash: show disconnected state and re-enter the attach-or-spawn path on user action; no automatic restart loop. The shell never deletes locks; if a stranded stale lock blocks respawn, fail closed and surface the lock path (reclamation is a non-goal, below).
+- One-shot SQLite CLI paths remain fail-closed while a daemon holds the workspace (unchanged).
 
-**D5 — Windows transport.** The daemon gains a named-pipe listener equivalent to the UDS listener; Unix keeps std UDS untouched. Default: `interprocess` crate local sockets (sync API fits the threaded daemon; UDS on Unix, named pipes on Windows); hand-rolled windows-rs pipes only if that spike fails. Pipe ACLs must match the current-user-only 0700/0600 posture; the Windows path model replacing XDG is decided inside the phase issue.
+**D5 — Windows transport (R5).** Unix keeps std UDS untouched — no dependency change on Unix. Windows-only: named pipes via the `interprocess` crate as the spiked default, behind a hard proof gate: an explicit current-user DACL is required (the Windows default DACL grants Everyone/anonymous read), with other-user rejection and remote-access rejection tests. Ownership model decided now, names refined in-phase: pipe name derived from workspace-id; ledger and lock under per-user `LocalAppData`; user config under `RoamingAppData`.
 
-**D6 — Repo home.** In `plato-agent`: one Tauri shell crate plus a `desktop/` web UI. New repo only if Node/Tauri CI weight demonstrably hurts this repo — boundary ladder requires a trigger for promotion (ARCHITECTURE.md:24-33).
+**D6 — Repo home (R6).** In `plato-agent`: one Tauri shell crate plus a `desktop/` web UI. Desktop checks run as separate CI jobs so the existing root Cargo job stays intact; native Windows CI lands with phase 3. CI isolation is a phase-1 acceptance item. No future-repo clause.
 
-**D7 — Distribution.** tauri-bundler NSIS/MSI installer bundling `plato-agentd.exe` as sidecar; WebView2 bootstrap enabled. Dev/dogfood builds unsigned; public distribution signs via Azure Artifact Signing (US individual) or ships through the Store — decided in phase 5. Updater deferred until signing exists.
+**D7 — Distribution: one coherent v1 route (R7).** A single directly distributed **signed NSIS installer** containing the pinned `plato-agentd.exe` sidecar. Signatures verified on the installer, app executable, uninstaller, and sidecar. Unsigned builds are dev-only artifacts and are never distributed. MSI, Microsoft Store, and auto-updater are deferred; each returns as its own issue (Store requires a signed offline self-updating installer, so it cannot precede the updater).
 
 ## Sequencing
-Each phase is its own issue and PR(s); implementation starts only on a `Ready for dev` phase issue.
+Each phase is its own issue and PR(s); implementation starts only on a `Ready for dev` phase issue. The two D2 protocol additions are their own daemon issues, cut with the phase issues; phases 1–2 gate on them.
 
-1. **Shell bootstrap (Linux-first).** Tauri window renders `sessions.list` + `transcript.read` against a live daemon over UDS. Proof: transcript parity with `plato replay`; screenshot; TUI attached simultaneously.
-2. **Chat parity.** Composer (`run.start`/`message.append`, `wait: false`), live `events.stream` deltas and status, approval modal (`approval.decide`), cancel, session picker. Proof: fake-daemon tests on the bridge plus live smoke in a scratch workspace.
-3. **Daemon Windows transport (D5).** Proof: Windows VM smoke — hello, run, replay; ACL check.
-4. **Windows shell + sidecar lifecycle (D4).** Spawn/adopt/stop rules, single-instance guard. Proof: cold double-click on a clean VM reaches a finished run.
-5. **Packaging + distribution (D7).** Proof: clean-VM install/uninstall; SmartScreen behavior recorded; sidecar version pinning checked.
+1. **Shell bootstrap + protocol adequacy gate (Linux).** Tauri window renders `sessions.list` and typed history for a selected run **without parsing the `transcript` string** (consumes the typed-transcript daemon issue). Capability-boundary bridge tests (D3). Live comparison via exact-run `transcript.read` against a running daemon; offline `plato replay` parity checked only after daemon shutdown (replay fails closed under the lock). TUI attached simultaneously. CI: separate desktop job; root Cargo job untouched.
+2. **Chat parity + state isolation (R2, R8).** Composer (`run.start`/`message.append`, `wait: false`), keyed delta folding, approval modal (`approval.decide`), cancel, session picker. Rendering and actions bind to one selected session and exact run; switching sessions invalidates stale in-flight pages and never cancels or splices another client's run; terminal recovery uses exact-run `transcript.read`, never latest-session readback. Acceptance proofs: full-page catch-up; folding without duplication; lag/resync; reconnect while approval-paused recovering the modal from the pending-approval snapshot; approval resolved by another client; all six `RunStateName` values; `CancelRequested` before terminal; same-session overload; two concurrently active sessions with no cross-session content or decisions.
+3. **Windows daemon parity (R9).** More than transport: native Windows build and tests; `LocalAppData`/`RoamingAppData` path model (D5); lock and pipe ACLs with the D5 proof gate; shutdown wake without Unix signals; `shell.exec` cancel/timeout on Windows. Native Windows CI starts here.
+4. **Windows shell + sidecar lifecycle on a provisioned dev-VM (R4, R9).** Attach/spawn race proofs (concurrent starters), exact-child graceful stop, app/child crash policy, second-client lifetime, CLI fail-closed preserved. Not a clean-VM proof — packaging does not exist yet.
+5. **Packaging + distribution (R7).** Signed NSIS installer with pinned sidecar; clean-VM install/uninstall and cold launch with an explicitly pre-provisioned workspace/config and user-scoped provider credential; SmartScreen behavior recorded; signature checks on all four artifacts.
 
 Phases 1–2 deliver a usable Linux-dev desktop client early; 3–5 make it a Windows product.
 
 ## Non-Goals
 - No `platonic-core` changes; no gateway or TUI behavior changes.
 - One workspace per window; no multi-workspace switcher in v1.
-- No auto-update before signing; no Store decision now; no macOS/Linux packaging in v1.
+- No MSI, no Store, no auto-updater in v1 (deferred per D7); no macOS/Linux packaging in v1.
+- No automatic stale-lock reclamation (fail closed and surface the path; revisit as a daemon issue if phase 4 proofs make it bite).
 - No model management, board, or GitHub integration surfaces.
 
 ## Open Questions (bounded)
-- `interprocess` vs hand-rolled named pipes: resolved by a spike inside phase 3's issue; D5 sets the default.
-- Windows path model (runtime/state equivalents of XDG): phase 3's issue.
-- Multi-client concurrency (TUI + desktop attached together) is expected to work today (server.rs:94-100); phase 1 proof must include it.
+- Exact pipe/path names and the DACL SDDL string: fixed inside phase 3 under the D5 ownership model and proof gate.
+- Typed-transcript and pending-approval-snapshot wire shapes: fixed in their daemon issues under D2's additive rule.
 
 ## Acceptance (for this design going Active)
-- Lead/human review of D1–D7 with findings folded in.
-- Phase issues 1–5 cut on this repo, linked to umbrella #139, each with scope, acceptance, and proof.
+- Lead re-review confirms R1–R9 are folded (this revision).
+- Phase issues 1–5 plus the two D2 daemon protocol issues cut on this repo, linked to umbrella #139, each with scope, acceptance, and proof.
 - Board: umbrella and phase issues on Project #1; nothing enters `In Progress` while current WIP (#129, #132) holds.
 
 ## Proof
