@@ -1172,6 +1172,7 @@ mod tests {
                     final_answer: None,
                     transcript: String::new(),
                     typed: None,
+                    pending_approval: None,
                 })
                 .unwrap(),
                 None

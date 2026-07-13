@@ -1,6 +1,9 @@
 use crate::{
     AppResult, ApprovalRequest, AssistantDeltaEvent,
-    daemon::{protocol::RunStateName, server::DaemonPaths},
+    daemon::{
+        protocol::{PendingApprovalSnapshot, RunStateName},
+        server::DaemonPaths,
+    },
     tools::ApprovalOutcome,
 };
 use platonic_core::RecordedEvent;
@@ -59,12 +62,29 @@ pub(super) struct EventBuffer {
 
 #[derive(Clone, Debug)]
 pub(super) struct PendingApproval {
+    pub(super) request: ApprovalRequest,
     pub(super) decision: Option<ApprovalOutcome>,
 }
 
 impl PendingApproval {
-    pub(super) fn new() -> Self {
-        Self { decision: None }
+    pub(super) fn new(request: ApprovalRequest) -> Self {
+        Self {
+            request,
+            decision: None,
+        }
+    }
+
+    fn snapshot(&self) -> PendingApprovalSnapshot {
+        PendingApprovalSnapshot {
+            run_id: self.request.run_id.to_string(),
+            tool_call_id: self.request.call_id.to_string(),
+            tool_name: self.request.tool_name.clone(),
+            effect: self.request.effect.clone(),
+            reason: Some(self.request.reason.clone()),
+            input_preview: self.request.input_preview.clone(),
+            approval_preview: self.request.approval_preview.clone(),
+            diff_preview: self.request.diff_preview.clone(),
+        }
     }
 }
 
@@ -146,16 +166,32 @@ impl RunRecord {
         status.final_answer = None;
         status.error = Some(error);
     }
+
+    pub(super) fn pending_approval(&self) -> Option<PendingApprovalSnapshot> {
+        let approvals = self.approvals.lock().expect("approvals lock poisoned");
+        if self.cancel.load(Ordering::SeqCst) || self.status().state != RunStateName::Running {
+            return None;
+        }
+        approvals
+            .values()
+            .find(|pending| pending.decision.is_none())
+            .map(PendingApproval::snapshot)
+    }
 }
 
 pub(super) fn approval_handler(
     record: Arc<RunRecord>,
 ) -> impl Fn(ApprovalRequest) -> AppResult<ApprovalOutcome> + Send + Sync + 'static {
     move |request| {
-        record.push_event(approval_requested_event(&request));
         let call_id = request.call_id.to_string();
         let mut approvals = record.approvals.lock().expect("approvals lock poisoned");
-        approvals.insert(call_id.clone(), PendingApproval::new());
+        if record.cancel.load(Ordering::SeqCst) {
+            return Ok(ApprovalOutcome::Denied {
+                reason: "run canceled".into(),
+            });
+        }
+        approvals.insert(call_id.clone(), PendingApproval::new(request.clone()));
+        record.push_event(approval_requested_event(&request));
         loop {
             if record.cancel.load(Ordering::SeqCst) {
                 approvals.remove(&call_id);
@@ -199,7 +235,7 @@ fn approval_requested_event(request: &ApprovalRequest) -> Value {
 mod tests {
     use super::*;
     use platonic_core::{EffectClass, RunId, ToolCallId};
-    use std::path::PathBuf;
+    use std::{path::PathBuf, thread};
 
     #[test]
     fn approval_requested_event_carries_diff_preview_when_present() {
@@ -209,6 +245,7 @@ mod tests {
             tool_name: "file.edit".into(),
             effect: EffectClass::WorkspaceWrite,
             reason: "file.edit requires approval".into(),
+            input_preview: None,
             approval_preview: None,
             diff_preview: Some("--- a/note.txt\n+++ b/note.txt\n".into()),
         });
@@ -225,6 +262,7 @@ mod tests {
             tool_name: "file.write".into(),
             effect: EffectClass::WorkspaceWrite,
             reason: "file.write requires approval".into(),
+            input_preview: None,
             approval_preview: None,
             diff_preview: None,
         });
@@ -240,6 +278,7 @@ mod tests {
             tool_name: "shell.exec".into(),
             effect: EffectClass::ExternalSideEffect,
             reason: "shell.exec requires approval".into(),
+            input_preview: None,
             approval_preview: Some("command: cargo test\ncwd: /tmp/work".into()),
             diff_preview: None,
         });
@@ -247,6 +286,90 @@ mod tests {
         assert_eq!(
             event["approval_preview"],
             "command: cargo test\ncwd: /tmp/work"
+        );
+    }
+
+    #[test]
+    fn canceled_run_does_not_register_or_publish_a_late_approval() {
+        let record = Arc::new(RunRecord::new(
+            "run_1".into(),
+            "session_1".into(),
+            PathBuf::from("/tmp/agent.db"),
+        ));
+        record.cancel.store(true, Ordering::SeqCst);
+        let decide = approval_handler(record.clone());
+
+        let outcome = decide(ApprovalRequest {
+            run_id: RunId::new("run_1").unwrap(),
+            call_id: ToolCallId::new("call_1").unwrap(),
+            tool_name: "file.write".into(),
+            effect: EffectClass::WorkspaceWrite,
+            reason: "file.write requires approval".into(),
+            input_preview: Some(r#"{"path":"out.txt"}"#.into()),
+            approval_preview: None,
+            diff_preview: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ApprovalOutcome::Denied {
+                reason: "run canceled".into()
+            }
+        );
+        assert!(record.approvals.lock().unwrap().is_empty());
+        assert!(record.events.lock().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn published_approval_event_has_a_complete_snapshot() {
+        let record = Arc::new(RunRecord::new(
+            "run_1".into(),
+            "session_1".into(),
+            PathBuf::from("/tmp/agent.db"),
+        ));
+        let decide = approval_handler(record.clone());
+        let worker = thread::spawn(move || {
+            decide(ApprovalRequest {
+                run_id: RunId::new("run_1").unwrap(),
+                call_id: ToolCallId::new("call_1").unwrap(),
+                tool_name: "file.write".into(),
+                effect: EffectClass::WorkspaceWrite,
+                reason: "file.write requires approval".into(),
+                input_preview: Some(r#"{"path":"out.txt"}"#.into()),
+                approval_preview: None,
+                diff_preview: None,
+            })
+            .unwrap()
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while record.events.lock().unwrap().events.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "approval event was not published"
+            );
+            thread::yield_now();
+        }
+
+        let snapshot = record.pending_approval().unwrap();
+        assert_eq!(snapshot.run_id, "run_1");
+        assert_eq!(snapshot.tool_call_id, "call_1");
+        assert_eq!(
+            snapshot.input_preview.as_deref(),
+            Some(r#"{"path":"out.txt"}"#)
+        );
+        let mut approvals = record.approvals.lock().unwrap();
+        approvals.get_mut("call_1").unwrap().decision = Some(ApprovalOutcome::Denied {
+            reason: "test complete".into(),
+        });
+        record.approval_changed.notify_all();
+        drop(approvals);
+
+        assert_eq!(
+            worker.join().unwrap(),
+            ApprovalOutcome::Denied {
+                reason: "test complete".into()
+            }
         );
     }
 

@@ -1,3 +1,4 @@
+use platonic_core::EffectClass;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -241,6 +242,24 @@ pub struct TranscriptReadResult {
     pub transcript: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typed: Option<TypedTranscript>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_approval: Option<PendingApprovalSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PendingApprovalSnapshot {
+    pub run_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub effect: EffectClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_preview: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -451,6 +470,7 @@ mod tests {
                     ],
                 }],
             }),
+            pending_approval: None,
         };
 
         let wire = serde_json::to_value(&current).unwrap();
@@ -532,5 +552,84 @@ mod tests {
         }))
         .expect("current clients decode typed-less daemon responses");
         assert_eq!(current_client.typed, None);
+        assert_eq!(current_client.pending_approval, None);
+    }
+
+    #[test]
+    fn pending_approval_snapshot_keeps_exact_additive_wire_shape() {
+        let current = TranscriptReadResult {
+            run_id: "run_1".into(),
+            status: RunStateName::Running,
+            final_answer: None,
+            transcript: "partial replay".into(),
+            typed: None,
+            pending_approval: Some(PendingApprovalSnapshot {
+                run_id: "run_1".into(),
+                tool_call_id: "call_1".into(),
+                tool_name: "file.write".into(),
+                effect: EffectClass::WorkspaceWrite,
+                reason: Some("file.write requires approval".into()),
+                input_preview: Some(r#"{"path":"out.txt"}"#.into()),
+                approval_preview: Some("write out.txt".into()),
+                diff_preview: Some("--- a/out.txt\n+++ b/out.txt\n".into()),
+            }),
+        };
+
+        let wire = serde_json::to_value(&current).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "run_id": "run_1",
+                "status": "running",
+                "final_answer": null,
+                "transcript": "partial replay",
+                "pending_approval": {
+                    "run_id": "run_1",
+                    "tool_call_id": "call_1",
+                    "tool_name": "file.write",
+                    "effect": "workspace_write",
+                    "reason": "file.write requires approval",
+                    "input_preview": "{\"path\":\"out.txt\"}",
+                    "approval_preview": "write out.txt",
+                    "diff_preview": "--- a/out.txt\n+++ b/out.txt\n"
+                }
+            })
+        );
+
+        #[derive(Deserialize)]
+        struct LegacyTranscriptReadResult {
+            run_id: String,
+            status: RunStateName,
+            transcript: String,
+        }
+
+        let decoded: TranscriptReadResult = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(decoded, current);
+
+        let legacy: LegacyTranscriptReadResult = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy.run_id, "run_1");
+        assert_eq!(legacy.status, RunStateName::Running);
+        assert_eq!(legacy.transcript, "partial replay");
+
+        let minimal = serde_json::to_value(PendingApprovalSnapshot {
+            run_id: "run_2".into(),
+            tool_call_id: "call_2".into(),
+            tool_name: "shell.exec".into(),
+            effect: EffectClass::ExternalSideEffect,
+            reason: None,
+            input_preview: None,
+            approval_preview: None,
+            diff_preview: None,
+        })
+        .unwrap();
+        assert_eq!(
+            minimal,
+            json!({
+                "run_id": "run_2",
+                "tool_call_id": "call_2",
+                "tool_name": "shell.exec",
+                "effect": "external_side_effect"
+            })
+        );
     }
 }
