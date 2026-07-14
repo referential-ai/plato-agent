@@ -124,6 +124,7 @@ busy-pipe connection waits.
 The daemon holds the lock while it is active. SIGINT and SIGTERM on Unix, and
 Ctrl-C or Ctrl-Break on Windows, trigger a graceful shutdown: the daemon stops
 accepting new connections, then removes its endpoint and lock before exiting.
+On Windows the daemon keeps the exact lock file pinned until delete-on-close.
 Do not remove a lock for a live daemon.
 Live assistant deltas are transient `events.stream` events and are not written
 to the ledger. After a `lagged` response, omitting `from_offset` resumes at the
@@ -141,6 +142,22 @@ closes run admission, returns `shutdown`, then exits and removes its socket and
 lock. Duplicate shutdown and run-admission requests dispatched before teardown
 fail with `daemon_shutting_down`; after the `shutdown` response, connection
 close is expected and lock removal confirms success.
+
+On Windows, installer control validates every current-user lock against its
+workspace and live process image. Exact sidecars also require the expected pipe
+server PID and `hello` response before control:
+
+```powershell
+plato-agentd control list-workspaces
+plato-agentd control shutdown-if-idle --workspace C:\path\to\workspace
+plato-agentd control shutdown-if-idle
+```
+
+The commands emit NDJSON. The aggregate shutdown validates the whole namespace
+before sending any shutdown request, attempts every validated daemon, and exits
+nonzero if a daemon is active or any lock cannot be validated. Locks are never
+removed by the control client. A missing targeted daemon reports `not_running`;
+a `shutdown` result is sent once and confirmed by process exit and lock removal.
 
 Minimal NDJSON-over-Unix-socket check, using the `workspace_id` and
 `socket_path` printed by the daemon:

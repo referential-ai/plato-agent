@@ -59,6 +59,9 @@ pub enum AppError {
     #[error("daemon protocol error {}: {}", .0.code, .0.message)]
     DaemonResponse(ProtocolError),
 
+    #[error("daemon control error: {0}")]
+    DaemonControl(String),
+
     #[error("path escapes workspace: {0}")]
     PathEscapesWorkspace(PathBuf),
 

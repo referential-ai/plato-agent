@@ -8,33 +8,205 @@ use std::{
         ffi::{OsStrExt, OsStringExt},
         io::{AsRawHandle, FromRawHandle},
     },
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf, Prefix},
     ptr,
     time::{Duration, Instant},
 };
 use widestring::U16CString;
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, GENERIC_READ,
-        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_TIMEOUT,
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_PIPE_BUSY,
+        ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::{
         Authorization::ConvertSidToStringSidW, EqualSid, GetTokenInformation, SECURITY_ATTRIBUTES,
         TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
     Storage::FileSystem::{
-        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+        CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileDispositionInfo, FileIdInfo, GetDriveTypeW,
+        GetFileInformationByHandleEx, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT, SetFileInformationByHandle,
     },
     System::{
-        Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW},
+        Pipes::{
+            GetNamedPipeServerProcessId, PIPE_NOWAIT, SetNamedPipeHandleState, WaitNamedPipeW,
+        },
         SystemInformation::GetSystemDirectoryW,
         Threading::{
             GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SYNCHRONIZE, WaitForSingleObject,
+            PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
         },
+        WindowsProgramming::{DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOVABLE},
     },
 };
+
+pub(crate) struct CurrentUserProcess {
+    handle: WinHandle,
+}
+
+impl CurrentUserProcess {
+    pub(crate) fn open(pid: u32) -> io::Result<Option<Self>> {
+        // SAFETY: the returned process handle is checked and owned on success.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        let process = Self {
+            handle: WinHandle(handle),
+        };
+        if !process.is_running()? {
+            return Ok(None);
+        }
+
+        let current_user = process_user(current_process())?;
+        let process_user = match process_user(process.handle.0) {
+            Ok(user) => user,
+            Err(_) if !process.is_running()? => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        // SAFETY: both SID pointers borrow live TOKEN_USER buffers.
+        if unsafe { EqualSid(current_user.sid(), process_user.sid()) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "process is not owned by the current user",
+            ));
+        }
+        if !process.is_running()? {
+            return Ok(None);
+        }
+        Ok(Some(process))
+    }
+
+    pub(crate) fn executable(&self) -> io::Result<PathBuf> {
+        let mut buffer = vec![0u16; 260];
+        loop {
+            let mut len = buffer
+                .len()
+                .try_into()
+                .map_err(|_| io::Error::other("process image path is too long"))?;
+            // SAFETY: self holds a live queryable process handle and buffer is writable.
+            if unsafe {
+                QueryFullProcessImageNameW(self.handle.0, 0, buffer.as_mut_ptr(), &mut len)
+            } != 0
+            {
+                let len = len as usize;
+                return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len])));
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+                return Err(error);
+            }
+            buffer.resize(buffer.len().saturating_mul(2), 0);
+        }
+    }
+
+    pub(crate) fn is_running(&self) -> io::Result<bool> {
+        // SAFETY: self owns a process handle opened with PROCESS_SYNCHRONIZE.
+        match unsafe { WaitForSingleObject(self.handle.0, 0) } {
+            WAIT_TIMEOUT => Ok(true),
+            WAIT_OBJECT_0 => Ok(false),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            result => Err(io::Error::other(format!(
+                "unexpected process wait result: {result}"
+            ))),
+        }
+    }
+
+    pub(crate) fn wait_until(&self, deadline: Instant) -> io::Result<bool> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(!self.is_running()?);
+            }
+            let wait_ms = remaining.as_millis().clamp(1, u32::MAX as u128) as u32;
+            // SAFETY: self owns a process handle opened with PROCESS_SYNCHRONIZE.
+            match unsafe { WaitForSingleObject(self.handle.0, wait_ms) } {
+                WAIT_OBJECT_0 => return Ok(true),
+                WAIT_TIMEOUT => {
+                    if Instant::now() >= deadline {
+                        return Ok(false);
+                    }
+                }
+                WAIT_FAILED => return Err(io::Error::last_os_error()),
+                result => {
+                    return Err(io::Error::other(format!(
+                        "unexpected process wait result: {result}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn same_file(left: &Path, right: &Path) -> io::Result<bool> {
+    let left = open_file_for_identity(left)?;
+    let right = open_file_for_identity(right)?;
+    same_file_handles(&left, &right)
+}
+
+pub(crate) fn same_file_handles(left: &File, right: &File) -> io::Result<bool> {
+    let left = file_identity(left)?;
+    let right = file_identity(right)?;
+    Ok(left.VolumeSerialNumber == right.VolumeSerialNumber
+        && left.FileId.Identifier == right.FileId.Identifier)
+}
+
+pub(crate) fn same_file_handle_path(file: &File, path: &Path) -> io::Result<bool> {
+    let current = open_file_for_identity(path)?;
+    same_file_handles(file, &current)
+}
+
+fn file_identity(file: &File) -> io::Result<FILE_ID_INFO> {
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: file is live and info is writable storage of the declared size.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            mem::size_of::<FILE_ID_INFO>()
+                .try_into()
+                .expect("FILE_ID_INFO size fits u32"),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(info)
+}
+
+pub(crate) fn is_local_disk_path(path: &Path) -> io::Result<bool> {
+    let drive = match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+            _ => return Ok(false),
+        },
+        _ => return Ok(false),
+    };
+    let root = format!("{}:\\", drive as char);
+    let root = U16CString::from_str(&root)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "drive path contains a NUL"))?;
+    // SAFETY: root is a live NUL-terminated drive-root path.
+    Ok(matches!(
+        unsafe { GetDriveTypeW(root.as_ptr()) },
+        DRIVE_REMOVABLE | DRIVE_FIXED | DRIVE_CDROM | DRIVE_RAMDISK
+    ))
+}
 
 pub(crate) fn current_user_pipe_descriptor() -> io::Result<SecurityDescriptor> {
     current_user_descriptor("GA")
@@ -65,7 +237,7 @@ pub(crate) fn create_current_user_file(path: &Path) -> io::Result<File> {
     let handle = unsafe {
         CreateFileW(
             path_wide.as_ptr(),
-            GENERIC_WRITE,
+            GENERIC_WRITE | DELETE,
             FILE_SHARE_READ,
             &attributes,
             CREATE_NEW,
@@ -81,7 +253,79 @@ pub(crate) fn create_current_user_file(path: &Path) -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
+pub(crate) fn open_lock_file_for_read(path: &Path) -> io::Result<File> {
+    open_file_for_identity(path)
+}
+
+pub(crate) fn open_file_for_identity(path: &Path) -> io::Result<File> {
+    let path_wide = path_wide(path, "Windows lock path contains a NUL")?;
+    // SAFETY: path_wide is NUL-terminated and the returned owned handle is checked.
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateFileW returned a new owned handle and File assumes that ownership.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+pub(crate) fn delete_file_on_close(file: &File) -> io::Result<()> {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: file is live and disposition points to initialized input of the declared size.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            mem::size_of::<FILE_DISPOSITION_INFO>()
+                .try_into()
+                .expect("FILE_DISPOSITION_INFO size fits u32"),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub(crate) fn connect_current_user_pipe(path: &Path) -> io::Result<File> {
+    connect_current_user_pipe_inner(path, None)
+}
+
+pub(crate) fn connect_current_user_pipe_for_pid(
+    path: &Path,
+    expected_server_pid: u32,
+) -> io::Result<File> {
+    let pipe = connect_current_user_pipe_inner(path, Some(expected_server_pid))?;
+    let mode = PIPE_NOWAIT;
+    // SAFETY: pipe is a live client pipe handle and mode is readable for the call.
+    if unsafe {
+        SetNamedPipeHandleState(
+            pipe.as_raw_handle(),
+            &mode,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(pipe)
+}
+
+fn connect_current_user_pipe_inner(
+    path: &Path,
+    expected_server_pid: Option<u32>,
+) -> io::Result<File> {
     let path_wide = path_wide(path, "Windows pipe path contains a NUL")?;
     let deadline = Instant::now() + Duration::from_secs(1);
     let handle = loop {
@@ -121,7 +365,7 @@ pub(crate) fn connect_current_user_pipe(path: &Path) -> io::Result<File> {
         }
     };
 
-    validate_pipe_server(&handle)?;
+    validate_pipe_server(&handle, expected_server_pid)?;
     Ok(handle)
 }
 
@@ -211,39 +455,31 @@ fn process_user(process: HANDLE) -> io::Result<TokenUserBuffer> {
     Ok(TokenUserBuffer { buffer })
 }
 
-fn validate_pipe_server(handle: &File) -> io::Result<()> {
+fn validate_pipe_server(handle: &File, expected_server_pid: Option<u32>) -> io::Result<()> {
     let raw = handle.as_raw_handle();
     let mut first_pid = 0;
     // SAFETY: raw is a live connected pipe handle and first_pid is writable output storage.
     if unsafe { GetNamedPipeServerProcessId(raw, &mut first_pid) } == 0 || first_pid == 0 {
         return Err(pipe_server_identity_error());
     }
-    // SAFETY: the returned process handle is checked and wrapped on success.
-    let process = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-            0,
-            first_pid,
-        )
+    if expected_server_pid.is_some_and(|expected| expected != first_pid) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "named-pipe server process does not match lock metadata",
+        ));
+    }
+    let Some(process) =
+        CurrentUserProcess::open(first_pid).map_err(|_| pipe_server_identity_error())?
+    else {
+        return Err(pipe_server_identity_error());
     };
-    if process.is_null() {
-        return Err(pipe_server_identity_error());
-    }
-    let process = WinHandle(process);
-    let current_user = process_user(current_process()).map_err(|_| pipe_server_identity_error())?;
-    let server_user = process_user(process.0).map_err(|_| pipe_server_identity_error())?;
-    // SAFETY: both SID pointers borrow live TOKEN_USER buffers.
-    if unsafe { EqualSid(current_user.sid(), server_user.sid()) } == 0 {
-        return Err(pipe_server_identity_error());
-    }
     let mut second_pid = 0;
     // SAFETY: raw remains live and second_pid is writable output storage.
     if unsafe { GetNamedPipeServerProcessId(raw, &mut second_pid) } == 0 || second_pid != first_pid
     {
         return Err(pipe_server_identity_error());
     }
-    // SAFETY: process is a live process handle opened with PROCESS_SYNCHRONIZE.
-    if unsafe { WaitForSingleObject(process.0, 0) } != WAIT_TIMEOUT {
+    if !process.is_running()? {
         return Err(pipe_server_identity_error());
     }
     Ok(())
@@ -346,6 +582,41 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         drop(file);
+    }
+
+    #[test]
+    fn current_user_process_reports_the_current_executable() {
+        let process = CurrentUserProcess::open(std::process::id())
+            .unwrap()
+            .unwrap();
+
+        assert!(process.is_running().unwrap());
+        assert!(
+            same_file(
+                &process.executable().unwrap(),
+                &std::env::current_exe().unwrap()
+            )
+            .unwrap()
+        );
+        assert!(
+            !process
+                .wait_until(Instant::now() + Duration::from_millis(10))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn same_file_uses_file_identity_instead_of_path_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.exe");
+        let alias = dir.path().join("alias.exe");
+        let other = dir.path().join("other.exe");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::hard_link(&first, &alias).unwrap();
+        std::fs::write(&other, b"other").unwrap();
+
+        assert!(same_file(&first, &alias).unwrap());
+        assert!(!same_file(&first, &other).unwrap());
     }
 
     #[test]

@@ -94,6 +94,12 @@ jobs:
           ctrl_c_stops_daemon_and_removes_lock
           -- --ignored --exact --nocapture
 
+      - name: Prove installer daemon control
+        run: >-
+          cargo test --locked --test windows_daemon
+          installer_control_preflights_refuses_active_and_retries_after_terminal
+          -- --ignored --exact --nocapture
+
       - name: Run Windows clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 

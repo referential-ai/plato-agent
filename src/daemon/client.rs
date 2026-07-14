@@ -22,16 +22,31 @@ pub struct DaemonClient {
     reader: BufReader<Stream>,
     writer: Stream,
     next_id: u64,
+    response_limit: Option<u64>,
 }
+
+#[cfg(windows)]
+const CONTROL_RESPONSE_LIMIT: u64 = 64 * 1024;
 
 impl DaemonClient {
     pub fn connect(socket_path: &Path) -> AppResult<Self> {
         let writer = transport::connect(socket_path)?;
+        Self::from_stream(writer, None)
+    }
+
+    #[cfg(windows)]
+    pub fn connect_expected_server(socket_path: &Path, expected_pid: u32) -> AppResult<Self> {
+        let writer = transport::connect_expected_server(socket_path, expected_pid)?;
+        Self::from_stream(writer, Some(CONTROL_RESPONSE_LIMIT))
+    }
+
+    fn from_stream(writer: Stream, response_limit: Option<u64>) -> AppResult<Self> {
         let reader = BufReader::new(transport::try_clone(&writer)?);
         Ok(Self {
             reader,
             writer,
             next_id: 1,
+            response_limit,
         })
     }
 
@@ -196,6 +211,11 @@ impl DaemonClient {
     where
         T: DeserializeOwned,
     {
+        #[cfg(windows)]
+        if self.response_limit.is_some() {
+            transport::reset_deadline(self.reader.get_mut());
+            transport::reset_deadline(&mut self.writer);
+        }
         let id = self.next_request_id(method);
         let envelope = Envelope {
             v: PROTOCOL_VERSION,
@@ -211,7 +231,20 @@ impl DaemonClient {
         self.writer.flush()?;
 
         let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
+        let bytes_read = match self.response_limit {
+            Some(limit) => {
+                let mut reader = std::io::Read::take(&mut self.reader, limit + 1);
+                let bytes_read = reader.read_line(&mut line)?;
+                if bytes_read as u64 > limit {
+                    return Err(AppError::DaemonProtocol(format!(
+                        "{method} response exceeds {limit} bytes"
+                    )));
+                }
+                bytes_read
+            }
+            None => self.reader.read_line(&mut line)?,
+        };
+        if bytes_read == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "daemon connection closed before response",

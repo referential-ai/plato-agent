@@ -1,4 +1,6 @@
 pub mod client;
+#[cfg(windows)]
+pub mod control;
 mod handlers;
 pub mod lock;
 pub mod protocol;

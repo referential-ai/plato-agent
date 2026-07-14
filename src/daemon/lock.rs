@@ -68,7 +68,10 @@ impl LockConflict {
 
 #[derive(Debug)]
 pub struct WorkspaceLock {
+    #[cfg(not(windows))]
     path: PathBuf,
+    #[cfg(windows)]
+    file: File,
 }
 
 impl WorkspaceLock {
@@ -100,7 +103,10 @@ impl WorkspaceLock {
         if let Err(error) = serde_json::to_writer(&mut file, &metadata)
             .and_then(|()| file.write_all(b"\n").map_err(serde_json::Error::io))
         {
+            #[cfg(windows)]
+            let _ = crate::windows_security::delete_file_on_close(&file);
             drop(file);
+            #[cfg(not(windows))]
             let _ = fs::remove_file(&path);
             return Err(Box::new(LockConflict {
                 path,
@@ -109,7 +115,12 @@ impl WorkspaceLock {
             }));
         }
 
-        Ok(Self { path })
+        Ok(Self {
+            #[cfg(not(windows))]
+            path,
+            #[cfg(windows)]
+            file,
+        })
     }
 
     pub fn acquire_for_workspace(workspace_root: &Path, socket_path: &Path) -> AppResult<Self> {
@@ -131,6 +142,9 @@ fn create_lock_file(path: &Path) -> std::io::Result<File> {
 
 impl Drop for WorkspaceLock {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        let _ = crate::windows_security::delete_file_on_close(&self.file);
+        #[cfg(not(windows))]
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -205,6 +219,11 @@ mod tests {
         {
             let _lock = WorkspaceLock::acquire(lock_path.clone(), metadata).unwrap();
             assert!(lock_path.exists());
+            #[cfg(windows)]
+            assert!(
+                fs::remove_file(&lock_path).is_err(),
+                "a live daemon lock must not be replaceable"
+            );
         }
 
         assert!(!lock_path.exists());

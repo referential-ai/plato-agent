@@ -1,4 +1,6 @@
 use clap::Parser;
+#[cfg(windows)]
+use clap::Subcommand;
 use plato_agent::daemon::{server::DaemonServer, wake_listener};
 #[cfg(unix)]
 use signal_hook::{
@@ -14,12 +16,36 @@ use std::thread;
 #[derive(Debug, Parser)]
 #[command(name = "plato-agentd")]
 #[command(about = "Plato Agent local daemon")]
+#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
+    #[cfg(windows)]
+    #[command(subcommand)]
+    command: Option<Command>,
+
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
 
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Subcommand)]
+enum Command {
+    Control {
+        #[command(subcommand)]
+        command: ControlCommand,
+    },
+}
+
+#[cfg(windows)]
+#[derive(Debug, Subcommand)]
+enum ControlCommand {
+    ListWorkspaces,
+    ShutdownIfIdle {
+        #[arg(long, value_name = "ROOT")]
+        workspace: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -31,6 +57,20 @@ fn main() {
 
 fn run() -> plato_agent::AppResult<()> {
     let cli = Cli::parse();
+    #[cfg(windows)]
+    if let Some(Command::Control { command }) = cli.command {
+        let stdout = std::io::stdout();
+        let mut output = stdout.lock();
+        return match command {
+            ControlCommand::ListWorkspaces => {
+                plato_agent::daemon::control::list_workspaces(&mut output)
+            }
+            ControlCommand::ShutdownIfIdle { workspace } => {
+                plato_agent::daemon::control::shutdown_if_idle(workspace.as_deref(), &mut output)
+            }
+        };
+    }
+
     let server = DaemonServer::bind(&cli.workspace, cli.socket)?;
     let socket_path = server.paths().socket_path.clone();
     eprintln!("workspace_id: {}", server.paths().workspace_id);
@@ -81,6 +121,49 @@ fn request_shutdown(shutdown: &AtomicBool, socket_path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn control_cli_parses_aggregate_and_targeted_shutdown() {
+        let aggregate =
+            Cli::try_parse_from(["plato-agentd", "control", "shutdown-if-idle"]).unwrap();
+        assert!(matches!(
+            aggregate.command,
+            Some(Command::Control {
+                command: ControlCommand::ShutdownIfIdle { workspace: None }
+            })
+        ));
+
+        let targeted = Cli::try_parse_from([
+            "plato-agentd",
+            "control",
+            "shutdown-if-idle",
+            "--workspace",
+            r"C:\work",
+        ])
+        .unwrap();
+        assert!(matches!(
+            targeted.command,
+            Some(Command::Control {
+                command: ControlCommand::ShutdownIfIdle { workspace: Some(_) }
+            })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn serve_arguments_conflict_with_control() {
+        assert!(
+            Cli::try_parse_from([
+                "plato-agentd",
+                "--socket",
+                r"\\.\pipe\custom",
+                "control",
+                "list-workspaces",
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn shutdown_request_sets_flag_when_listener_is_missing() {
