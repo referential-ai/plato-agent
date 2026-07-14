@@ -199,6 +199,21 @@ fn installer_control_preflights_refuses_active_and_retries_after_terminal() {
     fs::write(&idle_marker, b"idle user data").unwrap();
     fs::write(&active_marker, b"active user data").unwrap();
 
+    let missing = shutdown_target(local_app_data.path(), idle_workspace.path());
+    assert!(
+        missing.status.success(),
+        "missing target failed: {}",
+        missing.stderr
+    );
+    assert_eq!(
+        parse_ndjson(&missing.stdout),
+        vec![json!({
+            "kind": "shutdown",
+            "workspace_root": idle_workspace.path().canonicalize().unwrap().to_string_lossy(),
+            "result": "not_running",
+        })]
+    );
+
     let mut idle = ProofDaemon::spawn(idle_workspace.path(), local_app_data.path());
     let mut active = ProofDaemon::spawn(active_workspace.path(), local_app_data.path());
     let listed = list_workspaces(local_app_data.path());
@@ -212,6 +227,93 @@ fn installer_control_preflights_refuses_active_and_retries_after_terminal() {
     let mut expected = vec![idle.workspace_record(), active.workspace_record()];
     expected.sort_by_key(|record| record["workspace_id"].as_str().unwrap().to_string());
     assert_eq!(actual, expected);
+
+    let unrelated_workspace = tempfile::tempdir().unwrap();
+    let unrelated_root = unrelated_workspace.path().canonicalize().unwrap();
+    let unrelated_id = paths::workspace_id(&unrelated_root).unwrap();
+    let unrelated_lock = local_app_data
+        .path()
+        .join("plato-agent/workspaces")
+        .join(&unrelated_id)
+        .join("agent.lock");
+    fs::create_dir_all(unrelated_lock.parent().unwrap()).unwrap();
+    let ping = Path::new(&env::var_os("SystemRoot").unwrap())
+        .join("System32/ping.exe")
+        .canonicalize()
+        .unwrap();
+    let mut unrelated = Command::new(&ping)
+        .args(["-t", "127.0.0.1"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let unrelated_metadata = json!({
+        "v": 1,
+        "pid": unrelated.id(),
+        "executable": ping.to_string_lossy(),
+        "workspace_root": unrelated_root.to_string_lossy(),
+        "workspace_id": unrelated_id,
+        "socket_path": r"\\.\pipe\unrelated-process",
+    });
+    fs::write(
+        &unrelated_lock,
+        format!("{unrelated_metadata}\n").as_bytes(),
+    )
+    .unwrap();
+    let unrelated_bytes = fs::read(&unrelated_lock).unwrap();
+
+    let unrelated_list = list_workspaces(local_app_data.path());
+    assert!(
+        unrelated_list.status.success(),
+        "unrelated process was not positively classified: {}",
+        unrelated_list.stderr
+    );
+    let unrelated_records = parse_ndjson(&unrelated_list.stdout);
+    assert_eq!(
+        unrelated_records
+            .iter()
+            .filter(|record| record["kind"] == "workspace")
+            .count(),
+        2
+    );
+    assert!(unrelated_records.iter().any(|record| {
+        record["kind"] == "unrelated"
+            && record["lock_path"] == unrelated_lock.to_string_lossy().as_ref()
+            && record["pid"] == unrelated.id()
+    }));
+
+    unrelated.kill().unwrap();
+    unrelated.wait().unwrap();
+    let stale_list = list_workspaces(local_app_data.path());
+    assert!(!stale_list.status.success());
+    assert_eq!(
+        parse_ndjson(&stale_list.stdout)
+            .iter()
+            .filter(|record| record["kind"] == "workspace")
+            .count(),
+        2
+    );
+    assert!(stale_list.stderr.contains("stale pid"));
+    assert_eq!(fs::read(&unrelated_lock).unwrap(), unrelated_bytes);
+    fs::remove_file(&unrelated_lock).unwrap();
+
+    let targeted = shutdown_target(local_app_data.path(), idle_workspace.path());
+    assert!(
+        targeted.status.success(),
+        "targeted shutdown failed: {}",
+        targeted.stderr
+    );
+    assert_eq!(
+        parse_ndjson(&targeted.stdout),
+        vec![idle.shutdown_record("shutdown")]
+    );
+    assert!(idle.wait_for_exit().success());
+    assert!(!idle.lock_path.exists());
+    assert!(DaemonClient::connect(&idle.socket_path).is_err());
+    idle = ProofDaemon::spawn(idle_workspace.path(), local_app_data.path());
+    expected = vec![idle.workspace_record(), active.workspace_record()];
+    expected.sort_by_key(|record| record["workspace_id"].as_str().unwrap().to_string());
 
     let idle_lock_before = fs::read(&idle.lock_path).unwrap();
     let active_lock_before = fs::read(&active.lock_path).unwrap();
@@ -711,6 +813,15 @@ fn list_workspaces(local_app_data: &Path) -> ControlOutput {
 fn shutdown_if_idle(local_app_data: &Path) -> ControlOutput {
     let mut command = control_command(local_app_data);
     command.arg("shutdown-if-idle");
+    command_output_bounded(command)
+}
+
+fn shutdown_target(local_app_data: &Path, workspace: &Path) -> ControlOutput {
+    let mut command = control_command(local_app_data);
+    command
+        .arg("shutdown-if-idle")
+        .arg("--workspace")
+        .arg(workspace);
     command_output_bounded(command)
 }
 
