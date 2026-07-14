@@ -264,7 +264,9 @@ impl SqliteLedger {
         create_session: bool,
     ) -> AppResult<Vec<SessionTurn>> {
         let now = sqlite_i64(now_ms(), "occurred_at_ms")?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let exists = session_exists_in(&transaction, session_id)?;
         if !exists && !create_session {
             return Err(AppError::SessionNotFound(session_id.into()));
@@ -328,7 +330,9 @@ impl SqliteLedger {
 
     pub fn interrupt_running_session_runs(&mut self, error: &str) -> AppResult<usize> {
         let now = sqlite_i64(now_ms(), "occurred_at_ms")?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let session_ids = {
             let mut statement = transaction.prepare(
                 "SELECT DISTINCT session_id
@@ -764,6 +768,26 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use platonic_core::{AgentId, HarnessEvent, RunId};
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        thread,
+        time::Instant,
+    };
+
+    static FIRST_SESSION_BUSY: AtomicBool = AtomicBool::new(false);
+    static SECOND_SESSION_BUSY: AtomicBool = AtomicBool::new(false);
+
+    fn wait_first_session_writer(_: i32) -> bool {
+        FIRST_SESSION_BUSY.store(true, Ordering::SeqCst);
+        thread::yield_now();
+        true
+    }
+
+    fn wait_second_session_writer(_: i32) -> bool {
+        SECOND_SESSION_BUSY.store(true, Ordering::SeqCst);
+        thread::yield_now();
+        true
+    }
 
     #[test]
     fn writes_and_reads_versioned_jsonl_records() {
@@ -876,6 +900,98 @@ mod tests {
                 final_answer: "hi".into(),
             }]
         );
+    }
+
+    #[test]
+    fn sqlite_concurrent_sessions_avoid_deferred_write_upgrade_race() {
+        FIRST_SESSION_BUSY.store(false, Ordering::SeqCst);
+        SECOND_SESSION_BUSY.store(false, Ordering::SeqCst);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let mut first_ledger = SqliteLedger::open_or_create(&path).unwrap();
+        let mut second_ledger = SqliteLedger::open_or_create(&path).unwrap();
+        first_ledger
+            .connection
+            .busy_handler(Some(wait_first_session_writer))
+            .unwrap();
+        second_ledger
+            .connection
+            .busy_handler(Some(wait_second_session_writer))
+            .unwrap();
+
+        let mut blocker_ledger = SqliteLedger::open_or_create(&path).unwrap();
+        // A RESERVED lock makes DEFERRED readers fail on upgrade while IMMEDIATE writers wait.
+        let blocker = blocker_ledger
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let first_handle = thread::spawn(move || {
+            let run_id = RunId::new("run_1").unwrap();
+            let result = first_ledger.begin_session_run("session_1", &run_id, "question one", true);
+            (first_ledger, result)
+        });
+        let second_handle = thread::spawn(move || {
+            let run_id = RunId::new("run_2").unwrap();
+            let result =
+                second_ledger.begin_session_run("session_2", &run_id, "question two", true);
+            (second_ledger, result)
+        });
+
+        let deadline = Instant::now() + SQLITE_BUSY_TIMEOUT;
+        loop {
+            let both_waiting = FIRST_SESSION_BUSY.load(Ordering::SeqCst)
+                && SECOND_SESSION_BUSY.load(Ordering::SeqCst);
+            if both_waiting
+                || first_handle.is_finished()
+                || second_handle.is_finished()
+                || Instant::now() >= deadline
+            {
+                break;
+            }
+            thread::yield_now();
+        }
+        let first_waited = FIRST_SESSION_BUSY.load(Ordering::SeqCst);
+        let second_waited = SECOND_SESSION_BUSY.load(Ordering::SeqCst);
+        blocker.commit().unwrap();
+
+        let (mut first_ledger, first_result) = first_handle.join().unwrap();
+        let (mut second_ledger, second_result) = second_handle.join().unwrap();
+        assert!(
+            first_waited && second_waited,
+            "both writers must wait before reading: first={first_result:?}, second={second_result:?}"
+        );
+        assert!(first_result.unwrap().is_empty());
+        assert!(second_result.unwrap().is_empty());
+
+        for (ledger, run_id, occurred_at_ms, answer) in [
+            (&mut first_ledger, "run_1", 10, "answer one"),
+            (&mut second_ledger, "run_2", 20, "answer two"),
+        ] {
+            ledger
+                .append(run_id, &started_record(run_id, 0, occurred_at_ms))
+                .unwrap();
+            ledger
+                .finish_session_run(&RunId::new(run_id).unwrap(), answer)
+                .unwrap();
+        }
+        drop(first_ledger);
+        drop(second_ledger);
+
+        let ledger = SqliteLedger::open_readonly(&path).unwrap();
+        for (session_id, run_id, question, answer) in [
+            ("session_1", "run_1", "question one", "answer one"),
+            ("session_2", "run_2", "question two", "answer two"),
+        ] {
+            let session = ledger.read_session(session_id).unwrap();
+            assert_eq!(session.runs.len(), 1);
+            assert_eq!(session.runs[0].run_id, run_id);
+            assert_eq!(session.runs[0].question, question);
+            assert_eq!(session.runs[0].status, RunStateName::Finished);
+            assert_eq!(session.runs[0].final_answer.as_deref(), Some(answer));
+            assert_eq!(session.runs[0].records.len(), 1);
+            assert_eq!(session.runs[0].records[0].event.run_id().as_str(), run_id);
+        }
     }
 
     #[test]
