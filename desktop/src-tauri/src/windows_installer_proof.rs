@@ -243,7 +243,20 @@ fn run_installer_with_gate_probe(installer: &Path) -> ExitStatus {
 }
 
 fn run_uninstaller(uninstaller: &Path) -> ExitStatus {
-    run_bounded(uninstaller, &["/S"])
+    let copy_dir = tempfile::tempdir().unwrap();
+    let copy = copy_dir.path().join("uninstall.exe");
+    fs::copy(uninstaller, &copy).unwrap();
+    let install_dir = uninstaller.parent().unwrap();
+    let mut child = Command::new(&copy)
+        .arg("/S")
+        .raw_arg(format!("_?={}", install_dir.display()))
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_status(&mut child, INSTALL_TIMEOUT, &copy)
 }
 
 fn run_bounded(program: &Path, args: &[&str]) -> ExitStatus {
