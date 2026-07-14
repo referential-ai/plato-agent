@@ -23,15 +23,34 @@ pub struct DaemonClient {
     writer: Stream,
     next_id: u64,
     response_limit: Option<u64>,
+    #[cfg(unix)]
+    response_deadline: Option<std::time::Instant>,
 }
 
 #[cfg(windows)]
 const CONTROL_RESPONSE_LIMIT: u64 = 64 * 1024;
-
 impl DaemonClient {
     pub fn connect(socket_path: &Path) -> AppResult<Self> {
         let writer = transport::connect(socket_path)?;
         Self::from_stream(writer, None)
+    }
+
+    #[cfg(unix)]
+    pub fn connect_with_timeout(
+        socket_path: &Path,
+        timeout: std::time::Duration,
+    ) -> AppResult<Self> {
+        let writer = transport::connect_with_timeout(socket_path, timeout)?;
+        let mut client = Self::from_stream(writer, None)?;
+        client.set_timeout(timeout)?;
+        Ok(client)
+    }
+
+    #[cfg(unix)]
+    pub fn set_timeout(&mut self, timeout: std::time::Duration) -> AppResult<()> {
+        transport::set_timeout(&self.writer, timeout)?;
+        self.response_deadline = Some(std::time::Instant::now() + timeout);
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -47,6 +66,8 @@ impl DaemonClient {
             writer,
             next_id: 1,
             response_limit,
+            #[cfg(unix)]
+            response_deadline: None,
         })
     }
 
@@ -230,20 +251,30 @@ impl DaemonClient {
         self.writer.write_all(b"\n")?;
         self.writer.flush()?;
 
-        let mut line = String::new();
+        let mut line = Vec::new();
+        #[cfg(unix)]
+        if self.response_deadline.is_some() {
+            let bytes_read =
+                self.read_line_until_deadline(method, self.response_limit, &mut line)?;
+            return self.decode_response(method, id, bytes_read, line);
+        }
         let bytes_read = match self.response_limit {
-            Some(limit) => {
-                let mut reader = std::io::Read::take(&mut self.reader, limit + 1);
-                let bytes_read = reader.read_line(&mut line)?;
-                if bytes_read as u64 > limit {
-                    return Err(AppError::DaemonProtocol(format!(
-                        "{method} response exceeds {limit} bytes"
-                    )));
-                }
-                bytes_read
-            }
-            None => self.reader.read_line(&mut line)?,
+            Some(limit) => Self::read_limited_line(&mut self.reader, method, limit, &mut line)?,
+            None => self.reader.read_until(b'\n', &mut line)?,
         };
+        self.decode_response(method, id, bytes_read, line)
+    }
+
+    fn decode_response<T>(
+        &self,
+        method: &str,
+        id: String,
+        bytes_read: usize,
+        line: Vec<u8>,
+    ) -> AppResult<T>
+    where
+        T: DeserializeOwned,
+    {
         if bytes_read == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -251,7 +282,7 @@ impl DaemonClient {
             )
             .into());
         }
-        let response = serde_json::from_str::<Envelope>(line.trim())?;
+        let response = serde_json::from_slice::<Envelope>(&line)?;
         if response.v != PROTOCOL_VERSION {
             return Err(AppError::DaemonProtocol(format!(
                 "unsupported response protocol version: {}",
@@ -280,6 +311,69 @@ impl DaemonClient {
             other => Err(AppError::DaemonProtocol(format!(
                 "{method} returned unexpected envelope kind {other:?}"
             ))),
+        }
+    }
+
+    fn read_limited_line(
+        reader: &mut BufReader<Stream>,
+        method: &str,
+        limit: u64,
+        line: &mut Vec<u8>,
+    ) -> AppResult<usize> {
+        let mut reader = std::io::Read::take(reader, limit + 1);
+        let bytes_read = reader.read_until(b'\n', line)?;
+        if bytes_read as u64 > limit {
+            return Err(AppError::DaemonProtocol(format!(
+                "{method} response exceeds {limit} bytes"
+            )));
+        }
+        Ok(bytes_read)
+    }
+
+    #[cfg(unix)]
+    fn read_line_until_deadline(
+        &mut self,
+        method: &str,
+        limit: Option<u64>,
+        line: &mut Vec<u8>,
+    ) -> AppResult<usize> {
+        let deadline = self
+            .response_deadline
+            .expect("deadline reader requires a response deadline");
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("{method} response timed out"),
+                )
+                .into());
+            }
+            transport::set_timeout(self.reader.get_ref(), remaining)?;
+            let available = self.reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(line.len());
+            }
+            let consumed = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |position| position + 1);
+            let ended = available[consumed - 1] == b'\n';
+            let retained = match limit {
+                Some(limit) => consumed.min((limit + 1).saturating_sub(line.len() as u64) as usize),
+                None => consumed,
+            };
+            line.extend_from_slice(&available[..retained]);
+            self.reader.consume(consumed);
+            if limit.is_some_and(|limit| line.len() as u64 > limit) {
+                return Err(AppError::DaemonProtocol(format!(
+                    "{method} response exceeds {} bytes",
+                    limit.expect("checked as present")
+                )));
+            }
+            if ended {
+                return Ok(line.len());
+            }
         }
     }
 

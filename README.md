@@ -255,6 +255,33 @@ unvalidated lock aborts before installed Plato binaries or user files change;
 idle daemons exit and remove their locks. These unsigned artifacts are for
 development proof only and are not distributed.
 
+### Linux AppImage (Private Release)
+
+Linux releases target x86-64 Ubuntu 24.04 on the WebKitGTK 4.1 ABI. The
+AppImage contains the same-revision `plato-agentd` sidecar. It first attaches
+to a valid workspace daemon; if none is available, it restores only the user's
+login-shell `PATH`, starts the bundled sidecar, and retries for a bounded
+interval. Closing Plato detaches without stopping the daemon or active runs.
+Startup failures report the sidecar, socket, and lock paths and never delete a
+lock or fall back to a system daemon.
+
+Authenticated private-release download and integrity check:
+
+```bash
+gh auth status
+gh release download plato-desktop-v0.1.0 \
+  --repo referential-ai/plato-agent \
+  --pattern 'Plato-*-x86_64.AppImage*'
+sha256sum --check Plato-*-x86_64.AppImage.sha256
+chmod +x Plato-*-x86_64.AppImage
+./Plato-*-x86_64.AppImage
+```
+
+Ubuntu 24.04 needs its WebKitGTK 4.1 runtime and `libfuse2t64`; Rust, Node,
+and development packages are not runtime dependencies. These private artifacts
+are not a public community launch. Build the AppImage on Ubuntu 24.04 with
+`npm run tauri:bundle:linux -- --ci -- --locked` from `desktop/`.
+
 ## Discord Gateway
 
 `plato-gateway-discord` receives Discord messages over an outbound WebSocket
