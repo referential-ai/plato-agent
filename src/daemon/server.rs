@@ -132,7 +132,7 @@ impl DaemonServer {
         handle_stream(self.runtime.clone(), stream)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn handle_line(&self, line: &str) -> crate::daemon::protocol::Envelope {
         handle_line(&self.runtime, line)
     }
@@ -249,7 +249,7 @@ fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult
             Ok(())
         })();
         if stop_after_response {
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             runtime.wait_after_shutdown_flush();
             runtime.stop_requested.store(true, Ordering::SeqCst);
             transport::wake(&runtime.paths.socket_path);

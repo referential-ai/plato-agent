@@ -23,7 +23,7 @@ pub fn default_socket_path(workspace_root: &Path) -> AppResult<PathBuf> {
 pub fn default_socket_path(workspace_root: &Path) -> AppResult<PathBuf> {
     Ok(PathBuf::from(format!(
         r"\\.\pipe\plato-agent-{}",
-        workspace_hash(workspace_root)?
+        workspace_id(workspace_root)?
     )))
 }
 
@@ -40,17 +40,15 @@ pub fn workspace_id(workspace_root: &Path) -> AppResult<String> {
     Ok(workspace_id_from_canonical_path(&canonical))
 }
 
-#[cfg(windows)]
-fn workspace_hash(workspace_root: &Path) -> AppResult<String> {
-    Ok(hash16(&workspace_root.canonicalize()?))
-}
-
 fn workspace_id_from_canonical_path(path: &Path) -> String {
     let basename = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("workspace");
-    format!("{}-{}", slug(basename), hash16(path))
+    let slug = slug(basename);
+    #[cfg(windows)]
+    let slug: String = slug.chars().take(64).collect();
+    format!("{slug}-{}", hash16(path))
 }
 
 fn slug(value: &str) -> String {
@@ -225,7 +223,6 @@ mod tests {
             Some(local_app_data.path().as_os_str()),
             || {
                 let workspace_id = workspace_id(workspace.path()).unwrap();
-                let workspace_hash = workspace_hash(workspace.path()).unwrap();
                 let workspace_dir = local_app_data
                     .path()
                     .join("plato-agent")
@@ -234,7 +231,7 @@ mod tests {
 
                 assert_eq!(
                     default_socket_path(workspace.path()).unwrap(),
-                    PathBuf::from(format!(r"\\.\pipe\plato-agent-{workspace_hash}"))
+                    PathBuf::from(format!(r"\\.\pipe\plato-agent-{workspace_id}"))
                 );
                 assert_eq!(
                     default_lock_path(workspace.path()).unwrap(),
@@ -257,9 +254,11 @@ mod tests {
 
         let endpoint = default_socket_path(&workspace).unwrap();
         let endpoint = endpoint.to_string_lossy();
+        let workspace_id = workspace_id(&workspace).unwrap();
 
-        assert!(endpoint.starts_with(r"\\.\pipe\plato-agent-"));
-        assert_eq!(endpoint.encode_utf16().count(), 37);
+        assert_eq!(endpoint, format!(r"\\.\pipe\plato-agent-{workspace_id}"));
+        assert!(endpoint.encode_utf16().count() <= 102);
+        assert!(workspace_id.len() <= 81);
     }
 
     #[cfg(windows)]

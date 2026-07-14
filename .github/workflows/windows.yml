@@ -31,9 +31,14 @@ jobs:
           $ssh = Join-Path $HOME ".ssh"
           New-Item -ItemType Directory -Force $ssh | Out-Null
           $key = Join-Path $ssh "platonic_core_deploy_key"
+          $keyText = $env:PLATONIC_CORE_DEPLOY_KEY.Replace(
+            ([char]13).ToString() + [char]10,
+            [char]10
+          ).Replace([char]13, [char]10)
+          $keyText = $keyText.TrimEnd([char[]]@([char]10, [char]13)) + [char]10
           [IO.File]::WriteAllText(
             $key,
-            $env:PLATONIC_CORE_DEPLOY_KEY,
+            $keyText,
             [Text.UTF8Encoding]::new($false)
           )
           @'
@@ -78,6 +83,18 @@ jobs:
         run: >-
           cargo test --locked --test windows_daemon
           production_pipe_and_lock_reject_second_user_and_remote_clients
+          -- --ignored --exact --nocapture
+
+      - name: Prove hostile pipe pre-bind rejection
+        run: >-
+          cargo test --locked --test windows_daemon
+          client_rejects_second_user_prebound_pipes
+          -- --ignored --exact --nocapture
+
+      - name: Prove Ctrl-C graceful shutdown
+        run: >-
+          cargo test --locked --test windows_daemon
+          ctrl_c_stops_daemon_and_removes_lock
           -- --ignored --exact --nocapture
 
       - name: Run Windows clippy

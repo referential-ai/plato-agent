@@ -15,10 +15,7 @@ use std::{
 #[cfg(unix)]
 use std::{os::unix::process::CommandExt, process::Child};
 #[cfg(windows)]
-use {
-    command_group::{CommandGroup, GroupChild},
-    std::os::windows::process::CommandExt,
-};
+use {self::windows_shell::JobChild, std::os::windows::process::CommandExt};
 
 const MAX_READ_BYTES: usize = 64 * 1024;
 const MAX_LIST_ENTRIES: usize = 200;
@@ -60,7 +57,167 @@ const WINDOWS_SHELL_ENV_ALLOWLIST: &[&str] = &[
 #[cfg(unix)]
 type ShellChild = Child;
 #[cfg(windows)]
-type ShellChild = Option<GroupChild>;
+type ShellChild = Option<JobChild>;
+
+#[cfg(windows)]
+mod windows_shell {
+    #![allow(unsafe_code)]
+
+    use std::{
+        io, mem,
+        os::windows::{
+            io::{AsRawHandle, FromRawHandle, OwnedHandle},
+            process::CommandExt,
+        },
+        process::{Child, Command, ExitStatus},
+        ptr,
+    };
+    use windows_sys::Win32::{
+        Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
+                Thread32Next,
+            },
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject,
+            },
+            Threading::{CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
+        },
+    };
+
+    pub(super) struct JobChild {
+        child: Child,
+        job: Option<OwnedHandle>,
+    }
+
+    impl JobChild {
+        pub(super) fn spawn(command: &mut Command) -> io::Result<Self> {
+            command.creation_flags(CREATE_SUSPENDED);
+            let job = create_kill_on_close_job()?;
+            let mut child = command.spawn()?;
+            if let Err(error) = assign_to_job(&child, &job) {
+                if child.kill().is_ok() {
+                    let _ = child.wait();
+                }
+                return Err(error);
+            }
+            if let Err(error) = resume_process(child.id()) {
+                drop(job);
+                let _ = child.wait();
+                return Err(error);
+            }
+            Ok(Self {
+                child,
+                job: Some(job),
+            })
+        }
+
+        pub(super) fn inner(&mut self) -> &mut Child {
+            &mut self.child
+        }
+
+        pub(super) fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            self.child.try_wait()
+        }
+    }
+
+    impl Drop for JobChild {
+        fn drop(&mut self) {
+            drop(self.job.take());
+        }
+    }
+
+    fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
+        // SAFETY: null attributes/name request an unnamed, non-inheritable job.
+        let raw = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateJobObjectW returned a new owned handle.
+        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: job is live and limits points to the documented fixed-size structure.
+        if unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                mem::size_of_val(&limits)
+                    .try_into()
+                    .expect("job limits size fits u32"),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+
+    fn assign_to_job(child: &Child, job: &OwnedHandle) -> io::Result<()> {
+        // SAFETY: both handles stay live through the assignment.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn resume_process(process_id: u32) -> io::Result<()> {
+        // SAFETY: the snapshot handle is checked before ownership is assumed.
+        let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateToolhelp32Snapshot returned a new owned handle.
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut entry = THREADENTRY32 {
+            dwSize: mem::size_of::<THREADENTRY32>()
+                .try_into()
+                .expect("THREADENTRY32 size fits u32"),
+            ..Default::default()
+        };
+        // SAFETY: snapshot is live and entry points to initialized writable storage.
+        if unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut resumed = false;
+        loop {
+            if entry.th32OwnerProcessID == process_id {
+                // SAFETY: the returned thread handle is checked before ownership is assumed.
+                let raw = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if raw.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: OpenThread returned a new owned handle.
+                let thread = unsafe { OwnedHandle::from_raw_handle(raw) };
+                // SAFETY: thread is live and was opened with THREAD_SUSPEND_RESUME.
+                if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+                    return Err(io::Error::last_os_error());
+                }
+                resumed = true;
+            }
+
+            // SAFETY: snapshot and entry remain live for the enumeration.
+            if unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+                    return Err(error);
+                }
+                break;
+            }
+        }
+        if !resumed {
+            return Err(io::Error::other(
+                "Windows shell process had no thread to resume",
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -416,7 +573,7 @@ fn spawn_shell(command: &str, cwd: &Path, env: Vec<(String, String)>) -> io::Res
 
 #[cfg(windows)]
 fn spawn_shell(command: &str, cwd: &Path, env: Vec<(String, String)>) -> io::Result<ShellChild> {
-    let mut process = Command::new("cmd.exe");
+    let mut process = Command::new(crate::windows_security::system_cmd_path()?);
     process
         .arg("/C")
         .raw_arg(command)
@@ -425,7 +582,7 @@ fn spawn_shell(command: &str, cwd: &Path, env: Vec<(String, String)>) -> io::Res
         .envs(env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    process.group().kill_on_drop(true).spawn().map(Some)
+    JobChild::spawn(&mut process).map(Some)
 }
 
 #[cfg(unix)]
@@ -1490,6 +1647,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("user-bin");
         fs::create_dir(&bin).unwrap();
+        fs::write(bin.join("cmd.exe"), "not a Windows executable").unwrap();
         fs::write(
             bin.join("user-probe.cmd"),
             "@echo off\r\necho user-path-ok\r\n",
@@ -1499,7 +1657,7 @@ mod tests {
         let result = temp_env::with_vars(
             [
                 ("PATH", Some(bin.as_os_str())),
-                ("PATHEXT", Some(std::ffi::OsStr::new(".CMD"))),
+                ("PATHEXT", Some(std::ffi::OsStr::new(".EXE;.CMD"))),
             ],
             || {
                 execute_tool(
@@ -1556,7 +1714,7 @@ mod tests {
             AppError::Tool(message) if message == "shell.exec timed out after 1s"
         ));
         assert!(dir.path().join("descendant-started.txt").exists());
-        thread::sleep(Duration::from_secs(4));
+        thread::sleep(Duration::from_secs(6));
         assert!(!dir.path().join("descendant-survived.txt").exists());
     }
 
@@ -1597,7 +1755,7 @@ mod tests {
             err,
             AppError::Tool(message) if message == "shell.exec canceled"
         ));
-        thread::sleep(Duration::from_secs(4));
+        thread::sleep(Duration::from_secs(6));
         assert!(!dir.path().join("descendant-survived.txt").exists());
     }
 

@@ -111,12 +111,15 @@ Default paths are keyed by the workspace id:
 - Unix socket: `${XDG_RUNTIME_DIR:-/tmp/plato-agent/$USER}/plato-agent/workspaces/<workspace-id>/agent.sock`
 - Unix lock: `${XDG_RUNTIME_DIR:-/tmp/plato-agent/$USER}/plato-agent/workspaces/<workspace-id>/agent.lock`
 - Unix ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/plato-agent/workspaces/<workspace-id>/agent.db`
-- Windows pipe: `\\.\pipe\plato-agent-<workspace-hash>`
+- Windows pipe: `\\.\pipe\plato-agent-<workspace-id>`
 - Windows lock and ledger: `%LOCALAPPDATA%\plato-agent\workspaces\<workspace-id>\agent.lock` and `agent.db`
 
 Runtime directories are restricted to `0700` and the daemon socket to `0600`.
 A custom Unix `--socket` parent is restricted to `0700` at startup. Windows
-pipe and lock ACLs grant access only to the current user and reject remote pipe clients.
+pipe and lock ACLs grant access only to the current user and reject remote pipe
+clients. Windows clients limit server impersonation to identity inspection,
+authenticate the server's user before sending protocol bytes, and bound
+busy-pipe connection waits.
 
 The daemon holds the lock while it is active. SIGINT and SIGTERM on Unix, and
 Ctrl-C or Ctrl-Break on Windows, trigger a graceful shutdown: the daemon stops

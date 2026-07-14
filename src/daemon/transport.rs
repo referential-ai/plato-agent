@@ -4,7 +4,20 @@ use std::{io, path::Path};
 pub(crate) use std::os::unix::net::{UnixListener as Listener, UnixStream as Stream};
 
 #[cfg(windows)]
-pub(crate) use interprocess::local_socket::{Listener, Stream};
+pub(crate) use interprocess::local_socket::Listener;
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct Stream {
+    inner: WindowsStream,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+enum WindowsStream {
+    Client(std::fs::File),
+    Server(interprocess::local_socket::Stream),
+}
 
 #[cfg(unix)]
 pub(crate) fn bind(endpoint: &Path) -> io::Result<Listener> {
@@ -32,9 +45,11 @@ pub(crate) fn connect(endpoint: &Path) -> io::Result<Stream> {
 
 #[cfg(windows)]
 pub(crate) fn connect(endpoint: &Path) -> io::Result<Stream> {
-    use interprocess::local_socket::{GenericFilePath, prelude::*};
-
-    Stream::connect(endpoint.to_fs_name::<GenericFilePath>()?)
+    Ok(Stream {
+        inner: WindowsStream::Client(crate::windows_security::connect_current_user_pipe(
+            endpoint,
+        )?),
+    })
 }
 
 #[cfg(unix)]
@@ -46,7 +61,9 @@ pub(crate) fn accept(listener: &Listener) -> io::Result<Stream> {
 pub(crate) fn accept(listener: &Listener) -> io::Result<Stream> {
     use interprocess::local_socket::prelude::*;
 
-    listener.accept()
+    listener.accept().map(|stream| Stream {
+        inner: WindowsStream::Server(stream),
+    })
 }
 
 #[cfg(unix)]
@@ -56,11 +73,54 @@ pub(crate) fn try_clone(stream: &Stream) -> io::Result<Stream> {
 
 #[cfg(windows)]
 pub(crate) fn try_clone(stream: &Stream) -> io::Result<Stream> {
-    interprocess::TryClone::try_clone(stream)
+    let inner = match &stream.inner {
+        WindowsStream::Client(stream) => WindowsStream::Client(stream.try_clone()?),
+        WindowsStream::Server(stream) => {
+            WindowsStream::Server(interprocess::TryClone::try_clone(stream)?)
+        }
+    };
+    Ok(Stream { inner })
 }
 
 pub(crate) fn wake(endpoint: &Path) {
     let _ = connect(endpoint);
+}
+
+#[cfg(windows)]
+impl io::Read for Stream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match &mut self.inner {
+            WindowsStream::Client(stream) => stream.read(buffer),
+            WindowsStream::Server(stream) => stream.read(buffer),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl io::Read for &Stream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match &self.inner {
+            WindowsStream::Client(stream) => (&*stream).read(buffer),
+            WindowsStream::Server(stream) => (&*stream).read(buffer),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl io::Write for Stream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match &mut self.inner {
+            WindowsStream::Client(stream) => stream.write(buffer),
+            WindowsStream::Server(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.inner {
+            WindowsStream::Client(stream) => stream.flush(),
+            WindowsStream::Server(stream) => stream.flush(),
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

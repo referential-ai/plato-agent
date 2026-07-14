@@ -100,6 +100,7 @@ impl WorkspaceLock {
         if let Err(error) = serde_json::to_writer(&mut file, &metadata)
             .and_then(|()| file.write_all(b"\n").map_err(serde_json::Error::io))
         {
+            drop(file);
             let _ = fs::remove_file(&path);
             return Err(Box::new(LockConflict {
                 path,

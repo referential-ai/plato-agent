@@ -40,7 +40,6 @@ ureq = { version = "2", features = ["json"] }
 url = "2"
 
 [target.'cfg(windows)'.dependencies]
-command-group = "=5.0.1"
 ctrlc = "=3.5.2"
 interprocess = "=2.4.2"
 widestring = "1"
@@ -50,6 +49,10 @@ windows-sys = { version = "0.61", features = [
   "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
   "Win32_System_Console",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_Pipes",
+  "Win32_System_SystemInformation",
   "Win32_System_Threading",
 ] }
 
