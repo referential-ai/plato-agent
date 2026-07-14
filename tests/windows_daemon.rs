@@ -277,11 +277,16 @@ fn installer_control_preflights_refuses_active_and_retries_after_terminal() {
             .count(),
         2
     );
-    assert!(unrelated_records.iter().any(|record| {
-        record["kind"] == "unrelated"
-            && record["lock_path"] == unrelated_lock.to_string_lossy().as_ref()
-            && record["pid"] == unrelated.id()
-    }));
+    let unrelated_record = unrelated_records
+        .iter()
+        .find(|record| record["kind"] == "unrelated")
+        .unwrap_or_else(|| panic!("missing unrelated record: {unrelated_records:?}"));
+    assert_eq!(unrelated_record["pid"], unrelated.id());
+    let reported_lock = Path::new(unrelated_record["lock_path"].as_str().unwrap());
+    assert_eq!(
+        reported_lock.canonicalize().unwrap(),
+        unrelated_lock.canonicalize().unwrap()
+    );
 
     unrelated.kill().unwrap();
     unrelated.wait().unwrap();
