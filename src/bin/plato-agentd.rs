@@ -45,6 +45,8 @@ enum ControlCommand {
     ShutdownIfIdle {
         #[arg(long, value_name = "ROOT")]
         workspace: Option<PathBuf>,
+        #[arg(long)]
+        quiet: bool,
     },
 }
 
@@ -65,13 +67,27 @@ fn run() -> plato_agent::AppResult<()> {
             ControlCommand::ListWorkspaces => {
                 plato_agent::daemon::control::list_workspaces(&mut output)
             }
-            ControlCommand::ShutdownIfIdle { workspace } => {
-                plato_agent::daemon::control::shutdown_if_idle(workspace.as_deref(), &mut output)
+            ControlCommand::ShutdownIfIdle { workspace, quiet } => {
+                if quiet {
+                    plato_agent::daemon::control::shutdown_if_idle(
+                        workspace.as_deref(),
+                        &mut std::io::sink(),
+                    )
+                } else {
+                    plato_agent::daemon::control::shutdown_if_idle(
+                        workspace.as_deref(),
+                        &mut output,
+                    )
+                }
             }
         };
     }
 
+    #[cfg(windows)]
+    let installer_gate = plato_agent::daemon::installer_gate::InstallerStartupGate::acquire()?;
     let server = DaemonServer::bind(&cli.workspace, cli.socket)?;
+    #[cfg(windows)]
+    drop(installer_gate);
     let socket_path = server.paths().socket_path.clone();
     eprintln!("workspace_id: {}", server.paths().workspace_id);
     eprintln!("socket_path: {}", socket_path.display());
@@ -130,7 +146,10 @@ mod tests {
         assert!(matches!(
             aggregate.command,
             Some(Command::Control {
-                command: ControlCommand::ShutdownIfIdle { workspace: None }
+                command: ControlCommand::ShutdownIfIdle {
+                    workspace: None,
+                    quiet: false
+                }
             })
         ));
 
@@ -145,7 +164,19 @@ mod tests {
         assert!(matches!(
             targeted.command,
             Some(Command::Control {
-                command: ControlCommand::ShutdownIfIdle { workspace: Some(_) }
+                command: ControlCommand::ShutdownIfIdle {
+                    workspace: Some(_),
+                    quiet: false
+                }
+            })
+        ));
+
+        let quiet = Cli::try_parse_from(["plato-agentd", "control", "shutdown-if-idle", "--quiet"])
+            .unwrap();
+        assert!(matches!(
+            quiet.command,
+            Some(Command::Control {
+                command: ControlCommand::ShutdownIfIdle { quiet: true, .. }
             })
         ));
     }

@@ -177,3 +177,108 @@ jobs:
 
       - name: Run Rust clippy
         run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+
+  windows-installer:
+    name: Windows unsigned installer
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: desktop
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}\target
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out plato-agent
+        uses: actions/checkout@v4
+
+      - name: Configure SSH for private platonic-core dependency
+        env:
+          PLATONIC_CORE_DEPLOY_KEY: ${{ secrets.PLATONIC_CORE_DEPLOY_KEY }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:PLATONIC_CORE_DEPLOY_KEY)) {
+            throw "PLATONIC_CORE_DEPLOY_KEY is required"
+          }
+          $ssh = Join-Path $HOME ".ssh"
+          New-Item -ItemType Directory -Force $ssh | Out-Null
+          $key = Join-Path $ssh "platonic_core_deploy_key"
+          $keyText = $env:PLATONIC_CORE_DEPLOY_KEY -replace "`r`n?", "`n"
+          $keyText = $keyText.TrimEnd([char[]]@([char]10, [char]13)) + [char]10
+          [IO.File]::WriteAllText(
+            $key,
+            $keyText,
+            [Text.UTF8Encoding]::new($false)
+          )
+          @'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          '@ | Set-Content -Encoding utf8 (Join-Path $ssh "known_hosts")
+          $keyForSsh = $key.Replace('\', '/')
+          @"
+          Host github.com
+            HostName github.com
+            User git
+            IdentityFile $keyForSsh
+            IdentitiesOnly yes
+          "@ | Set-Content -Encoding utf8 (Join-Path $ssh "config")
+          icacls $ssh /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" | Out-Null
+          icacls $key /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci
+
+      - name: Build unsigned installers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm run tauri:bundle:windows -- --ci -- --locked
+
+          $bundle = Join-Path $env:CARGO_TARGET_DIR "x86_64-pc-windows-msvc\release\bundle\nsis"
+          $found = @(Get-ChildItem $bundle -File -Filter "*-setup.exe")
+          if ($found.Count -ne 1) {
+            throw "expected one base installer, found $($found.Count)"
+          }
+          $base = Join-Path $env:RUNNER_TEMP "plato-base-setup.exe"
+          Copy-Item $found[0].FullName $base
+          Remove-Item $bundle -Recurse -Force
+
+          $upgradeConfig = Join-Path $env:RUNNER_TEMP "tauri-upgrade.json"
+          [IO.File]::WriteAllText(
+            $upgradeConfig,
+            '{"version":"0.1.1"}',
+            [Text.UTF8Encoding]::new($false)
+          )
+          npx tauri build --target x86_64-pc-windows-msvc --bundles nsis `
+            --config src-tauri/tauri.windows-package.conf.json `
+            --config $upgradeConfig --ci --no-sign -- --locked
+
+          $found = @(Get-ChildItem $bundle -File -Filter "*-setup.exe")
+          if ($found.Count -ne 1) {
+            throw "expected one upgrade installer, found $($found.Count)"
+          }
+          $upgrade = Join-Path $env:RUNNER_TEMP "plato-upgrade-setup.exe"
+          Copy-Item $found[0].FullName $upgrade
+          Get-FileHash $base -Algorithm SHA256
+          Get-FileHash $upgrade -Algorithm SHA256
+
+      - name: Prove unsigned install, upgrade, and uninstall
+        shell: pwsh
+        env:
+          PLATO_DESKTOP_TEST_BASE_INSTALLER: ${{ runner.temp }}\plato-base-setup.exe
+          PLATO_DESKTOP_TEST_UPGRADE_INSTALLER: ${{ runner.temp }}\plato-upgrade-setup.exe
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --release
+          --target x86_64-pc-windows-msvc
+          windows_installer_proof::unsigned_installer_cold_launch_upgrade_and_uninstall_matrix
+          -- --ignored --nocapture --test-threads=1

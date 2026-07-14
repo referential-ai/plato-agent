@@ -24,6 +24,8 @@ use tauri_plugin_dialog::DialogExt;
 #[cfg(windows)]
 mod lifecycle;
 #[cfg(all(test, windows))]
+mod windows_installer_proof;
+#[cfg(all(test, windows))]
 mod windows_proof;
 
 const REQUIRED_CAPABILITIES: [&str; 10] = [
@@ -1733,6 +1735,11 @@ fn replace_workspace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(windows)]
+    drop(
+        plato_agent::daemon::installer_gate::InstallerStartupGate::acquire()
+            .expect("Plato installation or update is in progress"),
+    );
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {

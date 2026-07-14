@@ -76,6 +76,18 @@ jobs:
       - name: Run Windows tests
         run: cargo test --locked
 
+      - name: Prove installer startup gate
+        run: >-
+          cargo test --locked --test windows_daemon
+          installer_gate_refuses_daemon_before_endpoint_or_lock_creation
+          -- --ignored --exact --nocapture
+
+      - name: Prove current-user installer gate isolation
+        run: >-
+          cargo test --locked --test windows_daemon
+          installer_gate_is_isolated_per_current_user
+          -- --ignored --exact --nocapture
+
       - name: Prove pipe and lock ACLs
         run: >-
           cargo test --locked --test windows_daemon
