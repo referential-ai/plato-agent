@@ -12,9 +12,19 @@ use plato_agent::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{fs, io::ErrorKind, path::Path, path::PathBuf};
+use std::{
+    fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
+};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
+
+#[cfg(windows)]
+mod lifecycle;
+#[cfg(all(test, windows))]
+mod windows_proof;
 
 const REQUIRED_CAPABILITIES: [&str; 10] = [
     "hello",
@@ -30,9 +40,60 @@ const REQUIRED_CAPABILITIES: [&str; 10] = [
 ];
 const EVENT_PAGE_SIZE: usize = 128;
 const INPUT_PREVIEW_MAX_CHARS: usize = 2_000;
+#[cfg(windows)]
+const DAEMON_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(windows)]
+const DAEMON_ATTACH_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(windows)]
+const DAEMON_ATTACH_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
 struct DesktopState {
     workspace_file: PathBuf,
+    lifecycle: Arc<Mutex<DesktopLifecycle>>,
+    launch: DaemonLaunch,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DaemonLaunch {
+    #[cfg(windows)]
+    executable: Option<PathBuf>,
+}
+
+impl DaemonLaunch {
+    #[cfg(windows)]
+    fn installed() -> Result<Self, std::io::Error> {
+        Ok(Self {
+            executable: Some(lifecycle::sibling_daemon_executable()?),
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn installed() -> Result<Self, std::io::Error> {
+        Ok(Self::default())
+    }
+}
+
+#[derive(Default)]
+struct DesktopLifecycle {
+    workspace_root: Option<PathBuf>,
+    #[cfg(windows)]
+    workspace_instance: Option<lifecycle::WorkspaceInstance>,
+    #[cfg(windows)]
+    spawned_daemon: Option<SpawnedDaemon>,
+}
+
+struct PreparedWorkspace {
+    workspace_root: PathBuf,
+    #[cfg(windows)]
+    workspace_id: String,
+    #[cfg(windows)]
+    instance: Option<lifecycle::WorkspaceInstance>,
+}
+
+#[cfg(windows)]
+struct SpawnedDaemon {
+    workspace_id: String,
+    child: std::process::Child,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -393,12 +454,92 @@ enum SavedWorkspaceState {
     Ready(PathBuf),
 }
 
+impl DesktopLifecycle {
+    fn prepare_workspace(&self, workspace_root: &Path) -> Result<PreparedWorkspace, DesktopError> {
+        #[cfg(windows)]
+        {
+            let workspace_id = paths::workspace_id(workspace_root)
+                .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
+            if self
+                .workspace_instance
+                .as_ref()
+                .is_some_and(|instance| instance.workspace_id() == workspace_id)
+            {
+                return Ok(PreparedWorkspace {
+                    workspace_root: workspace_root.to_path_buf(),
+                    workspace_id,
+                    instance: None,
+                });
+            }
+            let instance = lifecycle::WorkspaceInstance::acquire(&workspace_id).map_err(
+                |error| match error {
+                    lifecycle::WorkspaceInstanceError::AlreadyOpen { .. } => DesktopError::new(
+                        "desktop_already_open",
+                        "This workspace is already open in another Plato desktop window",
+                    ),
+                    lifecycle::WorkspaceInstanceError::Io(error) => DesktopError::new(
+                        "desktop_single_instance_failed",
+                        format!("Unable to secure this desktop workspace: {error}"),
+                    ),
+                },
+            )?;
+            Ok(PreparedWorkspace {
+                workspace_root: workspace_root.to_path_buf(),
+                workspace_id,
+                instance: Some(instance),
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(PreparedWorkspace {
+                workspace_root: workspace_root.to_path_buf(),
+            })
+        }
+    }
+
+    fn commit_workspace(&mut self, prepared: PreparedWorkspace) {
+        #[cfg(windows)]
+        {
+            if let Some(instance) = prepared.instance {
+                debug_assert_eq!(instance.workspace_id(), prepared.workspace_id);
+                self.workspace_instance = Some(instance);
+                self.spawned_daemon = None;
+            }
+        }
+        self.workspace_root = Some(prepared.workspace_root);
+    }
+}
+
+fn lock_lifecycle(
+    lifecycle: &Mutex<DesktopLifecycle>,
+) -> Result<MutexGuard<'_, DesktopLifecycle>, DesktopError> {
+    lifecycle.lock().map_err(|_| {
+        DesktopError::new(
+            "desktop_lifecycle_failed",
+            "Desktop lifecycle state is unavailable",
+        )
+    })
+}
+
+fn selected_workspace(lifecycle: &Mutex<DesktopLifecycle>) -> Result<PathBuf, DesktopError> {
+    lock_lifecycle(lifecycle)?
+        .workspace_root
+        .clone()
+        .ok_or_else(|| {
+            DesktopError::new("workspace_not_selected", "No valid workspace is selected")
+        })
+}
+
 #[tauri::command]
 async fn bootstrap(state: tauri::State<'_, DesktopState>) -> Result<BootstrapView, DesktopError> {
     let workspace_file = state.workspace_file.clone();
-    tauri::async_runtime::spawn_blocking(move || bootstrap_from_store(&workspace_file, None))
-        .await
-        .map_err(worker_error)?
+    let lifecycle = state.lifecycle.clone();
+    let launch = state.launch.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        bootstrap_with_lifecycle(&workspace_file, &lifecycle, &launch, None)
+    })
+    .await
+    .map_err(worker_error)?
 }
 
 #[tauri::command]
@@ -420,9 +561,15 @@ async fn pick_workspace(
         )
     })?;
     let workspace_file = state.workspace_file.clone();
+    let lifecycle = state.lifecycle.clone();
+    let launch = state.launch.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        persist_workspace(&workspace_file, &selected)?;
-        connect_workspace(&selected, None).map(Some)
+        let selected = canonical_workspace(&selected)?;
+        let mut lifecycle = lock_lifecycle(&lifecycle)?;
+        let prepared = lifecycle.prepare_workspace(&selected)?;
+        persist_canonical_workspace(&workspace_file, &selected)?;
+        lifecycle.commit_workspace(prepared);
+        attach_or_spawn_workspace(&selected, None, &mut lifecycle, &launch).map(Some)
     })
     .await
     .map_err(worker_error)?
@@ -433,9 +580,9 @@ async fn read_run(
     run_id: String,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<DesktopRun, DesktopError> {
-    let workspace_file = state.workspace_file.clone();
+    let workspace_root = selected_workspace(&state.lifecycle)?;
     tauri::async_runtime::spawn_blocking(move || {
-        read_run_from_store(&workspace_file, &run_id, None)
+        read_run_from_workspace(&workspace_root, &run_id, None)
     })
     .await
     .map_err(worker_error)?
@@ -445,9 +592,9 @@ async fn read_run(
 async fn list_sessions(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Vec<DesktopSession>, DesktopError> {
-    let workspace_file = state.workspace_file.clone();
+    let workspace_root = selected_workspace(&state.lifecycle)?;
     tauri::async_runtime::spawn_blocking(move || {
-        with_saved_client(&workspace_file, None, |client| {
+        with_workspace_client(&workspace_root, None, |client| {
             client
                 .sessions_list()
                 .map(|sessions| sessions.into_iter().map(DesktopSession::from).collect())
@@ -463,9 +610,9 @@ async fn read_session(
     session_id: String,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<DesktopTranscript, DesktopError> {
-    let workspace_file = state.workspace_file.clone();
+    let workspace_root = selected_workspace(&state.lifecycle)?;
     tauri::async_runtime::spawn_blocking(move || {
-        read_session_from_store(&workspace_file, &session_id, None)
+        read_session_from_workspace(&workspace_root, &session_id, None)
     })
     .await
     .map_err(worker_error)?
@@ -477,9 +624,9 @@ async fn submit_message(
     session_id: Option<String>,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<DesktopSubmission, DesktopError> {
-    let workspace_file = state.workspace_file.clone();
+    let workspace_root = selected_workspace(&state.lifecycle)?;
     tauri::async_runtime::spawn_blocking(move || {
-        submit_message_from_store(&workspace_file, message, session_id, None)
+        submit_message_from_workspace(&workspace_root, message, session_id, None)
     })
     .await
     .map_err(worker_error)?
@@ -491,9 +638,9 @@ async fn poll_run(
     from_offset: u64,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<DesktopEventPage, DesktopError> {
-    let workspace_file = state.workspace_file.clone();
+    let workspace_root = selected_workspace(&state.lifecycle)?;
     tauri::async_runtime::spawn_blocking(move || {
-        poll_run_from_store(&workspace_file, &run_id, from_offset, None)
+        poll_run_from_workspace(&workspace_root, &run_id, from_offset, None)
     })
     .await
     .map_err(worker_error)?
@@ -504,9 +651,9 @@ async fn recover_run(
     run_id: String,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<DesktopRecovery, DesktopError> {
-    let workspace_file = state.workspace_file.clone();
+    let workspace_root = selected_workspace(&state.lifecycle)?;
     tauri::async_runtime::spawn_blocking(move || {
-        recover_run_from_store(&workspace_file, &run_id, None)
+        recover_run_from_workspace(&workspace_root, &run_id, None)
     })
     .await
     .map_err(worker_error)?
@@ -520,10 +667,10 @@ async fn decide_approval(
     reason: Option<String>,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<DesktopCommandStatus, DesktopError> {
-    let workspace_file = state.workspace_file.clone();
+    let workspace_root = selected_workspace(&state.lifecycle)?;
     tauri::async_runtime::spawn_blocking(move || {
-        decide_approval_from_store(
-            &workspace_file,
+        decide_approval_from_workspace(
+            &workspace_root,
             &run_id,
             &tool_call_id,
             decision,
@@ -540,9 +687,9 @@ async fn cancel_run(
     run_id: String,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<DesktopCommandStatus, DesktopError> {
-    let workspace_file = state.workspace_file.clone();
+    let workspace_root = selected_workspace(&state.lifecycle)?;
     tauri::async_runtime::spawn_blocking(move || {
-        cancel_run_from_store(&workspace_file, &run_id, None)
+        cancel_run_from_workspace(&workspace_root, &run_id, None)
     })
     .await
     .map_err(worker_error)?
@@ -552,6 +699,7 @@ fn worker_error(error: impl std::fmt::Display) -> DesktopError {
     DesktopError::new("desktop_worker", format!("Desktop worker failed: {error}"))
 }
 
+#[cfg(all(test, unix))]
 fn bootstrap_from_store(
     workspace_file: &Path,
     socket_path: Option<PathBuf>,
@@ -567,13 +715,52 @@ fn bootstrap_from_store(
     }
 }
 
+fn bootstrap_with_lifecycle(
+    workspace_file: &Path,
+    lifecycle: &Mutex<DesktopLifecycle>,
+    launch: &DaemonLaunch,
+    socket_path: Option<PathBuf>,
+) -> Result<BootstrapView, DesktopError> {
+    let mut lifecycle = lock_lifecycle(lifecycle)?;
+    let workspace_root = match lifecycle.workspace_root.clone() {
+        Some(workspace_root) => workspace_root,
+        None => match load_saved_workspace(workspace_file) {
+            SavedWorkspaceState::Missing => {
+                return Ok(BootstrapView::NeedsWorkspace { reason: None });
+            }
+            SavedWorkspaceState::Invalid(reason) => {
+                return Ok(BootstrapView::NeedsWorkspace {
+                    reason: Some(reason),
+                });
+            }
+            SavedWorkspaceState::Ready(workspace_root) => workspace_root,
+        },
+    };
+    let prepared = lifecycle.prepare_workspace(&workspace_root)?;
+    lifecycle.commit_workspace(prepared);
+    attach_or_spawn_workspace(&workspace_root, socket_path, &mut lifecycle, launch)
+}
+
+#[cfg(all(test, unix))]
 fn connect_workspace(
     workspace_root: &Path,
     socket_path: Option<PathBuf>,
 ) -> Result<BootstrapView, DesktopError> {
     let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
-    let mut client = connect_client(&config)?;
+    try_attach_workspace(&config)
+}
+
+#[cfg(not(windows))]
+fn try_attach_workspace(config: &DaemonConnectionConfig) -> Result<BootstrapView, DesktopError> {
+    let client = connect_client(config)?;
+    finish_attach_workspace(config, client)
+}
+
+fn finish_attach_workspace(
+    config: &DaemonConnectionConfig,
+    mut client: DaemonClient,
+) -> Result<BootstrapView, DesktopError> {
     let hello = client
         .hello(&config.workspace_root)
         .map_err(|error| DesktopError::daemon("Daemon hello failed", error))?;
@@ -597,18 +784,195 @@ fn connect_workspace(
     })
 }
 
-fn read_run_from_store(
-    workspace_file: &Path,
+#[cfg(windows)]
+fn try_attach_workspace_until(
+    config: &DaemonConnectionConfig,
+    deadline: std::time::Instant,
+) -> Result<BootstrapView, DesktopError> {
+    let client = connect_client(config)?;
+    let worker_config = config.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let _ = sender.send(finish_attach_workspace(&worker_config, client));
+    });
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    match receiver.recv_timeout(remaining) {
+        Ok(result) => {
+            worker.join().map_err(|_| attach_worker_error())?;
+            result
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            worker.join().map_err(|_| attach_worker_error())?;
+            Err(attach_worker_error())
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let _ = lifecycle::cancel_synchronous_io(&worker);
+            match receiver.recv_timeout(DAEMON_ATTACH_CANCEL_GRACE) {
+                Ok(result) => {
+                    worker.join().map_err(|_| attach_worker_error())?;
+                    return result;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    worker.join().map_err(|_| attach_worker_error())?;
+                    return Err(attach_worker_error());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            Err(DesktopError::new(
+                "daemon_unavailable",
+                format!(
+                    "Daemon attach timed out at {}",
+                    config.socket_path.display()
+                ),
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn attach_worker_error() -> DesktopError {
+    DesktopError::new("desktop_worker", "Daemon attach worker failed")
+}
+
+fn attach_or_spawn_workspace(
+    workspace_root: &Path,
+    socket_path: Option<PathBuf>,
+    lifecycle: &mut DesktopLifecycle,
+    launch: &DaemonLaunch,
+) -> Result<BootstrapView, DesktopError> {
+    let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
+        .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
+    #[cfg(windows)]
+    let initial =
+        try_attach_workspace_until(&config, std::time::Instant::now() + DAEMON_ATTACH_TIMEOUT);
+    #[cfg(not(windows))]
+    let initial = try_attach_workspace(&config);
+    match initial {
+        Ok(view) => Ok(view),
+        Err(error) if error.code == "daemon_unavailable" => {
+            #[cfg(windows)]
+            {
+                start_and_attach_workspace(&config, lifecycle, launch, error)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (lifecycle, launch);
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn start_and_attach_workspace(
+    config: &DaemonConnectionConfig,
+    lifecycle: &mut DesktopLifecycle,
+    launch: &DaemonLaunch,
+    initial_error: DesktopError,
+) -> Result<BootstrapView, DesktopError> {
+    let workspace_id = paths::workspace_id(&config.workspace_root)
+        .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
+    let mut last_error = initial_error.message;
+    let mut child_status = None;
+    let mut should_spawn = true;
+    if let Some(spawned) = lifecycle.spawned_daemon.as_mut()
+        && spawned.workspace_id == workspace_id
+    {
+        match spawned.child.try_wait() {
+            Ok(None) => should_spawn = false,
+            Ok(Some(status)) => child_status = Some(format!("previous child exited with {status}")),
+            Err(error) => {
+                return Err(daemon_start_error(
+                    config,
+                    format!("unable to inspect the previous daemon child: {error}"),
+                ));
+            }
+        }
+    }
+    if should_spawn {
+        lifecycle.spawned_daemon = None;
+        let executable = launch.executable.as_deref().ok_or_else(|| {
+            daemon_start_error(config, "the packaged daemon sidecar path is unavailable")
+        })?;
+        let child = lifecycle::spawn_detached_daemon(
+            executable,
+            &config.workspace_root,
+            Some(&config.socket_path),
+        )
+        .map_err(|error| {
+            daemon_start_error(
+                config,
+                format!("unable to start {}: {error}", executable.display()),
+            )
+        })?;
+        lifecycle.spawned_daemon = Some(SpawnedDaemon {
+            workspace_id: workspace_id.clone(),
+            child,
+        });
+    }
+
+    let deadline = std::time::Instant::now() + DAEMON_ATTACH_TIMEOUT;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            let detail = match child_status {
+                Some(status) => format!("{last_error}; {status}"),
+                None => last_error,
+            };
+            return Err(daemon_start_error(config, detail));
+        }
+        match try_attach_workspace_until(config, deadline) {
+            Ok(view) => return Ok(view),
+            Err(error) => {
+                if error.code != "daemon_unavailable" {
+                    return Err(error);
+                }
+                last_error = error.message;
+            }
+        }
+
+        if let Some(spawned) = lifecycle.spawned_daemon.as_mut()
+            && spawned.workspace_id == workspace_id
+        {
+            match spawned.child.try_wait() {
+                Ok(Some(status)) => {
+                    child_status = Some(format!("daemon child exited with {status}"));
+                    lifecycle.spawned_daemon = None;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    child_status = Some(format!("unable to inspect daemon child: {error}"));
+                    lifecycle.spawned_daemon = None;
+                }
+            }
+        }
+        std::thread::sleep(DAEMON_ATTACH_RETRY);
+    }
+}
+
+#[cfg(windows)]
+fn daemon_start_error(
+    config: &DaemonConnectionConfig,
+    detail: impl std::fmt::Display,
+) -> DesktopError {
+    let lock = paths::default_lock_path(&config.workspace_root)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("<unresolved: {error}>"));
+    DesktopError::new(
+        "daemon_start_failed",
+        format!(
+            "Unable to start plato-agentd: {detail}. Endpoint: {}. Lock: {lock}",
+            config.socket_path.display()
+        ),
+    )
+}
+
+fn read_run_from_workspace(
+    workspace_root: &Path,
     run_id: &str,
     socket_path: Option<PathBuf>,
 ) -> Result<DesktopRun, DesktopError> {
-    let SavedWorkspaceState::Ready(workspace_root) = load_saved_workspace(workspace_file) else {
-        return Err(DesktopError::new(
-            "workspace_not_selected",
-            "No valid workspace is selected",
-        ));
-    };
-    let config = DaemonConnectionConfig::resolve(&workspace_root, socket_path)
+    let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
     let mut client = connect_client(&config)?;
     let hello = client
@@ -700,18 +1064,12 @@ fn connect_client(config: &DaemonConnectionConfig) -> Result<DaemonClient, Deskt
         .map_err(|error| DesktopError::daemon("Unable to connect to plato-agentd", error))
 }
 
-fn with_saved_client<T>(
-    workspace_file: &Path,
+fn with_workspace_client<T>(
+    workspace_root: &Path,
     socket_path: Option<PathBuf>,
     run: impl FnOnce(&mut DaemonClient) -> Result<T, DesktopError>,
 ) -> Result<T, DesktopError> {
-    let SavedWorkspaceState::Ready(workspace_root) = load_saved_workspace(workspace_file) else {
-        return Err(DesktopError::new(
-            "workspace_not_selected",
-            "No valid workspace is selected",
-        ));
-    };
-    let config = DaemonConnectionConfig::resolve(&workspace_root, socket_path)
+    let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
     let mut client = connect_client(&config)?;
     let hello = client
@@ -721,12 +1079,12 @@ fn with_saved_client<T>(
     run(&mut client)
 }
 
-fn read_session_from_store(
-    workspace_file: &Path,
+fn read_session_from_workspace(
+    workspace_root: &Path,
     session_id: &str,
     socket_path: Option<PathBuf>,
 ) -> Result<DesktopTranscript, DesktopError> {
-    with_saved_client(workspace_file, socket_path, |client| {
+    with_workspace_client(workspace_root, socket_path, |client| {
         let transcript = client
             .transcript_read_session(session_id)
             .map_err(|error| {
@@ -783,13 +1141,13 @@ fn read_session_from_store(
     })
 }
 
-fn submit_message_from_store(
-    workspace_file: &Path,
+fn submit_message_from_workspace(
+    workspace_root: &Path,
     message: String,
     session_id: Option<String>,
     socket_path: Option<PathBuf>,
 ) -> Result<DesktopSubmission, DesktopError> {
-    with_saved_client(workspace_file, socket_path, |client| {
+    with_workspace_client(workspace_root, socket_path, |client| {
         let expected_session_id = session_id.clone();
         let result = match session_id {
             Some(session_id) => {
@@ -813,15 +1171,15 @@ fn submit_message_from_store(
     })
 }
 
-fn decide_approval_from_store(
-    workspace_file: &Path,
+fn decide_approval_from_workspace(
+    workspace_root: &Path,
     run_id: &str,
     tool_call_id: &str,
     decision: DesktopApprovalDecision,
     reason: Option<String>,
     socket_path: Option<PathBuf>,
 ) -> Result<DesktopCommandStatus, DesktopError> {
-    with_saved_client(workspace_file, socket_path, |client| {
+    with_workspace_client(workspace_root, socket_path, |client| {
         let result = match decision {
             DesktopApprovalDecision::Grant => client.approval_grant(run_id, tool_call_id),
             DesktopApprovalDecision::Deny => client.approval_deny(
@@ -845,12 +1203,12 @@ fn decide_approval_from_store(
     })
 }
 
-fn cancel_run_from_store(
-    workspace_file: &Path,
+fn cancel_run_from_workspace(
+    workspace_root: &Path,
     run_id: &str,
     socket_path: Option<PathBuf>,
 ) -> Result<DesktopCommandStatus, DesktopError> {
-    with_saved_client(workspace_file, socket_path, |client| {
+    with_workspace_client(workspace_root, socket_path, |client| {
         let result = client
             .run_cancel(run_id)
             .map_err(|error| DesktopError::daemon("Unable to cancel run", error))?;
@@ -867,13 +1225,13 @@ fn cancel_run_from_store(
     })
 }
 
-fn poll_run_from_store(
-    workspace_file: &Path,
+fn poll_run_from_workspace(
+    workspace_root: &Path,
     run_id: &str,
     from_offset: u64,
     socket_path: Option<PathBuf>,
 ) -> Result<DesktopEventPage, DesktopError> {
-    with_saved_client(workspace_file, socket_path, |client| {
+    with_workspace_client(workspace_root, socket_path, |client| {
         let page = client
             .events_stream(run_id, Some(from_offset), EVENT_PAGE_SIZE)
             .map_err(|error| DesktopError::daemon("Unable to poll run events", error))?;
@@ -881,12 +1239,12 @@ fn poll_run_from_store(
     })
 }
 
-fn recover_run_from_store(
-    workspace_file: &Path,
+fn recover_run_from_workspace(
+    workspace_root: &Path,
     run_id: &str,
     socket_path: Option<PathBuf>,
 ) -> Result<DesktopRecovery, DesktopError> {
-    with_saved_client(workspace_file, socket_path, |client| {
+    with_workspace_client(workspace_root, socket_path, |client| {
         let anchor = client
             .events_stream(run_id, None, EVENT_PAGE_SIZE)
             .map_err(|error| DesktopError::daemon("Unable to anchor run recovery", error))?;
@@ -925,6 +1283,99 @@ fn recover_run_from_store(
             page,
         })
     })
+}
+
+#[cfg(test)]
+fn workspace_from_store(workspace_file: &Path) -> Result<PathBuf, DesktopError> {
+    match load_saved_workspace(workspace_file) {
+        SavedWorkspaceState::Ready(workspace_root) => Ok(workspace_root),
+        SavedWorkspaceState::Missing | SavedWorkspaceState::Invalid(_) => Err(DesktopError::new(
+            "workspace_not_selected",
+            "No valid workspace is selected",
+        )),
+    }
+}
+
+#[cfg(all(test, windows))]
+fn with_saved_client<T>(
+    workspace_file: &Path,
+    socket_path: Option<PathBuf>,
+    run: impl FnOnce(&mut DaemonClient) -> Result<T, DesktopError>,
+) -> Result<T, DesktopError> {
+    let workspace_root = workspace_from_store(workspace_file)?;
+    with_workspace_client(&workspace_root, socket_path, run)
+}
+
+#[cfg(all(test, unix))]
+fn read_session_from_store(
+    workspace_file: &Path,
+    session_id: &str,
+    socket_path: Option<PathBuf>,
+) -> Result<DesktopTranscript, DesktopError> {
+    let workspace_root = workspace_from_store(workspace_file)?;
+    read_session_from_workspace(&workspace_root, session_id, socket_path)
+}
+
+#[cfg(all(test, unix))]
+fn submit_message_from_store(
+    workspace_file: &Path,
+    message: String,
+    session_id: Option<String>,
+    socket_path: Option<PathBuf>,
+) -> Result<DesktopSubmission, DesktopError> {
+    let workspace_root = workspace_from_store(workspace_file)?;
+    submit_message_from_workspace(&workspace_root, message, session_id, socket_path)
+}
+
+#[cfg(all(test, unix))]
+fn decide_approval_from_store(
+    workspace_file: &Path,
+    run_id: &str,
+    tool_call_id: &str,
+    decision: DesktopApprovalDecision,
+    reason: Option<String>,
+    socket_path: Option<PathBuf>,
+) -> Result<DesktopCommandStatus, DesktopError> {
+    let workspace_root = workspace_from_store(workspace_file)?;
+    decide_approval_from_workspace(
+        &workspace_root,
+        run_id,
+        tool_call_id,
+        decision,
+        reason,
+        socket_path,
+    )
+}
+
+#[cfg(all(test, unix))]
+fn cancel_run_from_store(
+    workspace_file: &Path,
+    run_id: &str,
+    socket_path: Option<PathBuf>,
+) -> Result<DesktopCommandStatus, DesktopError> {
+    let workspace_root = workspace_from_store(workspace_file)?;
+    cancel_run_from_workspace(&workspace_root, run_id, socket_path)
+}
+
+#[cfg(all(test, unix))]
+fn poll_run_from_store(
+    workspace_file: &Path,
+    run_id: &str,
+    from_offset: u64,
+    socket_path: Option<PathBuf>,
+) -> Result<DesktopEventPage, DesktopError> {
+    let workspace_root = workspace_from_store(workspace_file)?;
+    poll_run_from_workspace(&workspace_root, run_id, from_offset, socket_path)
+}
+
+#[cfg(all(test, unix))]
+fn recover_run_from_store(
+    workspace_file: &Path,
+    run_id: &str,
+    socket_path: Option<PathBuf>,
+) -> Result<DesktopRecovery, DesktopError> {
+    let workspace_root = workspace_from_store(workspace_file)?;
+    recover_run_from_workspace(&workspace_root, run_id, socket_path)
 }
 
 fn normalize_event_page(
@@ -1213,10 +1664,7 @@ fn load_saved_workspace(workspace_file: &Path) -> SavedWorkspaceState {
     }
 }
 
-fn persist_workspace(
-    workspace_file: &Path,
-    workspace_root: &Path,
-) -> Result<PathBuf, DesktopError> {
+fn canonical_workspace(workspace_root: &Path) -> Result<PathBuf, DesktopError> {
     let canonical = workspace_root.canonicalize().map_err(|error| {
         DesktopError::new(
             "invalid_workspace",
@@ -1229,6 +1677,13 @@ fn persist_workspace(
             "Selected workspace is not a directory",
         ));
     }
+    Ok(canonical)
+}
+
+fn persist_canonical_workspace(
+    workspace_file: &Path,
+    canonical: &Path,
+) -> Result<(), DesktopError> {
     let workspace_root = canonical.to_str().ok_or_else(|| {
         DesktopError::new("invalid_workspace", "Workspace path must be valid UTF-8")
     })?;
@@ -1240,7 +1695,7 @@ fn persist_workspace(
             )
         })?;
     }
-    let temporary = workspace_file.with_extension("json.tmp");
+    let temporary = workspace_file.with_extension(format!("json.{}.tmp", std::process::id()));
     let bytes = serde_json::to_vec(&SavedWorkspace {
         workspace_root: workspace_root.into(),
     })
@@ -1256,13 +1711,24 @@ fn persist_workspace(
             format!("Workspace selection could not be saved: {error}"),
         )
     })?;
-    fs::rename(&temporary, workspace_file).map_err(|error| {
+    replace_workspace_file(&temporary, workspace_file).map_err(|error| {
         DesktopError::new(
             "workspace_save_failed",
             format!("Workspace selection could not be saved: {error}"),
         )
     })?;
-    Ok(canonical)
+    Ok(())
+}
+
+fn replace_workspace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        lifecycle::replace_file(from, to)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1271,7 +1737,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let workspace_file = app.path().app_data_dir()?.join("workspace.json");
-            app.manage(DesktopState { workspace_file });
+            app.manage(DesktopState {
+                workspace_file,
+                lifecycle: Arc::new(Mutex::new(DesktopLifecycle::default())),
+                launch: DaemonLaunch::installed()?,
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1290,7 +1760,7 @@ pub fn run() {
         .expect("error while running Plato desktop");
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use plato_agent::daemon::protocol::{Envelope, EnvelopeKind, PROTOCOL_VERSION};
@@ -1315,7 +1785,8 @@ mod tests {
         );
 
         let workspace = tempfile::tempdir().unwrap();
-        let canonical = persist_workspace(&workspace_file, workspace.path()).unwrap();
+        let canonical = canonical_workspace(workspace.path()).unwrap();
+        persist_canonical_workspace(&workspace_file, &canonical).unwrap();
         assert!(matches!(
             load_saved_workspace(&workspace_file),
             SavedWorkspaceState::Ready(path) if path == canonical
@@ -1341,13 +1812,45 @@ mod tests {
         let file = state.path().join("not-a-workspace");
         fs::write(&file, "text").unwrap();
 
-        let error = persist_workspace(&workspace_file, &file).unwrap_err();
+        let error = canonical_workspace(&file).unwrap_err();
 
         assert_eq!(
             error,
             DesktopError::new("invalid_workspace", "Selected workspace is not a directory")
         );
         assert!(!workspace_file.exists());
+    }
+
+    #[test]
+    fn each_shell_keeps_its_selected_workspace_in_memory() {
+        let state = tempfile::tempdir().unwrap();
+        let first_root = tempfile::tempdir().unwrap();
+        let second_root = tempfile::tempdir().unwrap();
+        let workspace_file = state.path().join("workspace.json");
+        let first = Mutex::new(DesktopLifecycle::default());
+        let second = Mutex::new(DesktopLifecycle::default());
+
+        for (lifecycle, root) in [(&first, first_root.path()), (&second, second_root.path())] {
+            let root = canonical_workspace(root).unwrap();
+            let mut lifecycle = lifecycle.lock().unwrap();
+            let prepared = lifecycle.prepare_workspace(&root).unwrap();
+            lifecycle.commit_workspace(prepared);
+            persist_canonical_workspace(&workspace_file, &root).unwrap();
+        }
+
+        assert_eq!(
+            selected_workspace(&first).unwrap(),
+            first_root.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            selected_workspace(&second).unwrap(),
+            second_root.path().canonicalize().unwrap()
+        );
+        assert!(matches!(
+            load_saved_workspace(&workspace_file),
+            SavedWorkspaceState::Ready(root)
+                if root == second_root.path().canonicalize().unwrap()
+        ));
     }
 
     #[test]
@@ -2241,7 +2744,8 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_file = state.path().join("workspace.json");
-        persist_workspace(&workspace_file, workspace.path()).unwrap();
+        let canonical = canonical_workspace(workspace.path()).unwrap();
+        persist_canonical_workspace(&workspace_file, &canonical).unwrap();
         let socket_path = state.path().join("agent.sock");
         let workspace_id = paths::workspace_id(workspace.path()).unwrap();
         BridgeFixture {

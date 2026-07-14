@@ -145,6 +145,80 @@ describe('desktop chat', () => {
 		expect(calls).toContainEqual({ command: 'read_session', payload: { sessionId: 'session-1' } });
 	});
 
+	it('renders the workspace guard conflict separately from daemon failure', async () => {
+		mockIPC((command) => {
+			if (command === 'bootstrap') {
+				return Promise.reject({
+					code: 'desktop_already_open',
+					message: 'This workspace is already open in Plato'
+				});
+			}
+			throw new Error(`unexpected command ${command}`);
+		});
+
+		render(Page);
+
+		await expect.element(page.getByRole('heading', { name: 'Workspace already open' })).toBeVisible();
+		await expect.element(page.getByText('This workspace is already open in Plato')).toBeVisible();
+	});
+
+	it('detects an idle daemon exit without restarting it', async () => {
+		let listCalls = 0;
+		mockIPC((command) => {
+			if (command === 'bootstrap') return ready;
+			if (command === 'read_session') return transcript(firstRun, secondRun);
+			if (command === 'list_sessions') {
+				listCalls += 1;
+				return Promise.reject({ code: 'daemon_unavailable', message: 'Daemon process exited' });
+			}
+			throw new Error(`unexpected command ${command}`);
+		});
+
+		render(Page);
+
+		await expect.element(page.getByText('The focused proof passed.')).toBeVisible();
+		await expect.element(page.getByRole('heading', { name: 'Daemon unavailable' })).toBeVisible();
+		expect(listCalls).toBe(1);
+	});
+
+	it('stops old-workspace polling before the picker and restores it after cancel', async () => {
+		const live = run('run-picker', 0, 'running', 'Keep this workspace active');
+		const liveReady: Extract<BootstrapView, { state: 'ready' }> = {
+			...ready,
+			sessions: [{ ...sessionOne, runId: live.runId, status: 'running' }],
+			selectedRun: live
+		};
+		const picked = deferred<BootstrapView | null>();
+		let bootstrapCalls = 0;
+		let pollCalls = 0;
+		mockIPC((command) => {
+			if (command === 'bootstrap') {
+				bootstrapCalls += 1;
+				return liveReady;
+			}
+			if (command === 'read_session') return transcript(live);
+			if (command === 'recover_run') return recovery(live);
+			if (command === 'poll_run') {
+				pollCalls += 1;
+				return eventPage(live.runId, 'running');
+			}
+			if (command === 'pick_workspace') return picked.promise;
+			if (command === 'list_sessions') return liveReady.sessions;
+			throw new Error(`unexpected command ${command}`);
+		});
+
+		render(Page);
+		await waitFor(() => pollCalls > 0);
+		await page.getByRole('button', { name: 'Choose workspace' }).click();
+		const pollsAtPicker = pollCalls;
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		expect(pollCalls).toBe(pollsAtPicker);
+
+		picked.resolve(null);
+		await waitFor(() => bootstrapCalls === 2);
+		await waitFor(() => pollCalls > pollsAtPicker);
+	});
+
 	it('submits a continuation to the selected session and a new chat without one', async () => {
 		const submissions: unknown[] = [];
 		let submittedRun: DesktopRun | null = null;
@@ -483,6 +557,84 @@ describe('desktop chat', () => {
 		expect(recoveryRunIds).toEqual(['run-lagged', 'run-lagged', 'run-lagged']);
 	});
 
+	it('stops active polling after daemon loss until explicit reconnect', async () => {
+		const live = run('run-disconnected', 0, 'running', 'Keep streaming', 'Partial answer');
+		const liveReady: Extract<BootstrapView, { state: 'ready' }> = {
+			...ready,
+			sessions: [
+				{
+					sessionId: 'session-disconnected',
+					runId: live.runId,
+					status: 'running',
+					latestQuestion: 'Keep streaming'
+				}
+			],
+			selectedRun: live
+		};
+		let bootstrapCalls = 0;
+		let pollCalls = 0;
+		let requestCount = 0;
+		mockIPC((command) => {
+			requestCount += 1;
+			if (command === 'bootstrap') {
+				bootstrapCalls += 1;
+				return bootstrapCalls === 1 ? liveReady : ready;
+			}
+			if (command === 'read_session') {
+				return bootstrapCalls === 1 ? transcript(live) : transcript(firstRun, secondRun);
+			}
+			if (command === 'recover_run') return recovery(live);
+			if (command === 'poll_run') {
+				pollCalls += 1;
+				return Promise.reject({ code: 'daemon_unavailable', message: 'Daemon process exited' });
+			}
+			throw new Error(`unexpected command ${command}`);
+		});
+
+		render(Page);
+
+		await expect.element(page.getByRole('heading', { name: 'Daemon unavailable' })).toBeVisible();
+		const requestsAtDisconnect = requestCount;
+		await new Promise((resolve) => setTimeout(resolve, 650));
+		expect(requestCount).toBe(requestsAtDisconnect);
+		expect(pollCalls).toBe(1);
+
+		await page.getByRole('button', { name: 'Reconnect' }).click();
+		await expect.element(page.getByText('The focused proof passed.')).toBeVisible();
+		expect(bootstrapCalls).toBe(2);
+		expect(requestCount).toBeGreaterThan(requestsAtDisconnect);
+	});
+
+	it('does not retry recovery after daemon loss', async () => {
+		const live = run('run-recovery-disconnected', 0, 'running', 'Recover this run');
+		let recoveryCalls = 0;
+		let requestCount = 0;
+		mockIPC((command) => {
+			requestCount += 1;
+			if (command === 'bootstrap') {
+				return {
+					...ready,
+					sessions: [{ ...sessionOne, runId: live.runId, status: 'running' }],
+					selectedRun: live
+				};
+			}
+			if (command === 'read_session') return transcript(live);
+			if (command === 'recover_run') {
+				recoveryCalls += 1;
+				return Promise.reject({ code: 'daemon_unavailable', message: 'Daemon process exited' });
+			}
+			throw new Error(`unexpected command ${command}`);
+		});
+
+		render(Page);
+
+		await expect.element(page.getByRole('heading', { name: 'Daemon unavailable' })).toBeVisible();
+		const requestsAtDisconnect = requestCount;
+		await new Promise((resolve) => setTimeout(resolve, 650));
+		expect(requestCount).toBe(requestsAtDisconnect);
+		expect(recoveryCalls).toBe(1);
+	});
+
 	it('restores a pending approval on reconnect and clears it after external resolution', async () => {
 		const live = run('run-approval', 0, 'running', 'Write the file');
 		const finished: DesktopRun = {
@@ -735,6 +887,25 @@ describe('desktop chat', () => {
 		await expect.element(page.getByText('The focused proof passed.')).toBeVisible();
 		await expect.element(page.getByRole('textbox', { name: 'Message' })).toBeEnabled();
 		await expect.element(page.getByRole('heading', { name: 'Daemon unavailable' })).not.toBeInTheDocument();
+	});
+
+	it('leaves the ready screen when a command reports daemon loss', async () => {
+		mockIPC((command) => {
+			if (command === 'bootstrap') return ready;
+			if (command === 'read_session') return transcript(firstRun, secondRun);
+			if (command === 'submit_message') {
+				return Promise.reject({ code: 'daemon_unavailable', message: 'Daemon process exited' });
+			}
+			throw new Error(`unexpected command ${command}`);
+		});
+
+		render(Page);
+
+		await expect.element(page.getByText('The focused proof passed.')).toBeVisible();
+		await page.getByRole('textbox', { name: 'Message' }).fill('Continue after disconnect');
+		await page.getByRole('button', { name: 'Send message' }).click();
+		await expect.element(page.getByRole('heading', { name: 'Daemon unavailable' })).toBeVisible();
+		await expect.element(page.getByText('Daemon process exited')).toBeVisible();
 	});
 
 	it('isolates two active sessions when an old poll completes after switching', async () => {

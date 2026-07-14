@@ -2547,6 +2547,7 @@ dependencies = [
 name = "plato-desktop"
 version = "0.1.0"
 dependencies = [
+ "interprocess",
  "plato-agent",
  "serde",
  "serde_json",
@@ -2554,6 +2555,8 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tempfile",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
