@@ -939,12 +939,16 @@ mod tests {
         });
 
         let deadline = Instant::now() + SQLITE_BUSY_TIMEOUT;
-        while !(FIRST_SESSION_BUSY.load(Ordering::SeqCst)
-            && SECOND_SESSION_BUSY.load(Ordering::SeqCst))
-            && !first_handle.is_finished()
-            && !second_handle.is_finished()
-            && Instant::now() < deadline
-        {
+        loop {
+            let both_waiting = FIRST_SESSION_BUSY.load(Ordering::SeqCst)
+                && SECOND_SESSION_BUSY.load(Ordering::SeqCst);
+            if both_waiting
+                || first_handle.is_finished()
+                || second_handle.is_finished()
+                || Instant::now() >= deadline
+            {
+                break;
+            }
             thread::yield_now();
         }
         let first_waited = FIRST_SESSION_BUSY.load(Ordering::SeqCst);
