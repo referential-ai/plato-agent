@@ -165,7 +165,10 @@ fn read_client(
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             return Err(pipe_io_timeout());
         }
+        // PIPE_NOWAIT reports an empty connected pipe as a zero-byte read.
         match stream.read(buffer) {
+            Ok(0) if wait_for_pipe(deadline) => continue,
+            Ok(0) if deadline.is_some() => return Err(pipe_io_timeout()),
             Err(error)
                 if deadline.is_some() && pipe_would_block(&error) && wait_for_pipe(deadline) =>
             {
