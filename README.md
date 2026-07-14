@@ -235,6 +235,26 @@ when startup remains blocked. Only one Windows shell may own a workspace at a
 time. Linux development requires the
 [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/#linux).
 
+### Windows Installer (Unsigned Development)
+
+Phase A targets x64 Windows 10 22H2 or newer. Build the per-user NSIS installer
+on Windows:
+
+```powershell
+cd desktop
+npm ci
+npm run tauri:bundle:windows
+```
+
+The installer writes Plato under `%LOCALAPPDATA%`, bundles the same-revision
+`plato-agentd.exe`, and downloads the WebView2 Evergreen bootstrapper when the
+runtime is absent. Upgrade and uninstall first close the desktop, block new
+installed-sidecar starts, and make one bounded aggregate
+`plato-agentd control shutdown-if-idle` invocation. An active daemon or
+unvalidated lock aborts before installed Plato binaries or user files change;
+idle daemons exit and remove their locks. These unsigned artifacts are for
+development proof only and are not distributed.
+
 ## Discord Gateway
 
 `plato-gateway-discord` receives Discord messages over an outbound WebSocket

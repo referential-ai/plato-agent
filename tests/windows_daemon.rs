@@ -8,6 +8,7 @@ use interprocess::{
 use plato_agent::{
     daemon::{
         client::DaemonClient,
+        installer_gate::InstallerStartupGate,
         protocol::{RunStateName, ShutdownIfIdleResultName},
         server::DaemonServer,
     },
@@ -52,6 +53,75 @@ use windows_sys::Win32::{
 };
 
 const PROOF_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[test]
+#[ignore = "holds the process-global installer gate; run serially"]
+fn installer_gate_refuses_daemon_before_endpoint_or_lock_creation() {
+    let gate = InstallerStartupGate::acquire().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let lock_path = paths::default_lock_path(workspace.path()).unwrap();
+    let socket_path = paths::default_socket_path(workspace.path()).unwrap();
+
+    let started = Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_plato-agentd"))
+        .arg("--workspace")
+        .arg(workspace.path())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Plato installation or update is in progress")
+    );
+    assert!(!lock_path.exists());
+    assert!(DaemonClient::connect(&socket_path).is_err());
+    drop(gate);
+}
+
+#[test]
+#[ignore = "requires PLATO_WINDOWS_SECOND_USER and PLATO_WINDOWS_SECOND_PASSWORD"]
+fn installer_gate_is_isolated_per_current_user() {
+    let username = env::var("PLATO_WINDOWS_SECOND_USER").unwrap();
+    let password = env::var("PLATO_WINDOWS_SECOND_PASSWORD").unwrap();
+    let public = env::var_os("PUBLIC").expect("PUBLIC is required for the cross-user proof");
+    let shared = tempfile::Builder::new()
+        .prefix("plato-149-")
+        .tempdir_in(public)
+        .unwrap();
+    let grant = Command::new("icacls.exe")
+        .arg(shared.path())
+        .args(["/grant", &format!("{username}:(OI)(CI)M")])
+        .output()
+        .unwrap();
+    assert!(
+        grant.status.success(),
+        "failed to grant helper directory access: {}",
+        String::from_utf8_lossy(&grant.stderr)
+    );
+    let helper = shared.path().join("plato-installer-gate-helper.exe");
+    fs::copy(env::current_exe().unwrap(), &helper).unwrap();
+
+    let gate = InstallerStartupGate::acquire().unwrap();
+    let mut child = LoggedOnProcess::spawn_test(
+        &username,
+        &password,
+        &helper,
+        shared.path(),
+        "installer_gate_second_user_child",
+    )
+    .unwrap();
+    assert_eq!(child.wait_bounded(PROOF_TIMEOUT).unwrap(), 0);
+    drop(gate);
+}
+
+#[test]
+#[ignore = "child process for the cross-user installer-gate proof"]
+fn installer_gate_second_user_child() {
+    drop(InstallerStartupGate::acquire().unwrap());
+}
 
 #[test]
 fn daemon_round_trip_streams_and_replays_after_clean_shutdown() {

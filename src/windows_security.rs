@@ -20,8 +20,9 @@ use windows_sys::Win32::{
         WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::{
-        Authorization::ConvertSidToStringSidW, EqualSid, GetTokenInformation, SECURITY_ATTRIBUTES,
-        TOKEN_QUERY, TOKEN_USER, TokenUser,
+        Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT},
+        EqualSid, GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
     Storage::FileSystem::{
         CREATE_NEW, CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO,
@@ -210,6 +211,48 @@ pub(crate) fn is_local_disk_path(path: &Path) -> io::Result<bool> {
 
 pub(crate) fn current_user_pipe_descriptor() -> io::Result<SecurityDescriptor> {
     current_user_descriptor("GA")
+}
+
+pub(crate) fn validate_current_user_kernel_object(handle: HANDLE) -> io::Result<()> {
+    let current_user = process_user(current_process())?;
+    let mut owner = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: handle is live and both requested output pointers refer to writable storage.
+    let result = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result as i32));
+    }
+    if descriptor.is_null() || owner.is_null() {
+        if !descriptor.is_null() {
+            // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
+            unsafe { LocalFree(descriptor.cast()) };
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kernel object has no owner",
+        ));
+    }
+    let descriptor = LocalSecurityDescriptor(descriptor);
+    // SAFETY: both SID pointers remain live for this comparison.
+    if unsafe { EqualSid(current_user.sid(), owner) } == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "kernel object is not owned by the current user",
+        ));
+    }
+    drop(descriptor);
+    Ok(())
 }
 
 pub(crate) fn create_current_user_file(path: &Path) -> io::Result<File> {
@@ -405,7 +448,7 @@ fn current_user_descriptor(rights: &str) -> io::Result<SecurityDescriptor> {
     SecurityDescriptor::deserialize(&descriptor)
 }
 
-fn current_user_sid_string() -> io::Result<String> {
+pub(crate) fn current_user_sid_string() -> io::Result<String> {
     let user = process_user(current_process())?;
     user.sid_string()
 }
@@ -556,6 +599,17 @@ struct LocalWideString(*mut u16);
 impl Drop for LocalWideString {
     fn drop(&mut self) {
         // SAFETY: this wrapper owns the successful ConvertSidToStringSidW allocation.
+        unsafe {
+            LocalFree(self.0.cast());
+        }
+    }
+}
+
+struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper owns the successful GetSecurityInfo allocation.
         unsafe {
             LocalFree(self.0.cast());
         }

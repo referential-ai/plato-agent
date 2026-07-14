@@ -2,6 +2,8 @@ pub mod client;
 #[cfg(windows)]
 pub mod control;
 mod handlers;
+#[cfg(windows)]
+pub mod installer_gate;
 pub mod lock;
 pub mod protocol;
 mod runtime;
