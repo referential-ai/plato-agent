@@ -27,8 +27,11 @@ Acceptance must be recorded in this file or on issue #44. A pane-level `proceed`
 - Anchor command feel: `plato`, `plato --config <path>`, `plato -c`, `plato replay`, and later `plato tui`.
 - `platonic-core` is out of scope.
 
-## Source Grounding
-Checked local sources:
+## Source Grounding At Adoption
+
+Historical 2026-07-05 snapshot; linked code and issues own current behavior.
+
+Checked local sources at adoption:
 - `docs/ARCHITECTURE.md`: `plato`, `plato-agentd`, and `plato-tui` topology; gateway boundary; shared run-driving rule.
 - `docs/QUICKSTART.md`: current local commands for `plato`, `plato replay`, `plato-agentd`, and `plato-tui`.
 - PR #43 `.plandoc/designs/hermes-light-product-spine.md`: proposed product spine, first slices, and transparent-learning direction.

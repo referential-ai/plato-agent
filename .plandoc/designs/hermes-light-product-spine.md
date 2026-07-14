@@ -13,8 +13,11 @@ issue: https://github.com/referential-ai/plato-agent/issues/42
 - Claude architecture-lane input, 2026-07-05: sessions are the real product gap; do not lead with gateway work.
 - Human direction, 2026-07-05: the product should eventually let the user see how the agent learns about them over time.
 
-## Source Grounding
-Checked:
+## Source Grounding At Adoption
+
+Historical 2026-07-05 snapshot; linked code and issues own current behavior.
+
+Checked at adoption:
 - `src/bin/plato.rs`: `plato "question"` exists; default ledger is `events.jsonl`; bare `--db` uses the XDG SQLite path.
 - `src/paths.rs`: workspace-scoped SQLite/socket/lock paths already exist.
 - `src/config.rs`: strict TOML config exists; missing `plato.toml` falls back to defaults; unknown tools fail closed.
@@ -24,7 +27,7 @@ Checked:
 - `src/tool_catalog.rs`: the MVP tool catalog is file-only today: read, list, write, edit.
 - `docs/ARCHITECTURE.md`: connectors and gateways must not own sessions, policy, approvals, provider fallback, or run semantics.
 
-Not checked yet:
+Not checked at adoption:
 - External comparable implementations such as Hermes, OpenCode, or OpenClaw-style gateway systems.
 - Real-provider product feel after PR #41 lands.
 

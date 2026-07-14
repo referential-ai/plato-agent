@@ -12,8 +12,11 @@ issue: https://github.com/referential-ai/plato-agent/issues/93
 - MVP decisions (`mvp-decisions.md`): remote channels must not become a grant surface.
 - `docs/ARCHITECTURE.md`: connectors never own sessions, policy, approvals, provider fallback, or run semantics.
 
-## Source Grounding
-Checked:
+## Source Grounding At Adoption
+
+Historical 2026-07-09 snapshot; linked code and issues own current behavior.
+
+Checked at adoption:
 - `src/daemon/protocol.rs`: envelope `v: 1` with strict equality reject; `deny_unknown_fields` on envelope and all param structs; typed error codes including `lagged`, `unsupported_method`, `unsupported_version`; `hello` returns `daemon_version` + `capabilities` (method list); `events.stream` is cursor polling (`from_offset` → `next_offset`); `approval.decide` and `transcript.read` exist; `message.append` takes `session_id`.
 - `src/daemon/handlers.rs`: full method surface is `hello`, `run.start`, `message.append`, `events.stream`, `approval.decide`, `run.cancel`, `sessions.list`, `transcript.read`.
 - `src/daemon/runtime.rs` (`approval_handler`): a pending approval waits indefinitely on a condvar; it resolves only by `approval.decide` or run cancel. No timeout exists.

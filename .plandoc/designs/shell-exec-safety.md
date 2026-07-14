@@ -11,7 +11,10 @@ issue: https://github.com/referential-ai/plato-agent/issues/51
 - Issue #6 remains the yolo/network guardrail.
 - `.plandoc/designs/hermes-light-product-spine.md` names `shell.exec` as the first non-file tool candidate.
 
-## Source Grounding
+## Source Grounding At Adoption
+
+Historical snapshot; linked code and issues own current behavior.
+
 - `src/app.rs`: `--yolo` currently auto-grants generic `RequireApproval`; `ApprovalRequest` already carries tool, effect, reason, and diff preview.
 - `src/tool_catalog.rs`: only file tools are registered; unknown tools fail closed as `ExternalSideEffect`.
 - `src/tools.rs`: tool execution is app-owned and already records bounded structured results.
