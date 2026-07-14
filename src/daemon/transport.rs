@@ -52,6 +52,16 @@ pub(crate) fn connect(endpoint: &Path) -> io::Result<Stream> {
     })
 }
 
+#[cfg(windows)]
+pub(crate) fn connect_expected_server(endpoint: &Path, expected_pid: u32) -> io::Result<Stream> {
+    Ok(Stream {
+        inner: WindowsStream::Client(crate::windows_security::connect_current_user_pipe_for_pid(
+            endpoint,
+            expected_pid,
+        )?),
+    })
+}
+
 #[cfg(unix)]
 pub(crate) fn accept(listener: &Listener) -> io::Result<Stream> {
     listener.accept().map(|(stream, _)| stream)
@@ -141,7 +151,7 @@ mod tests {
         let listener = bind(&endpoint).unwrap();
         let client_endpoint = endpoint.clone();
         let client = thread::spawn(move || {
-            let stream = connect(&client_endpoint).unwrap();
+            let stream = connect_expected_server(&client_endpoint, std::process::id()).unwrap();
             let mut writer = try_clone(&stream).unwrap();
             writer.write_all(b"ping").unwrap();
             let mut response = [0; 4];
@@ -159,5 +169,28 @@ mod tests {
 
         assert_eq!(request, *b"ping");
         assert_eq!(client.join().unwrap(), *b"pong");
+    }
+
+    #[test]
+    fn named_pipe_rejects_an_unexpected_server_pid() {
+        let endpoint = PathBuf::from(format!(
+            r"\\.\pipe\plato-agent-transport-pid-test-{}",
+            std::process::id()
+        ));
+        let listener = bind(&endpoint).unwrap();
+        let client_endpoint = endpoint.clone();
+        let client = thread::spawn(move || {
+            connect_expected_server(&client_endpoint, std::process::id().wrapping_add(1))
+        });
+
+        let stream = accept(&listener).unwrap();
+        drop(stream);
+        let error = client.join().unwrap().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("named-pipe server process does not match lock metadata")
+        );
     }
 }

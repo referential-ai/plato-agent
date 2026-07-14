@@ -27,6 +27,16 @@ pub struct DaemonClient {
 impl DaemonClient {
     pub fn connect(socket_path: &Path) -> AppResult<Self> {
         let writer = transport::connect(socket_path)?;
+        Self::from_stream(writer)
+    }
+
+    #[cfg(windows)]
+    pub fn connect_expected_server(socket_path: &Path, expected_pid: u32) -> AppResult<Self> {
+        let writer = transport::connect_expected_server(socket_path, expected_pid)?;
+        Self::from_stream(writer)
+    }
+
+    fn from_stream(writer: Stream) -> AppResult<Self> {
         let reader = BufReader::new(transport::try_clone(&writer)?);
         Ok(Self {
             reader,
