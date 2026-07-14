@@ -31,10 +31,7 @@ jobs:
           $ssh = Join-Path $HOME ".ssh"
           New-Item -ItemType Directory -Force $ssh | Out-Null
           $key = Join-Path $ssh "platonic_core_deploy_key"
-          $keyText = $env:PLATONIC_CORE_DEPLOY_KEY.Replace(
-            ([char]13).ToString() + [char]10,
-            [char]10
-          ).Replace([char]13, [char]10)
+          $keyText = $env:PLATONIC_CORE_DEPLOY_KEY -replace "`r`n?", "`n"
           $keyText = $keyText.TrimEnd([char[]]@([char]10, [char]13)) + [char]10
           [IO.File]::WriteAllText(
             $key,
