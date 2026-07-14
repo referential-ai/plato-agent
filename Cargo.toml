@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 description = "Plato Agent runtime and CLI built on platonic-core."
-license = "UNLICENSED"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "plato"

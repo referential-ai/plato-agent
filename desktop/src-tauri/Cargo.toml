@@ -2,7 +2,7 @@
 name = "plato-desktop"
 version = "0.1.0"
 description = "Plato desktop shell"
-license = "UNLICENSED"
+license = "MIT OR Apache-2.0"
 edition = "2024"
 rust-version = "1.85"
 publish = false

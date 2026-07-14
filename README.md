@@ -402,3 +402,12 @@ OPENROUTER_API_KEY="$(cat /path/to/your/openrouter-key)" \
 ## Boundary
 
 `platonic-core` remains pure. Provider calls, local tools, approval prompts, ledger files, SQLite, daemon runtime, TUI, and connectors belong in this repo.
+
+## License
+
+Licensed under either of
+
+- [Apache License, Version 2.0](LICENSE-APACHE) ([official text](https://www.apache.org/licenses/LICENSE-2.0))
+- [MIT License](LICENSE-MIT) ([official text](https://opensource.org/licenses/MIT))
+
+at your option.
