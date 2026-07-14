@@ -11,7 +11,10 @@ issue: https://github.com/referential-ai/plato-agent/issues/51
 - Issue #6 remains the yolo/network guardrail.
 - `.plandoc/designs/hermes-light-product-spine.md` names `shell.exec` as the first non-file tool candidate.
 
-## Source Grounding
+## Source Grounding At Adoption
+
+Historical snapshot; linked code and issues own current behavior.
+
 - `src/app.rs`: `--yolo` currently auto-grants generic `RequireApproval`; `ApprovalRequest` already carries tool, effect, reason, and diff preview.
 - `src/tool_catalog.rs`: only file tools are registered; unknown tools fail closed as `ExternalSideEffect`.
 - `src/tools.rs`: tool execution is app-owned and already records bounded structured results.
@@ -113,7 +116,7 @@ issue: https://github.com/referential-ai/plato-agent/issues/51
 - If #52 changes the effect class, yolo boundary, env allowlist, output caps, or timeout shape, update this design or quote the new decision on #52 before coding.
 - If a network-class tool is added later, link issue #6 again; this design does not decide general network-tool yolo semantics.
 
-## Open Questions
+## Questions Recorded at Adoption
 - None for #52 MVP implementation.
 
 ## Contract Neighborhood
@@ -142,6 +145,3 @@ A reviewer can implement #52 from this document without adding new safety decisi
 - Docs-only PR linked to #51.
 - `git diff --check`.
 - Contradiction check against product spine, MVP decisions, #6, #44, #51, and #52.
-
-## Goal Handoff
-`/goal Implement approval-gated shell.exec from .plandoc/designs/shell-exec-safety.md for plato-agent#52 after #51 is accepted. Non-goals: no dedicated network tool, no remote approval grants, no shell sessions, no streaming process UI, no OS/container sandboxing, no platonic-core changes. Proof: tests listed in this design plus scratch-workspace command proof, cargo fmt --check, cargo test --locked, and cargo clippy --locked --all-targets -- -D warnings.`

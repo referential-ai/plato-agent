@@ -25,7 +25,7 @@ Revision 6 — adds the bounded terminal-swap wait (S1) after real-Discord smoke
 ### Effects model (F5, F6)
 **Classification.** Presentation effects are exactly: reactions and typing. The final-answer reply and terminal notifications are **product messages**, not presentation — their error semantics are unchanged by this design (they propagate per existing gateway flow), and terminal notifications are owned by #102.
 
-All presentation effects execute **serialized on the single gateway loop**, in program order, best-effort: each is a logged-ignored `Result`, **exactly one attempt**, bounded ~1.5s — never retried. On a 429, the effect is dropped **and a monotonic not-before gate opens for the full returned `retry_after`** — no cap; Discord documents values well above a minute (official example 1336.57s). Gate scope follows the response: a scoped 429 gates **presentation effects**; a **global** 429 gates **all Discord REST** — while a global gate is open, a due product message fails and **propagates without being sent** (its normal error semantics; never silently dropped, never delayed by sleeping). No sleeping, no retrying in either case. Contract: https://docs.discord.com/developers/topics/rate-limits. No detached threads or queues — out-of-order effects (late 👀 after a terminal swap, phantom typing) are structurally impossible. Presentation failures never propagate to run flow.
+All presentation effects execute **serialized on the single gateway loop**, in program order, best-effort. Except for S1's one terminal-add retry, each is a logged-ignored `Result` with **exactly one attempt**, bounded ~1.5s. Every 429 opens a monotonic not-before gate for the full returned `retry_after` — no cap; Discord documents values well above a minute (official example 1336.57s). Gate scope follows the response: a scoped 429 gates **presentation effects**; a **global** 429 gates **all Discord REST** — while a global gate is open, a due product message fails and **propagates without being sent** (its normal error semantics; never silently dropped, never delayed by sleeping). Outside S1 the 429 effect is dropped with no sleeping or retrying. Contract: https://docs.discord.com/developers/topics/rate-limits. No detached threads or queues — out-of-order effects (late 👀 after a terminal swap, phantom typing) are structurally impossible. Presentation failures never propagate to run flow.
 
 **Abnormal-exit cleanup rule:** exits caused by **errors outside the typed terminal-status paths** (daemon connect/hello, dispatch, poll, readback, product-message send failures) attempt best-effort cleanup — stop-typing-refresh → remove 👀 → add ❌ — before the error propagates with its existing semantics (subject to the not-before gate; accepted partial failures below). Typed terminal states are **not** cleanup: they follow the exhaustive table exactly (✅ / ❌ / no emoji). Discord has no typing-off call: stopping the refresh lets the indicator decay within its documented ~10s. Run semantics unchanged.
 
@@ -33,9 +33,9 @@ All presentation effects execute **serialized on the single gateway loop**, in p
 Independent monotonic deadline, never tied to poll pages: while status is `Running` and no approval is pending, send trigger-typing when `now ≥ next_typing_at`, then `next_typing_at = now + 8s` (Discord documents ~10s expiry; 2s margin). The **first** send fires immediately on first observing `Running` (and again immediately on resume after an approval decision): `next_typing_at` initializes in the past. Catch-up/backfill pages never burst typing sends. Send timeout (~1.5s) stays well below the 8s interval; a slow send delays polls by at most the timeout — accepted for a single serialized loop.
 
 ### Reactions per message lifecycle (F1, F3)
-Up to **three** reaction calls plus the reply, in this order at terminal: reply first (answer latency wins), then remove 👀, then add the terminal emoji.
+Up to **four** reaction calls plus the reply: add 👀, then at terminal reply first (answer latency wins), remove 👀, add the terminal emoji, and optionally retry that terminal add once under S1.
 
-**S1 — bounded terminal-swap wait (real-smoke finding, rev 6).** Discord assigns *all* reaction writes on a message to one rate-limit bucket (observed limit 1). Back-to-back remove-👀 then add-terminal therefore collide: the add 429s and, under the strict no-sleep rule, was dropped — so ✅/❌ never landed (verified in the #133 smoke). Narrow exception: **between the terminal remove and the terminal add only**, the loop may wait for the bucket to reset — honor the response's `Retry-After`, **capped at 2s**, then make exactly one add attempt; if it still 429s, drop it (accepted partial failure). This wait is bounded, non-recursive, and occurs **after the product reply is already delivered**, so it adds no perceived answer latency. It does **not** apply to mid-run presentation, product messages, or the not-before gate below — those keep the strict no-sleep rule (C1/C2). The 2s cap means a pathological large `Retry-After` degrades to a dropped terminal emoji, never a loop stall. Accepted partial-failure states otherwise: orphan 👀 (remove failed) or missing terminal emoji (add failed after the one bounded wait) — logged, never further retried.
+**S1 — bounded terminal-swap wait (real-smoke finding, rev 6).** Discord assigns *all* reaction writes on a message to one rate-limit bucket (observed limit 1). Back-to-back remove-👀 then add-terminal therefore collide: the add 429s and, under the strict no-sleep rule, was dropped — so ✅/❌ never landed (verified in the #133 smoke). Narrow exception: **between the terminal remove and the terminal add only**, the loop may wait for the bucket to reset — honor the response's `Retry-After`, **capped at 2s**, then make at most one add retry; a still-open gate or second 429 drops it (accepted partial failure). Global 429s never wait or retry. This wait is bounded, non-recursive, and occurs **after the product reply is already delivered**, so it adds no perceived answer latency. It does **not** apply to mid-run presentation or product messages — those keep the strict no-sleep rule (C1/C2). The 2s cap means a pathological large `Retry-After` degrades to a dropped terminal emoji, never a loop stall. Accepted partial-failure states otherwise: orphan 👀 (remove failed) or missing terminal emoji (add failed after the one bounded wait) — logged, never further retried.
 
 Full status map (exhaustive `match` on `RunStateName`; a seventh state fails at compile time):
 
@@ -44,7 +44,7 @@ Full status map (exhaustive `match` on `RunStateName`; a seventh state fails at 
 | `Running` | on (deadline-based) | 👀 present (added at filter-pass) |
 | `CancelRequested` | stop refresh (waiting quietly) | unchanged |
 | `Finished` | stop refresh | reply → remove 👀 → add ✅ |
-| `Failed` | stop refresh | remove 👀 → add ❌. The one-time terminal failure notification (today the gateway sends nothing on failure — `terminal_answer` errors when `final_answer` is absent, src/discord_gateway.rs:149-163,253-260) is **#102's surface, single owner; duplication prohibited here** — canonical copy proposed on #102 |
+| `Failed` | stop refresh | #102's product notification (`Run failed. Inspect it locally with: plato replay`) → remove 👀 → add ❌; this design adds no terminal text (`src/discord_gateway.rs:36,285-295`) |
 | `Canceled` | stop refresh | no reply (the operator canceled it); remove 👀, **no terminal emoji** (current-Hermes behavior; stale 👀 falsely says in-progress) |
 | `Interrupted` | stop refresh | no reply (the session is resumable and the recovered status is itself `Interrupted` — no recursion into readback); remove 👀, no emoji |
 
@@ -59,11 +59,11 @@ Full status map (exhaustive `match` on `RunStateName`; a seventh state fails at 
 ### Discord contract (F4)
 - Carry `MESSAGE_CREATE.id` through `DiscordMessage` (small in-scope struct change) so reactions can target `channel_id + message_id`.
 - Emoji are URL-encoded in REST paths.
-- Permissions (guide #127 updates): **Add Reactions** + **Read Message History** (required for Create Reaction), and **Send Messages in Threads** if thread channels are used.
-- Rate budget stated plainly, no broader claims: ≤3 reaction calls + `ceil(len/2000)` reply POSTs per message lifecycle (`send_message` chunks at 2000 chars, src/discord_gateway.rs:357-368); typing ≤1 per 8s per active run; zero retries.
+- Permissions (owned by `referential-ai/platonic-workspace#16`): **Add Reactions** + **Read Message History** (required for Create Reaction), and **Send Messages in Threads** if thread channels are used.
+- Rate budget stated plainly, no broader claims: ≤4 reaction calls + `ceil(len/2000)` product-message POSTs per message lifecycle (`send_message` chunks at 2000 chars, src/discord_gateway.rs:357-368); typing ≤1 per 8s per active run; zero retries except S1's single terminal-add retry.
 
-### Alignment with #102 (in progress)
-#102 owns **all one-time terminal notifications** (approval notify and the terminal failure notification; its card states terminal states notify once) — this design sends no terminal text of its own, only reactions and typing, and must not duplicate #102's messages. Proposed literal failure copy is recorded on #102 so implementation and tests do not invent wording. The shared event-fold loop is reconciled with #102's implementation before card #129 goes Ready.
+### Terminal-Message Ownership
+#102 owns **all one-time terminal notifications** (approval notify and the shipped terminal failure notification); this design sends no terminal text of its own, only reactions and typing, and must not duplicate #102's messages. The literal failure copy and shared event-fold behavior remain owned by #102's implementation.
 
 ## Non-Goals
 - No per-tool-call or per-event reactions; no configurable emoji sets.
@@ -84,7 +84,7 @@ Fake-platform tests:
 
 Real-Discord smoke: one run showing 👀 → typing → reply → ✅ **with the terminal ✅ confirmed present via REST reaction readback** (the rev-5 gap: the swap must be verified landed, not assumed); one stranger message showing nothing. A fake-platform test must also simulate the shared-bucket 429-on-add and assert the bounded wait then successful add.
 
-Docs: the implementation PR updates README.md/docs/QUICKSTART.md for the user-visible changes (reactions, typing) in the same PR per plato-agent/AGENTS.md — not deferred to the guide card #127. The failure-notification docs belong to #102's PR with its own same-PR requirement.
+Docs: the implementation PR updates README.md/docs/QUICKSTART.md for the user-visible changes (reactions, typing) in the same PR per plato-agent/AGENTS.md — not deferred to the gateway guide owned by `referential-ai/platonic-workspace#16`. The failure-notification docs shipped with #102.
 
 ## Proof
 `cargo test --locked`; scratch-workspace smoke with reaction readback via REST.

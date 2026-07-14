@@ -12,8 +12,11 @@ issue: https://github.com/referential-ai/plato-agent/issues/93
 - MVP decisions (`mvp-decisions.md`): remote channels must not become a grant surface.
 - `docs/ARCHITECTURE.md`: connectors never own sessions, policy, approvals, provider fallback, or run semantics.
 
-## Source Grounding
-Checked:
+## Source Grounding At Adoption
+
+Historical 2026-07-09 snapshot; linked code and issues own current behavior.
+
+Checked at adoption:
 - `src/daemon/protocol.rs`: envelope `v: 1` with strict equality reject; `deny_unknown_fields` on envelope and all param structs; typed error codes including `lagged`, `unsupported_method`, `unsupported_version`; `hello` returns `daemon_version` + `capabilities` (method list); `events.stream` is cursor polling (`from_offset` → `next_offset`); `approval.decide` and `transcript.read` exist; `message.append` takes `session_id`.
 - `src/daemon/handlers.rs`: full method surface is `hello`, `run.start`, `message.append`, `events.stream`, `approval.decide`, `run.cancel`, `sessions.list`, `transcript.read`.
 - `src/daemon/runtime.rs` (`approval_handler`): a pending approval waits indefinitely on a condvar; it resolves only by `approval.decide` or run cancel. No timeout exists.
@@ -95,7 +98,9 @@ Jerome: default (notify-only). Accepted 2026-07-09 by ratifying the architecture
 - No platform tokens in config values or the ledger.
 - Remote channels must never grant approval-required effects.
 
-## First Slices (issues to cut after acceptance, in order)
+## Original Slice Boundaries
+
+Linked issues and PRs own implementation and status.
 1. Socket hardening: `0700` dir / `0600` socket enforced at bind, fail-closed test. (Independent of platform choice.)
 2. Typed recovery surface + contract test: the three D4 changes, plus a daemon integration test proving the lag path and the restart path with typed assertions.
 3. Gateway binary skeleton for the chosen platform: hello/capabilities check, allowlist filter, session map, `message.append` + polling, final-answer reply.
@@ -118,6 +123,3 @@ From the remote channel, the owner: sends a message, gets the final answer; trig
 - Platform SDK sprawl: keep the platform client thin; no framework adoption for one bot.
 - Notification spam on busy runs: notify on approval and terminal states only, not per-event.
 - The `/tmp` runtime fallback stays same-user-writable-parent even after hardening; slice 1 must verify the full path chain, not just the leaf.
-
-## Goal Handoff
-None until both slots are answered and this design is accepted on #93.
