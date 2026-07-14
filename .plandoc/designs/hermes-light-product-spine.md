@@ -127,7 +127,9 @@ Not checked yet:
 - Learning data must be local, inspectable, correctable, and forgettable.
 - Daemon socket access and protocol compatibility must be designed before a gateway or second client class ships.
 
-## First Slices
+## Original Slice Boundaries
+
+Linked issues and PRs own implementation and status.
 1. Land the existing file.edit approval-preview fix before stacking implementation branches.
 2. Config and defaults:
    - implement config resolution order;
@@ -184,7 +186,7 @@ Not checked yet:
 - Comparable research can turn into architecture copying; keep it question-led and timeboxed.
 - Visible learning can become creepy or manipulative if it is hidden, overconfident, or hard to correct.
 
-## Open Questions
+## Questions Recorded at Adoption
 - Should the last workspace session be selected by latest successful run, latest session record, or an explicit session pointer?
 - How should long sessions compact or select context under token budget?
 - Resolved by PR #47: `plato --tui` attaches to an existing workspace daemon or starts an embedded daemon for the TUI session.
@@ -192,10 +194,3 @@ Not checked yet:
 - Does the first gateway target need pairing, local-only callback URLs, or daemon socket brokering?
 - Should approved learnings be scoped per user, per workspace, or both?
 - What level of evidence is enough before proposing a behavior-changing learning?
-
-## Candidate Handoff Notes
-- Next bounded implementation after this design is accepted: config/defaults slice.
-- Do not start gateway implementation from this design until sessions and `shell.exec` safety have separate accepted proof.
-
-## Goal Handoff
-`/goal Implement the config/defaults slice from .plandoc/designs/hermes-light-product-spine.md in plato-agent after PR #41 is landed: add config resolution order (--config, PLATO_CONFIG, ./plato.toml, ~/.config/plato/config.toml, defaults), leading-~ expansion for explicit config paths, XDG SQLite as the default plato ledger, explicit JSONL behavior, and configurable turn count. Non-goals: no sessions, no shell.exec, no gateway, no core changes, no YAML. Proof: focused unit tests plus cargo fmt --check, cargo test --locked, cargo clippy --locked --all-targets -- -D warnings, and PR linked to the owning issue.`

@@ -204,15 +204,8 @@ Product implication for Plato: local command execution is central to usefulness,
 - If an implementation issue contradicts this file, the issue must quote the contradiction and name the new human decision.
 - If Claude or another reviewer finds a boundary contradiction, resolve it in GitHub before implementation continues.
 
-## Open Questions
+## Questions Recorded at Adoption
 - Are the recommended defaults accepted as written?
 - Which of the first usable tasks is the first scratch-workspace product proof?
 - Does Jerome want `plato` to become the interactive TUI entry point before or after `plato -c` works?
 - The session implementation issue must name the SQLite single-writer decision before daemon/CLI coexistence changes.
-
-## Goal Handoff
-No implementation `/goal` is authorized from this file while any `Jerome:` slot is blank.
-
-After Jerome fills the slots or explicitly accepts the defaults, create a new implementation issue before using a handoff like:
-
-`/goal Implement the accepted Hermes-light MVP slice from .plandoc/designs/mvp-decisions.md in plato-agent. Scope, non-goals, acceptance, and proof must be copied to the owning GitHub issue before coding.`

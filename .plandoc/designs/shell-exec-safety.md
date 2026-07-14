@@ -113,7 +113,7 @@ issue: https://github.com/referential-ai/plato-agent/issues/51
 - If #52 changes the effect class, yolo boundary, env allowlist, output caps, or timeout shape, update this design or quote the new decision on #52 before coding.
 - If a network-class tool is added later, link issue #6 again; this design does not decide general network-tool yolo semantics.
 
-## Open Questions
+## Questions Recorded at Adoption
 - None for #52 MVP implementation.
 
 ## Contract Neighborhood
@@ -142,6 +142,3 @@ A reviewer can implement #52 from this document without adding new safety decisi
 - Docs-only PR linked to #51.
 - `git diff --check`.
 - Contradiction check against product spine, MVP decisions, #6, #44, #51, and #52.
-
-## Goal Handoff
-`/goal Implement approval-gated shell.exec from .plandoc/designs/shell-exec-safety.md for plato-agent#52 after #51 is accepted. Non-goals: no dedicated network tool, no remote approval grants, no shell sessions, no streaming process UI, no OS/container sandboxing, no platonic-core changes. Proof: tests listed in this design plus scratch-workspace command proof, cargo fmt --check, cargo test --locked, and cargo clippy --locked --all-targets -- -D warnings.`

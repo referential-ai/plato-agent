@@ -95,7 +95,9 @@ Jerome: default (notify-only). Accepted 2026-07-09 by ratifying the architecture
 - No platform tokens in config values or the ledger.
 - Remote channels must never grant approval-required effects.
 
-## First Slices (issues to cut after acceptance, in order)
+## Original Slice Boundaries
+
+Linked issues and PRs own implementation and status.
 1. Socket hardening: `0700` dir / `0600` socket enforced at bind, fail-closed test. (Independent of platform choice.)
 2. Typed recovery surface + contract test: the three D4 changes, plus a daemon integration test proving the lag path and the restart path with typed assertions.
 3. Gateway binary skeleton for the chosen platform: hello/capabilities check, allowlist filter, session map, `message.append` + polling, final-answer reply.
@@ -118,6 +120,3 @@ From the remote channel, the owner: sends a message, gets the final answer; trig
 - Platform SDK sprawl: keep the platform client thin; no framework adoption for one bot.
 - Notification spam on busy runs: notify on approval and terminal states only, not per-event.
 - The `/tmp` runtime fallback stays same-user-writable-parent even after hardening; slice 1 must verify the full path chain, not just the leaf.
-
-## Goal Handoff
-None until both slots are answered and this design is accepted on #93.

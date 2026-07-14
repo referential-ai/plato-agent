@@ -15,18 +15,16 @@
 - GitHub PRs are the implementation and proof surface.
 - Link every PR to its issue and include verification commands or manual proof.
 - A PR changing user-visible behavior must update `README.md` or `docs/QUICKSTART.md` in the same PR.
-- A generic “proceed” is not merge authority. CI green is necessary, not sufficient; merge requires explicit human “merge” or “land” instruction.
+- Merge authority follows the workspace-root `AGENTS.md`; CI must be green and every issue- or PR-specific review and proof gate must be satisfied.
 - Do not use local TODOs, wiki pages, tmux pane names, or chat history as active-work authority.
 - Do not start implementation unless a GitHub issue or direct human task has clear scope, non-goals, acceptance, target surface, and proof.
 
 ## Runtime Topology
 
-- Bootstrap with `src/bin/plato.rs` only.
 - `plato` one-shot execution and `plato replay` must work without a daemon permanently.
-- `plato` and future `plato-agentd` must share one run-driving implementation. Do not duplicate model/tool/policy event choreography.
+- One-shot, daemon, TUI, gateway, and desktop surfaces share one run-driving implementation. Do not duplicate model/tool/policy event choreography.
 - Provider fallback changes run outcome and must be recorded in the run ledger. Unrecorded fallback is forbidden.
-- Add `plato-agentd` only when a second client needs a persistent runtime.
-- Add `plato-tui` only after a daemon/client API exists.
+- `plato-agentd` owns the persistent workspace runtime; clients attach through the daemon protocol and do not own run semantics.
 - Connectors must not own sessions, policy, approvals, provider fallback, or run semantics.
 
 ## Verification

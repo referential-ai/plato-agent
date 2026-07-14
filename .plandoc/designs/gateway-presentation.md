@@ -62,8 +62,8 @@ Full status map (exhaustive `match` on `RunStateName`; a seventh state fails at 
 - Permissions (guide #127 updates): **Add Reactions** + **Read Message History** (required for Create Reaction), and **Send Messages in Threads** if thread channels are used.
 - Rate budget stated plainly, no broader claims: ≤3 reaction calls + `ceil(len/2000)` reply POSTs per message lifecycle (`send_message` chunks at 2000 chars, src/discord_gateway.rs:357-368); typing ≤1 per 8s per active run; zero retries.
 
-### Alignment with #102 (in progress)
-#102 owns **all one-time terminal notifications** (approval notify and the terminal failure notification; its card states terminal states notify once) — this design sends no terminal text of its own, only reactions and typing, and must not duplicate #102's messages. Proposed literal failure copy is recorded on #102 so implementation and tests do not invent wording. The shared event-fold loop is reconciled with #102's implementation before card #129 goes Ready.
+### Terminal-Message Ownership
+#102 owns **all one-time terminal notifications** (approval notify and the terminal failure notification); this design sends no terminal text of its own, only reactions and typing, and must not duplicate #102's messages. The literal failure copy and shared event-fold behavior remain owned by #102's implementation.
 
 ## Non-Goals
 - No per-tool-call or per-event reactions; no configurable emoji sets.
