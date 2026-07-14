@@ -10,28 +10,82 @@ permissions:
   contents: read
 
 jobs:
-  pipe-security-spike:
-    name: Pipe security spike
+  daemon:
+    name: Windows daemon
     runs-on: windows-2025
+    env:
+      RUST_BACKTRACE: "1"
     steps:
       - name: Check out plato-agent
         uses: actions/checkout@v4
 
-      - name: Prove named-pipe security gate
+      - name: Configure SSH for private platonic-core dependency
+        env:
+          PLATONIC_CORE_DEPLOY_KEY: ${{ secrets.PLATONIC_CORE_DEPLOY_KEY }}
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $user = "plato-pipe-test"
+          if ([string]::IsNullOrWhiteSpace($env:PLATONIC_CORE_DEPLOY_KEY)) {
+            throw "PLATONIC_CORE_DEPLOY_KEY is required"
+          }
+          $ssh = Join-Path $HOME ".ssh"
+          New-Item -ItemType Directory -Force $ssh | Out-Null
+          $key = Join-Path $ssh "platonic_core_deploy_key"
+          [IO.File]::WriteAllText(
+            $key,
+            $env:PLATONIC_CORE_DEPLOY_KEY,
+            [Text.UTF8Encoding]::new($false)
+          )
+          @'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          '@ | Set-Content -Encoding utf8 (Join-Path $ssh "known_hosts")
+          $keyForSsh = $key.Replace('\', '/')
+          @"
+          Host github.com
+            HostName github.com
+            User git
+            IdentityFile $keyForSsh
+            IdentitiesOnly yes
+          "@ | Set-Content -Encoding utf8 (Join-Path $ssh "config")
+          icacls $ssh /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" | Out-Null
+          icacls $key /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Create ACL proof user
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $user = "plato-acl-test"
           $password = "P1pe147!Aa2"
           Write-Output "::add-mask::$password"
           net user $user /delete 2>$null | Out-Null
           net user $user $password /add | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "failed to create second local user" }
-          try {
-            $env:PLATO_WINDOWS_SECOND_USER = $user
-            $env:PLATO_WINDOWS_SECOND_PASSWORD = $password
-            cargo run --locked --manifest-path spikes/windows-pipe/Cargo.toml
-            if ($LASTEXITCODE -ne 0) { throw "named-pipe security spike failed" }
-          } finally {
-            net user $user /delete | Out-Null
-          }
+          "PLATO_WINDOWS_SECOND_USER=$user" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PLATO_WINDOWS_SECOND_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Windows tests
+        run: cargo test --locked
+
+      - name: Prove pipe and lock ACLs
+        run: >-
+          cargo test --locked --test windows_daemon
+          production_pipe_and_lock_reject_second_user_and_remote_clients
+          -- --ignored --exact --nocapture
+
+      - name: Run Windows clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Remove ACL proof user
+        if: always()
+        shell: pwsh
+        run: |
+          net user plato-acl-test /delete 2>$null | Out-Null
+          exit 0

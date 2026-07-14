@@ -6,7 +6,7 @@ Plato Agent is the first application shell built on `platonic-core`.
 
 The bootstrap surface is intentionally small:
 
-- `plato "question"` runs one bounded CLI invocation, streams live assistant text to stderr, and writes the run ledger to the default XDG SQLite path.
+- `plato "question"` runs one bounded CLI invocation, streams live assistant text to stderr, and writes the run ledger to the platform user-state path.
 - `plato -c "follow-up"` continues the latest workspace session from the SQLite ledger.
 - `plato --events <file> "question"` writes an explicit JSONL ledger.
 - `plato replay <file>` validates and prints a deterministic JSONL readback without network calls or tool execution.
@@ -20,7 +20,7 @@ Config resolution order:
 1. `--config <path>`
 2. `$PLATO_CONFIG`
 3. `./plato.toml`
-4. `~/.config/plato/config.toml`
+4. `~/.config/plato/config.toml` on Unix or `%APPDATA%\plato\config.toml` on Windows
 5. built-in defaults
 
 Leading `~` expands in explicit config paths. Relative explicit paths resolve
@@ -53,7 +53,8 @@ api_key_env = "OPENAI_API_KEY"
 `file.read` and `file.list` are auto-allowed. `file.write`, `file.edit`, and
 `shell.exec` require stdin approval and default to no. `shell.exec` runs from
 the workspace root with a scrubbed child environment, no provider credentials,
-bounded stdout/stderr, and a timeout.
+bounded stdout/stderr, and a timeout. It uses `sh -c` on Unix and
+`cmd.exe /C` on Windows; timeout or cancellation terminates the full process tree.
 Use `--yolo` to auto-approve enabled workspace-write tools that would otherwise
 prompt. Yolo mode does not enable disabled or unknown tools, approve network
 tools, permit deny-class effects such as external side effects or secret access,
@@ -61,16 +62,16 @@ approve `shell.exec`, or bypass workspace path checks.
 
 ## SQLite Ledgers
 
-- Bare `plato "..."` writes to the default XDG state path.
+- Bare `plato "..."` writes to the default platform user-state path.
 - `plato -c "..."` continues the latest session from that store.
-- `--db` also writes to the default XDG state path.
+- `--db` also writes to the default platform user-state path.
 - `--db=<path>` writes to that SQLite file; relative paths resolve against the current workspace.
 - Use `=` for explicit paths because `--db` also has a bare default form.
 - Live assistant text, `run_id`, `ledger_path`, and replay hints print to stderr. Stdout remains only the final answer.
 - Replay shows final assistant messages, not partial streaming deltas.
 - Ledger, approval, replay, and typed-transcript tool call ids are host-minted per run; provider ids remain provider-facing.
 - Streamed runs request provider usage chunks; providers that omit usage still record zero usage.
-- `plato replay` without arguments replays the latest session from the default XDG SQLite ledger.
+- `plato replay` without arguments replays the latest session from the default platform SQLite ledger.
 - `plato replay --run <id>` replays a single run.
 - `--events <file>` is the explicit JSONL export/debug path.
 - If the workspace daemon lock is held, SQLite CLI run/replay paths fail closed instead of competing with the daemon-owned store.
@@ -101,22 +102,26 @@ On startup it prints:
 
 ```text
 workspace_id: <workspace-id>
-socket_path: <runtime-path>/agent.sock
+socket_path: <daemon-endpoint>
 ledger_path: <state-path>/agent.db
 ```
 
 Default paths are keyed by the workspace id:
 
-- socket: `${XDG_RUNTIME_DIR:-/tmp/plato-agent/$USER}/plato-agent/workspaces/<workspace-id>/agent.sock`
-- lock: `${XDG_RUNTIME_DIR:-/tmp/plato-agent/$USER}/plato-agent/workspaces/<workspace-id>/agent.lock`
-- ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/plato-agent/workspaces/<workspace-id>/agent.db`
+- Unix socket: `${XDG_RUNTIME_DIR:-/tmp/plato-agent/$USER}/plato-agent/workspaces/<workspace-id>/agent.sock`
+- Unix lock: `${XDG_RUNTIME_DIR:-/tmp/plato-agent/$USER}/plato-agent/workspaces/<workspace-id>/agent.lock`
+- Unix ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/plato-agent/workspaces/<workspace-id>/agent.db`
+- Windows pipe: `\\.\pipe\plato-agent-<workspace-hash>`
+- Windows lock and ledger: `%LOCALAPPDATA%\plato-agent\workspaces\<workspace-id>\agent.lock` and `agent.db`
 
 Runtime directories are restricted to `0700` and the daemon socket to `0600`.
-A custom `--socket` parent is restricted to `0700` at startup.
+A custom Unix `--socket` parent is restricted to `0700` at startup. Windows
+pipe and lock ACLs grant access only to the current user and reject remote pipe clients.
 
-The daemon holds the lock while it is active. SIGINT and SIGTERM trigger
-a graceful shutdown: the daemon stops accepting new connections, then removes
-the socket and lock before exiting. Do not remove a lock for a live daemon.
+The daemon holds the lock while it is active. SIGINT and SIGTERM on Unix, and
+Ctrl-C or Ctrl-Break on Windows, trigger a graceful shutdown: the daemon stops
+accepting new connections, then removes its endpoint and lock before exiting.
+Do not remove a lock for a live daemon.
 Live assistant deltas are transient `events.stream` events and are not written
 to the ledger. After a `lagged` response, omitting `from_offset` resumes at the
 current tip; `transcript.read` returns ledger-backed status and final answer.

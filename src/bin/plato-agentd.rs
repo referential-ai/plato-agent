@@ -1,13 +1,14 @@
 use clap::Parser;
-use plato_agent::daemon::server::DaemonServer;
+use plato_agent::daemon::{server::DaemonServer, wake_listener};
+#[cfg(unix)]
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
     iterator::Signals,
 };
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::thread;
 
 #[derive(Debug, Parser)]
@@ -37,17 +38,57 @@ fn run() -> plato_agent::AppResult<()> {
     eprintln!("ledger_path: {}", server.paths().ledger_path.display());
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let mut signals = Signals::new([SIGINT, SIGTERM])?;
-
-    {
-        let shutdown = shutdown.clone();
-        thread::spawn(move || {
-            if signals.forever().next().is_some() {
-                shutdown.store(true, Ordering::SeqCst);
-                let _ = UnixStream::connect(&socket_path);
-            }
-        });
-    }
+    install_shutdown_handler(shutdown.clone(), socket_path)?;
 
     server.serve_forever(shutdown)
+}
+
+#[cfg(unix)]
+fn install_shutdown_handler(
+    shutdown: Arc<AtomicBool>,
+    socket_path: PathBuf,
+) -> plato_agent::AppResult<()> {
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            request_shutdown(&shutdown, &socket_path);
+        }
+    });
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install_shutdown_handler(
+    shutdown: Arc<AtomicBool>,
+    socket_path: PathBuf,
+) -> plato_agent::AppResult<()> {
+    ctrlc::set_handler(move || {
+        request_shutdown(&shutdown, &socket_path);
+    })
+    .map_err(|error| {
+        std::io::Error::other(format!(
+            "failed to install console control handler: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn request_shutdown(shutdown: &AtomicBool, socket_path: &std::path::Path) {
+    shutdown.store(true, Ordering::SeqCst);
+    wake_listener(socket_path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_request_sets_flag_when_listener_is_missing() {
+        let workspace = tempfile::tempdir().unwrap();
+        let shutdown = AtomicBool::new(false);
+
+        request_shutdown(&shutdown, &workspace.path().join("missing.sock"));
+
+        assert!(shutdown.load(Ordering::SeqCst));
+    }
 }

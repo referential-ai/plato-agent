@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod app;
 pub mod config;
@@ -13,6 +13,9 @@ pub mod replay;
 pub mod tool_catalog;
 pub mod tools;
 pub mod tui;
+
+#[cfg(windows)]
+mod windows_security;
 
 pub use app::{
     ApprovalMode, ApprovalRequest, AssistantDeltaEvent, RunEvent, RunLedger, RunOptions,

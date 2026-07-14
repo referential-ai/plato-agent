@@ -15,7 +15,7 @@ This document copies the topology decision from the Platonic workspace issue tha
 - Fallback rule: provider fallback is per-run ledger evidence. The process that computes it is mechanics; unrecorded fallback is forbidden.
 - Daemon noun: `plato-agentd` is the persistent runtime. Gateways are future ingress adapters and never own agent semantics.
 - TUI decision: `plato-tui` is a separate binary in this crate once it exists.
-- Daemon ownership: `plato-agentd` owns the Unix socket, event database, and process lock. XDG runtime/state paths are keyed by `workspace-id` = sanitized root basename + first 16 SHA-256 hex chars of the canonical root path.
+- Daemon ownership: `plato-agentd` owns the local endpoint, event database, and process lock. Unix uses a private UDS plus XDG runtime/state paths; Windows uses a current-user named pipe plus `LocalAppData` runtime/state paths. Durable paths are keyed by `workspace-id` = sanitized root basename + first 16 SHA-256 hex chars of the canonical root path; the bounded Windows pipe name uses that hash.
 - Single-writer invariant: one live writer owns a workspace store. Before daemon and CLI coexist on SQLite, decide whether CLI writes directly, delegates to the daemon, or refuses while the daemon is active.
 - Daemon API sketch: start run, append message, stream events, approve/deny, cancel, list sessions, read transcript. `run.start` and `message.append` default to async `wait: false`; explicit `wait: true` blocks until terminal result.
 - Live assistant text deltas are transient daemon/app events; final `model_responded` ledger messages remain the replay source of truth.

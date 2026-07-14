@@ -39,7 +39,7 @@ plato replay        # audit the latest default SQLite session
 ```
 
 Live assistant text prints to stderr; the final answer prints to stdout. The
-complete run ledger lands in the default XDG SQLite store for the workspace.
+complete run ledger lands in the default platform SQLite store for the workspace.
 `-c` continues the latest workspace session. Use `--events <file>` when you
 want JSONL.
 
@@ -125,7 +125,7 @@ cargo fmt --check
 
 | Symptom | Fix |
 | --- | --- |
-| daemon lock held | a daemon is running or died hard: check the pid inside `agent.lock`; if dead, delete `agent.lock` and `agent.sock` |
+| daemon lock held | a daemon is running or died hard: check the pid inside `agent.lock`; if dead, delete `agent.lock` and any Unix `agent.sock` |
 | `--db /path` ignored | use the equals form: `--db=/path` |
 | provider api key env is not set | re-export `OPENROUTER_API_KEY` in this shell |
 | ledger already exists | JSONL ledgers never overwrite — pass a fresh `--events` name |

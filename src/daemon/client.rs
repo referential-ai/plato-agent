@@ -1,10 +1,13 @@
 use crate::{
     AppError, AppResult,
-    daemon::protocol::{
-        ApprovalDecideParams, CommandAcceptedResult, Envelope, EnvelopeKind, EventsStreamParams,
-        EventsStreamResult, HelloParams, HelloResult, MessageAppendParams, PROTOCOL_VERSION,
-        RunCancelParams, RunStartParams, RunStartResult, SessionSummary, SessionsListResult,
-        ShutdownIfIdleResult, TranscriptReadParams, TranscriptReadResult,
+    daemon::{
+        protocol::{
+            ApprovalDecideParams, CommandAcceptedResult, Envelope, EnvelopeKind,
+            EventsStreamParams, EventsStreamResult, HelloParams, HelloResult, MessageAppendParams,
+            PROTOCOL_VERSION, RunCancelParams, RunStartParams, RunStartResult, SessionSummary,
+            SessionsListResult, ShutdownIfIdleResult, TranscriptReadParams, TranscriptReadResult,
+        },
+        transport::{self, Stream},
     },
     paths,
 };
@@ -12,20 +15,19 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
     io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
 };
 
 pub struct DaemonClient {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    reader: BufReader<Stream>,
+    writer: Stream,
     next_id: u64,
 }
 
 impl DaemonClient {
     pub fn connect(socket_path: &Path) -> AppResult<Self> {
-        let writer = UnixStream::connect(socket_path)?;
-        let reader = BufReader::new(writer.try_clone()?);
+        let writer = transport::connect(socket_path)?;
+        let reader = BufReader::new(transport::try_clone(&writer)?);
         Ok(Self {
             reader,
             writer,
@@ -270,7 +272,7 @@ impl DaemonConnectionConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::daemon::protocol::{
@@ -279,7 +281,7 @@ mod tests {
     use serde_json::json;
     use std::{
         io::{BufRead, BufReader, Write},
-        os::unix::net::UnixListener,
+        os::unix::net::{UnixListener, UnixStream},
         thread,
     };
 

@@ -12,7 +12,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Unix socket path printed by plato-agentd"
+        help = "Daemon endpoint printed by plato-agentd"
     )]
     socket: Option<PathBuf>,
 

@@ -6,12 +6,18 @@ use serde_json::{Value, json};
 use std::{
     env, fs,
     io::{self, ErrorKind, Read, Write},
-    os::unix::process::CommandExt,
     path::{Component, Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{ChildStderr, ChildStdout, Command, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
+};
+#[cfg(unix)]
+use std::{os::unix::process::CommandExt, process::Child};
+#[cfg(windows)]
+use {
+    command_group::{CommandGroup, GroupChild},
+    std::os::windows::process::CommandExt,
 };
 
 const MAX_READ_BYTES: usize = 64 * 1024;
@@ -41,6 +47,20 @@ const SHELL_ENV_ALLOWLIST: &[&str] = &[
     "CARGO_HOME",
     "RUSTUP_HOME",
 ];
+#[cfg(windows)]
+const WINDOWS_SHELL_ENV_ALLOWLIST: &[&str] = &[
+    "PATHEXT",
+    "SYSTEMROOT",
+    "COMSPEC",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+];
+
+#[cfg(unix)]
+type ShellChild = Child;
+#[cfg(windows)]
+type ShellChild = Option<GroupChild>;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -314,24 +334,11 @@ fn shell_exec(
     let cwd = context.workspace_root.canonicalize()?;
     let env = shell_child_env(context.provider_api_key_env);
     let started = Instant::now();
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(&input.command)
-        .current_dir(&cwd)
-        .env_clear()
-        .envs(env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()?;
+    let mut child = spawn_shell(&input.command, &cwd, env)?;
 
-    let stdout = child
-        .stdout
-        .take()
+    let stdout = take_shell_stdout(&mut child)
         .ok_or_else(|| AppError::Tool("shell.exec stdout pipe unavailable".into()))?;
-    let stderr = child
-        .stderr
-        .take()
+    let stderr = take_shell_stderr(&mut child)
         .ok_or_else(|| AppError::Tool("shell.exec stderr pipe unavailable".into()))?;
     let stdout_reader = thread::spawn(move || read_capped_output(stdout, SHELL_OUTPUT_BYTES));
     let stderr_reader = thread::spawn(move || read_capped_output(stderr, SHELL_OUTPUT_BYTES));
@@ -339,24 +346,24 @@ fn shell_exec(
     let mut timed_out = false;
     let mut canceled = false;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        if let Some(status) = try_wait_shell(&mut child)? {
+            break Some(status);
         }
         if context
             .cancel
             .is_some_and(|cancel| cancel.load(Ordering::SeqCst))
         {
             canceled = true;
-            kill_shell_group(&mut child);
-            break child.wait()?;
+            break terminate_shell(&mut child)?;
         }
         if Instant::now() >= deadline {
             timed_out = true;
-            kill_shell_group(&mut child);
-            break child.wait()?;
+            break terminate_shell(&mut child)?;
         }
         thread::sleep(Duration::from_millis(20));
     };
+    #[cfg(windows)]
+    close_shell_job(&mut child);
     let stdout = join_output_reader(stdout_reader)?;
     let stderr = join_output_reader(stderr_reader)?;
     let duration_ms = started.elapsed().as_millis() as u64;
@@ -370,6 +377,7 @@ fn shell_exec(
         return Err(AppError::Tool("shell.exec canceled".into()));
     }
 
+    let status = status.expect("completed shell has an exit status");
     let exit_code = status.code();
     let exit_label = exit_code
         .map(|code| code.to_string())
@@ -392,11 +400,85 @@ fn shell_exec(
     })
 }
 
-fn kill_shell_group(child: &mut Child) {
+#[cfg(unix)]
+fn spawn_shell(command: &str, cwd: &Path, env: Vec<(String, String)>) -> io::Result<ShellChild> {
+    Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+}
+
+#[cfg(windows)]
+fn spawn_shell(command: &str, cwd: &Path, env: Vec<(String, String)>) -> io::Result<ShellChild> {
+    let mut process = Command::new("cmd.exe");
+    process
+        .arg("/C")
+        .raw_arg(command)
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    process.group().kill_on_drop(true).spawn().map(Some)
+}
+
+#[cfg(unix)]
+fn take_shell_stdout(child: &mut ShellChild) -> Option<ChildStdout> {
+    child.stdout.take()
+}
+
+#[cfg(windows)]
+fn take_shell_stdout(child: &mut ShellChild) -> Option<ChildStdout> {
+    child.as_mut()?.inner().stdout.take()
+}
+
+#[cfg(unix)]
+fn take_shell_stderr(child: &mut ShellChild) -> Option<ChildStderr> {
+    child.stderr.take()
+}
+
+#[cfg(windows)]
+fn take_shell_stderr(child: &mut ShellChild) -> Option<ChildStderr> {
+    child.as_mut()?.inner().stderr.take()
+}
+
+#[cfg(unix)]
+fn try_wait_shell(child: &mut ShellChild) -> io::Result<Option<std::process::ExitStatus>> {
+    child.try_wait()
+}
+
+#[cfg(windows)]
+fn try_wait_shell(child: &mut ShellChild) -> io::Result<Option<std::process::ExitStatus>> {
+    child
+        .as_mut()
+        .expect("live shell job is present")
+        .try_wait()
+}
+
+#[cfg(unix)]
+fn terminate_shell(child: &mut ShellChild) -> io::Result<Option<std::process::ExitStatus>> {
     if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
         let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }
     let _ = child.kill();
+    child.wait().map(Some)
+}
+
+#[cfg(windows)]
+fn terminate_shell(child: &mut ShellChild) -> io::Result<Option<std::process::ExitStatus>> {
+    close_shell_job(child);
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn close_shell_job(child: &mut ShellChild) {
+    drop(child.take());
 }
 
 fn normalize_timeout_seconds(timeout_seconds: Option<u64>) -> u64 {
@@ -414,10 +496,37 @@ fn shell_child_env_from(
     provider_api_key_env: Option<&str>,
 ) -> Vec<(String, String)> {
     vars.into_iter()
-        .filter(|(name, _)| SHELL_ENV_ALLOWLIST.contains(&name.as_str()))
+        .filter(|(name, _)| shell_env_name_is_allowlisted(name))
         .filter(|(name, _)| !is_credential_env_name(name))
-        .filter(|(name, _)| provider_api_key_env != Some(name.as_str()))
+        .filter(|(name, _)| {
+            provider_api_key_env.is_none_or(|provider| !shell_env_names_equal(provider, name))
+        })
         .collect()
+}
+
+fn shell_env_name_is_allowlisted(name: &str) -> bool {
+    #[cfg(unix)]
+    {
+        SHELL_ENV_ALLOWLIST.contains(&name)
+    }
+    #[cfg(windows)]
+    {
+        SHELL_ENV_ALLOWLIST
+            .iter()
+            .chain(WINDOWS_SHELL_ENV_ALLOWLIST)
+            .any(|allowed| allowed.eq_ignore_ascii_case(name))
+    }
+}
+
+fn shell_env_names_equal(left: &str, right: &str) -> bool {
+    #[cfg(unix)]
+    {
+        left == right
+    }
+    #[cfg(windows)]
+    {
+        left.eq_ignore_ascii_case(right)
+    }
 }
 
 fn is_credential_env_name(name: &str) -> bool {
@@ -1155,6 +1264,35 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn shell_env_matches_windows_names_case_insensitively() {
+        let env = shell_child_env_from(
+            vec![
+                ("Path".into(), r"C:\Windows\System32".into()),
+                ("pathext".into(), ".COM;.EXE;.BAT;.CMD".into()),
+                ("systemroot".into(), r"C:\Windows".into()),
+                ("ComSpec".into(), r"C:\Windows\System32\cmd.exe".into()),
+                ("UserProfile".into(), r"C:\Users\runner".into()),
+                ("homeDrive".into(), "C:".into()),
+                ("homePath".into(), r"\Users\runner".into()),
+                ("temp".into(), r"C:\Temp".into()),
+                ("TmP".into(), r"C:\Temp".into()),
+                ("Home".into(), "provider-secret".into()),
+                ("OpenRouter_Api_Key".into(), "credential-secret".into()),
+            ],
+            Some("HOME"),
+        );
+
+        assert_eq!(env.len(), 9);
+        assert!(env.iter().any(|(name, _)| name == "Path"));
+        assert!(env.iter().any(|(name, _)| name == "pathext"));
+        assert!(env.iter().any(|(name, _)| name == "systemroot"));
+        assert!(env.iter().any(|(name, _)| name == "ComSpec"));
+        assert!(!env.iter().any(|(name, _)| name == "Home"));
+        assert!(!env.iter().any(|(name, _)| name == "OpenRouter_Api_Key"));
+    }
+
     #[test]
     fn capped_output_marks_truncation() {
         let output = read_capped_output(io::Cursor::new(b"abcdef".to_vec()), 3).unwrap();
@@ -1316,5 +1454,166 @@ mod tests {
             err,
             AppError::Tool(message) if message == "shell.exec canceled"
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_exec_uses_cmd_grammar_and_workspace_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("probe.cmd"),
+            "@echo off\r\necho batch-ok\r\n",
+        )
+        .unwrap();
+
+        let result = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            SHELL_EXEC,
+            json!({"command": "probe&&echo chained"}),
+        )
+        .unwrap();
+
+        assert_eq!(result.data["exit_code"], 0);
+        assert_eq!(
+            result.data["cwd"].as_str().unwrap(),
+            dir.path().canonicalize().unwrap().to_string_lossy()
+        );
+        let stdout = result.data["stdout"].as_str().unwrap();
+        assert!(stdout.contains("batch-ok"));
+        assert!(stdout.contains("chained"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_exec_finds_cmd_files_on_user_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("user-bin");
+        fs::create_dir(&bin).unwrap();
+        fs::write(
+            bin.join("user-probe.cmd"),
+            "@echo off\r\necho user-path-ok\r\n",
+        )
+        .unwrap();
+
+        let result = temp_env::with_vars(
+            [
+                ("PATH", Some(bin.as_os_str())),
+                ("PATHEXT", Some(std::ffi::OsStr::new(".CMD"))),
+            ],
+            || {
+                execute_tool(
+                    dir.path(),
+                    ToolCallId::new("call_1").unwrap(),
+                    SHELL_EXEC,
+                    json!({"command": "user-probe"}),
+                )
+                .unwrap()
+            },
+        );
+
+        assert_eq!(result.data["exit_code"], 0);
+        assert!(
+            result.data["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("user-path-ok")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_exec_records_windows_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            SHELL_EXEC,
+            json!({"command": "echo fail 1>&2&&exit /b 7"}),
+        )
+        .unwrap();
+
+        assert_eq!(result.data["exit_code"], 7);
+        assert!(result.data["stderr"].as_str().unwrap().contains("fail"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_exec_timeout_kills_windows_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        write_windows_descendant_probe(dir.path());
+
+        let err = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            SHELL_EXEC,
+            json!({"command": "descendant-probe.cmd", "timeout_seconds": 1}),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            AppError::Tool(message) if message == "shell.exec timed out after 1s"
+        ));
+        assert!(dir.path().join("descendant-started.txt").exists());
+        thread::sleep(Duration::from_secs(4));
+        assert!(!dir.path().join("descendant-survived.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_exec_cancel_kills_windows_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        write_windows_descendant_probe(dir.path());
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let cancel_for_thread = std::sync::Arc::clone(&cancel);
+        let started_path = dir.path().join("descendant-started.txt");
+        let canceler = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !started_path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "descendant did not start before cancel deadline"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            cancel_for_thread.store(true, Ordering::SeqCst);
+        });
+
+        let err = execute_tool_with_context(
+            ToolExecutionContext {
+                workspace_root: dir.path(),
+                provider_api_key_env: None,
+                cancel: Some(cancel.as_ref()),
+            },
+            ToolCallId::new("call_1").unwrap(),
+            SHELL_EXEC,
+            json!({"command": "descendant-probe.cmd", "timeout_seconds": 10}),
+        )
+        .unwrap_err();
+        canceler.join().unwrap();
+
+        assert!(matches!(
+            err,
+            AppError::Tool(message) if message == "shell.exec canceled"
+        ));
+        thread::sleep(Duration::from_secs(4));
+        assert!(!dir.path().join("descendant-survived.txt").exists());
+    }
+
+    #[cfg(windows)]
+    fn write_windows_descendant_probe(workspace: &Path) {
+        fs::write(
+            workspace.join("descendant-probe.cmd"),
+            concat!(
+                "@echo off\r\n",
+                "start \"\" /b cmd.exe /C ",
+                "\"echo started>descendant-started.txt ",
+                "& ping -n 5 127.0.0.1 >NUL ",
+                "& echo survived>descendant-survived.txt\"\r\n",
+                "ping -n 30 127.0.0.1 >NUL\r\n",
+            ),
+        )
+        .unwrap();
     }
 }
