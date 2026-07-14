@@ -54,6 +54,7 @@ struct LiveUnrelatedProcess {
     pid: u32,
     metadata_executable: PinnedFile,
     process_executable: PinnedFile,
+    control_executable: PinnedFile,
     process: CurrentUserProcess,
 }
 
@@ -324,6 +325,7 @@ fn recheck_preflight(exact: &[LiveWorkspace], unrelated: &[LiveUnrelatedProcess]
             || !live.process.is_running()?
             || !live.metadata_executable.is_unchanged()?
             || !live.process_executable.is_unchanged()?
+            || !live.control_executable.is_unchanged()?
         {
             return Err(control_error(format!(
                 "unrelated process {} changed after preflight",
@@ -460,6 +462,7 @@ fn inspect_lock(lock_path: &Path) -> AppResult<LiveObservation> {
             pid: metadata.pid,
             metadata_executable,
             process_executable,
+            control_executable,
             process,
         }));
     }
