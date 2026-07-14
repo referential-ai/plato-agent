@@ -559,7 +559,7 @@ fn shell_exec(
 
 #[cfg(unix)]
 fn spawn_shell(command: &str, cwd: &Path, env: Vec<(String, String)>) -> io::Result<ShellChild> {
-    Command::new("sh")
+    Command::new("/bin/sh")
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
@@ -1477,6 +1477,37 @@ mod tests {
             result.data["stdout"].as_str().unwrap().trim(),
             cwd.to_string_lossy()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_uses_a_trusted_shell_and_resolves_commands_on_user_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("user-bin");
+        fs::create_dir(&bin).unwrap();
+        let fake_shell = bin.join("sh");
+        let user_command = bin.join("user-path-proof");
+        fs::write(&fake_shell, "#!/bin/sh\nprintf compromised\n").unwrap();
+        fs::write(&user_command, "#!/bin/sh\nprintf user-path-ok\n").unwrap();
+        for executable in [&fake_shell, &user_command] {
+            let mut permissions = fs::metadata(executable).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(executable, permissions).unwrap();
+        }
+
+        let output = spawn_shell(
+            "user-path-proof",
+            dir.path(),
+            vec![("PATH".into(), bin.to_string_lossy().into_owned())],
+        )
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"user-path-ok");
     }
 
     #[cfg(unix)]

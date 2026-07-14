@@ -23,6 +23,10 @@ use tauri_plugin_dialog::DialogExt;
 
 #[cfg(windows)]
 mod lifecycle;
+#[cfg(unix)]
+mod unix_lifecycle;
+#[cfg(all(test, unix))]
+mod unix_proof;
 #[cfg(all(test, windows))]
 mod windows_installer_proof;
 #[cfg(all(test, windows))]
@@ -42,11 +46,11 @@ const REQUIRED_CAPABILITIES: [&str; 10] = [
 ];
 const EVENT_PAGE_SIZE: usize = 128;
 const INPUT_PREVIEW_MAX_CHARS: usize = 2_000;
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 const DAEMON_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 #[cfg(windows)]
 const DAEMON_ATTACH_CANCEL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 const DAEMON_ATTACH_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 
 struct DesktopState {
@@ -57,7 +61,7 @@ struct DesktopState {
 
 #[derive(Clone, Debug, Default)]
 struct DaemonLaunch {
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     executable: Option<PathBuf>,
 }
 
@@ -69,7 +73,14 @@ impl DaemonLaunch {
         })
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    fn installed() -> Result<Self, std::io::Error> {
+        Ok(Self {
+            executable: Some(unix_lifecycle::sibling_daemon_executable()?),
+        })
+    }
+
+    #[cfg(not(any(windows, unix)))]
     fn installed() -> Result<Self, std::io::Error> {
         Ok(Self::default())
     }
@@ -80,7 +91,7 @@ struct DesktopLifecycle {
     workspace_root: Option<PathBuf>,
     #[cfg(windows)]
     workspace_instance: Option<lifecycle::WorkspaceInstance>,
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     spawned_daemon: Option<SpawnedDaemon>,
 }
 
@@ -92,7 +103,7 @@ struct PreparedWorkspace {
     instance: Option<lifecycle::WorkspaceInstance>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 struct SpawnedDaemon {
     workspace_id: String,
     child: std::process::Child,
@@ -500,12 +511,20 @@ impl DesktopLifecycle {
     }
 
     fn commit_workspace(&mut self, prepared: PreparedWorkspace) {
+        #[cfg(any(windows, unix))]
+        if self.workspace_root.as_ref() != Some(&prepared.workspace_root) {
+            #[cfg(unix)]
+            reap_detached_daemon(self);
+            #[cfg(windows)]
+            {
+                self.spawned_daemon = None;
+            }
+        }
         #[cfg(windows)]
         {
             if let Some(instance) = prepared.instance {
                 debug_assert_eq!(instance.workspace_id(), prepared.workspace_id);
                 self.workspace_instance = Some(instance);
-                self.spawned_daemon = None;
             }
         }
         self.workspace_root = Some(prepared.workspace_root);
@@ -750,27 +769,30 @@ fn connect_workspace(
 ) -> Result<BootstrapView, DesktopError> {
     let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
-    try_attach_workspace(&config)
-}
-
-#[cfg(not(windows))]
-fn try_attach_workspace(config: &DaemonConnectionConfig) -> Result<BootstrapView, DesktopError> {
-    let client = connect_client(config)?;
-    finish_attach_workspace(config, client)
+    try_attach_workspace_until(&config, std::time::Instant::now() + DAEMON_ATTACH_TIMEOUT)
 }
 
 fn finish_attach_workspace(
     config: &DaemonConnectionConfig,
     mut client: DaemonClient,
+    deadline: Option<std::time::Instant>,
 ) -> Result<BootstrapView, DesktopError> {
+    #[cfg(windows)]
+    let _ = deadline;
+    #[cfg(unix)]
+    refresh_attach_timeout(config, &mut client, deadline)?;
     let hello = client
         .hello(&config.workspace_root)
         .map_err(|error| DesktopError::daemon("Daemon hello failed", error))?;
     validate_hello(&config.workspace_root, &hello)?;
     let daemon_version = hello.daemon_version;
+    #[cfg(unix)]
+    refresh_attach_timeout(config, &mut client, deadline)?;
     let session_summaries = client
         .sessions_list()
         .map_err(|error| DesktopError::daemon("Unable to list daemon sessions", error))?;
+    #[cfg(unix)]
+    refresh_attach_timeout(config, &mut client, deadline)?;
     let selected_run = session_summaries
         .first()
         .map(|session| read_typed_run(&mut client, &session.run_id))
@@ -795,7 +817,7 @@ fn try_attach_workspace_until(
     let worker_config = config.clone();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let worker = std::thread::spawn(move || {
-        let _ = sender.send(finish_attach_workspace(&worker_config, client));
+        let _ = sender.send(finish_attach_workspace(&worker_config, client, None));
     });
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     match receiver.recv_timeout(remaining) {
@@ -831,6 +853,48 @@ fn try_attach_workspace_until(
     }
 }
 
+#[cfg(unix)]
+fn try_attach_workspace_until(
+    config: &DaemonConnectionConfig,
+    deadline: std::time::Instant,
+) -> Result<BootstrapView, DesktopError> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(DesktopError::new(
+            "daemon_unavailable",
+            format!(
+                "Daemon attach timed out at {}",
+                config.socket_path.display()
+            ),
+        ));
+    }
+    let client = DaemonClient::connect_with_timeout(&config.socket_path, remaining)
+        .map_err(|error| DesktopError::daemon("Unable to connect to plato-agentd", error))?;
+    finish_attach_workspace(config, client, Some(deadline))
+}
+
+#[cfg(unix)]
+fn refresh_attach_timeout(
+    config: &DaemonConnectionConfig,
+    client: &mut DaemonClient,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), DesktopError> {
+    let deadline = deadline.expect("Unix attach always has a deadline");
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(DesktopError::new(
+            "daemon_unavailable",
+            format!(
+                "Daemon attach timed out at {}",
+                config.socket_path.display()
+            ),
+        ));
+    }
+    client
+        .set_timeout(remaining)
+        .map_err(|error| DesktopError::daemon("Unable to bound daemon attach", error))
+}
+
 #[cfg(windows)]
 fn attach_worker_error() -> DesktopError {
     DesktopError::new("desktop_worker", "Daemon attach worker failed")
@@ -844,19 +908,20 @@ fn attach_or_spawn_workspace(
 ) -> Result<BootstrapView, DesktopError> {
     let config = DaemonConnectionConfig::resolve(workspace_root, socket_path)
         .map_err(|error| DesktopError::daemon("Workspace is invalid", error))?;
-    #[cfg(windows)]
     let initial =
         try_attach_workspace_until(&config, std::time::Instant::now() + DAEMON_ATTACH_TIMEOUT);
-    #[cfg(not(windows))]
-    let initial = try_attach_workspace(&config);
     match initial {
-        Ok(view) => Ok(view),
+        Ok(view) => {
+            #[cfg(unix)]
+            reap_detached_daemon(lifecycle);
+            Ok(view)
+        }
         Err(error) if error.code == "daemon_unavailable" => {
-            #[cfg(windows)]
+            #[cfg(any(windows, unix))]
             {
                 start_and_attach_workspace(&config, lifecycle, launch, error)
             }
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, unix)))]
             {
                 let _ = (lifecycle, launch);
                 Err(error)
@@ -866,7 +931,7 @@ fn attach_or_spawn_workspace(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, unix))]
 fn start_and_attach_workspace(
     config: &DaemonConnectionConfig,
     lifecycle: &mut DesktopLifecycle,
@@ -885,6 +950,8 @@ fn start_and_attach_workspace(
             Ok(None) => should_spawn = false,
             Ok(Some(status)) => child_status = Some(format!("previous child exited with {status}")),
             Err(error) => {
+                #[cfg(unix)]
+                reap_detached_daemon(lifecycle);
                 return Err(daemon_start_error(
                     config,
                     format!("unable to inspect the previous daemon child: {error}"),
@@ -893,16 +960,40 @@ fn start_and_attach_workspace(
         }
     }
     if should_spawn {
-        lifecycle.spawned_daemon = None;
+        #[cfg(unix)]
+        reap_detached_daemon(lifecycle);
+        #[cfg(windows)]
+        {
+            lifecycle.spawned_daemon = None;
+        }
         let executable = launch.executable.as_deref().ok_or_else(|| {
             daemon_start_error(config, "the packaged daemon sidecar path is unavailable")
         })?;
+        #[cfg(windows)]
         let child = lifecycle::spawn_detached_daemon(
             executable,
             &config.workspace_root,
             Some(&config.socket_path),
-        )
-        .map_err(|error| {
+        );
+        #[cfg(unix)]
+        let child = {
+            let user_path = unix_lifecycle::user_launch_path().map_err(|error| {
+                daemon_start_error(
+                    config,
+                    format!(
+                        "unable to establish the user launch PATH before starting {}: {error}",
+                        executable.display()
+                    ),
+                )
+            })?;
+            unix_lifecycle::spawn_detached_daemon(
+                executable,
+                &config.workspace_root,
+                Some(&config.socket_path),
+                &user_path,
+            )
+        };
+        let child = child.map_err(|error| {
             daemon_start_error(
                 config,
                 format!("unable to start {}: {error}", executable.display()),
@@ -921,12 +1012,20 @@ fn start_and_attach_workspace(
                 Some(status) => format!("{last_error}; {status}"),
                 None => last_error,
             };
+            #[cfg(unix)]
+            reap_detached_daemon(lifecycle);
             return Err(daemon_start_error(config, detail));
         }
         match try_attach_workspace_until(config, deadline) {
-            Ok(view) => return Ok(view),
+            Ok(view) => {
+                #[cfg(unix)]
+                reap_detached_daemon(lifecycle);
+                return Ok(view);
+            }
             Err(error) => {
                 if error.code != "daemon_unavailable" {
+                    #[cfg(unix)]
+                    reap_detached_daemon(lifecycle);
                     return Err(error);
                 }
                 last_error = error.message;
@@ -944,7 +1043,12 @@ fn start_and_attach_workspace(
                 Ok(None) => {}
                 Err(error) => {
                     child_status = Some(format!("unable to inspect daemon child: {error}"));
-                    lifecycle.spawned_daemon = None;
+                    #[cfg(unix)]
+                    reap_detached_daemon(lifecycle);
+                    #[cfg(windows)]
+                    {
+                        lifecycle.spawned_daemon = None;
+                    }
                 }
             }
         }
@@ -952,7 +1056,18 @@ fn start_and_attach_workspace(
     }
 }
 
-#[cfg(windows)]
+#[cfg(unix)]
+fn reap_detached_daemon(lifecycle: &mut DesktopLifecycle) {
+    let Some(spawned) = lifecycle.spawned_daemon.take() else {
+        return;
+    };
+    let mut child = spawned.child;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
+#[cfg(any(windows, unix))]
 fn daemon_start_error(
     config: &DaemonConnectionConfig,
     detail: impl std::fmt::Display,
@@ -1775,7 +1890,9 @@ mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
         os::unix::net::{UnixListener, UnixStream},
+        process::Command,
         thread,
+        time::{Duration, Instant},
     };
 
     #[test]
@@ -1858,6 +1975,213 @@ mod tests {
             SavedWorkspaceState::Ready(root)
                 if root == second_root.path().canonicalize().unwrap()
         ));
+    }
+
+    #[test]
+    fn connected_daemon_that_never_answers_is_bounded() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            let mut reader = BufReader::new(stream);
+            reader.read_line(&mut request).unwrap();
+            assert!(!request.is_empty());
+            released.recv_timeout(Duration::from_secs(2)).unwrap();
+            drop(reader);
+        });
+        let config = DaemonConnectionConfig::resolve(workspace.path(), Some(socket_path)).unwrap();
+
+        let started = Instant::now();
+        let error =
+            try_attach_workspace_until(&config, Instant::now() + Duration::from_millis(200))
+                .unwrap_err();
+
+        assert_eq!(error.code, "daemon_unavailable");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn connected_daemon_that_drips_a_response_cannot_extend_the_deadline() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert!(!request.is_empty());
+            for _ in 0..20 {
+                if stream.write_all(b" ").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let config = DaemonConnectionConfig::resolve(workspace.path(), Some(socket_path)).unwrap();
+
+        let started = Instant::now();
+        let error =
+            try_attach_workspace_until(&config, Instant::now() + Duration::from_millis(200))
+                .unwrap_err();
+
+        assert_eq!(error.code, "daemon_unavailable");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn late_initial_attach_hands_the_tracked_child_to_a_reaper() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_root = canonical_workspace(workspace.path()).unwrap();
+        let workspace_id = paths::workspace_id(&workspace_root).unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server_workspace_id = workspace_id.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            answer_hello(&mut reader, &mut writer, server_workspace_id);
+            let sessions = read_request(&mut reader);
+            write_response(
+                &mut writer,
+                sessions.id,
+                "sessions.list",
+                json!({"sessions": []}),
+            );
+        });
+        let child = Command::new("/bin/sh")
+            .args(["-c", "sleep 0.1"])
+            .spawn()
+            .unwrap();
+        let child_id = child.id();
+        let mut lifecycle = DesktopLifecycle {
+            workspace_root: Some(workspace_root.clone()),
+            spawned_daemon: Some(SpawnedDaemon {
+                workspace_id,
+                child,
+            }),
+        };
+
+        let view = attach_or_spawn_workspace(
+            &workspace_root,
+            Some(socket_path),
+            &mut lifecycle,
+            &DaemonLaunch::default(),
+        )
+        .unwrap();
+
+        assert!(matches!(view, BootstrapView::Ready { .. }));
+        assert!(lifecycle.spawned_daemon.is_none());
+        server.join().unwrap();
+        wait_for_process_gone(child_id);
+    }
+
+    #[test]
+    fn workspace_switch_hands_the_previous_child_to_a_reaper() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first = canonical_workspace(first.path()).unwrap();
+        let second = canonical_workspace(second.path()).unwrap();
+        let child = Command::new("/bin/sh")
+            .args(["-c", "sleep 0.1"])
+            .spawn()
+            .unwrap();
+        let child_id = child.id();
+        let mut lifecycle = DesktopLifecycle {
+            workspace_root: Some(first.clone()),
+            spawned_daemon: Some(SpawnedDaemon {
+                workspace_id: paths::workspace_id(&first).unwrap(),
+                child,
+            }),
+        };
+
+        let prepared = lifecycle.prepare_workspace(&second).unwrap();
+        lifecycle.commit_workspace(prepared);
+
+        assert_eq!(lifecycle.workspace_root.as_deref(), Some(second.as_path()));
+        assert!(lifecycle.spawned_daemon.is_none());
+        wait_for_process_gone(child_id);
+    }
+
+    #[test]
+    fn timed_out_sidecar_is_reaped_without_another_bootstrap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_root = canonical_workspace(workspace.path()).unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let pid_file = socket_dir.path().join("sidecar.pid");
+        let sidecar = socket_dir.path().join("slow-sidecar");
+        fs::write(
+            &sidecar,
+            format!(
+                "#!/bin/sh\nprintf '%s' $$ > '{}'\nsleep 4\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&sidecar).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&sidecar, permissions).unwrap();
+        let mut lifecycle = DesktopLifecycle::default();
+
+        let error = attach_or_spawn_workspace(
+            &workspace_root,
+            Some(socket_path),
+            &mut lifecycle,
+            &DaemonLaunch {
+                executable: Some(sidecar),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "daemon_start_failed");
+        assert!(lifecycle.spawned_daemon.is_none());
+        let pid = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        wait_for_process_gone(pid);
+    }
+
+    #[test]
+    fn missing_packaged_sidecar_fails_closed_with_runtime_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let missing = socket_dir.path().join("missing-plato-agentd");
+        let launch = DaemonLaunch {
+            executable: Some(missing.clone()),
+        };
+
+        let error = attach_or_spawn_workspace(
+            workspace.path(),
+            Some(socket_path.clone()),
+            &mut DesktopLifecycle::default(),
+            &launch,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "daemon_start_failed");
+        assert!(error.message.contains(missing.to_string_lossy().as_ref()));
+        assert!(
+            error
+                .message
+                .contains(socket_path.to_string_lossy().as_ref())
+        );
+        let lock = paths::default_lock_path(workspace.path()).unwrap();
+        assert!(error.message.contains(lock.to_string_lossy().as_ref()));
+        assert!(!socket_path.exists());
+        assert!(!lock.exists());
     }
 
     #[test]
@@ -1986,6 +2310,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("agent.sock");
+        let launch = DaemonLaunch {
+            executable: Some(socket_dir.path().join("must-not-start")),
+        };
         let listener = UnixListener::bind(&socket_path).unwrap();
         let workspace_id = paths::workspace_id(workspace.path()).unwrap();
         let capabilities = REQUIRED_CAPABILITIES
@@ -2011,7 +2338,13 @@ mod tests {
             );
         });
 
-        let error = connect_workspace(workspace.path(), Some(socket_path)).unwrap_err();
+        let error = attach_or_spawn_workspace(
+            workspace.path(),
+            Some(socket_path),
+            &mut DesktopLifecycle::default(),
+            &launch,
+        )
+        .unwrap_err();
         handle.join().unwrap();
 
         assert_eq!(
@@ -2820,6 +3153,20 @@ mod tests {
         let envelope: Envelope = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(envelope.kind, EnvelopeKind::Request);
         envelope
+    }
+
+    fn wait_for_process_gone(pid: u32) {
+        let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match rustix::process::test_kill_process(pid) {
+                Err(rustix::io::Errno::SRCH) => return,
+                Ok(()) | Err(rustix::io::Errno::PERM) => {}
+                Err(error) => panic!("cannot inspect child process: {error}"),
+            }
+            assert!(Instant::now() < deadline, "child process was not reaped");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn write_response(writer: &mut UnixStream, id: Option<String>, method: &str, result: Value) {
