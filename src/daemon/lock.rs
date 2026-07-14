@@ -1,7 +1,9 @@
 use crate::{AppError, AppResult, paths};
 use serde::{Deserialize, Serialize};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
 };
@@ -81,7 +83,7 @@ impl WorkspaceLock {
             }));
         }
 
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut file = match create_lock_file(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 return Err(Box::new(read_conflict(path)));
@@ -98,6 +100,7 @@ impl WorkspaceLock {
         if let Err(error) = serde_json::to_writer(&mut file, &metadata)
             .and_then(|()| file.write_all(b"\n").map_err(serde_json::Error::io))
         {
+            drop(file);
             let _ = fs::remove_file(&path);
             return Err(Box::new(LockConflict {
                 path,
@@ -114,6 +117,16 @@ impl WorkspaceLock {
         let metadata = LockMetadata::for_workspace(workspace_root, socket_path)?;
         Self::acquire(lock_path, metadata).map_err(|conflict| lock_conflict_error(*conflict))
     }
+}
+
+#[cfg(not(windows))]
+fn create_lock_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+#[cfg(windows)]
+fn create_lock_file(path: &Path) -> std::io::Result<File> {
+    crate::windows_security::create_current_user_file(path)
 }
 
 impl Drop for WorkspaceLock {

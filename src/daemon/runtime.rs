@@ -8,7 +8,7 @@ use crate::{
 };
 use platonic_core::RecordedEvent;
 use serde_json::{Value, json};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::sync::Barrier;
 use std::{
     collections::{HashMap, VecDeque},
@@ -26,7 +26,7 @@ pub(super) struct DaemonRuntime {
     pub(super) paths: DaemonPaths,
     pub(super) state: Arc<Mutex<RuntimeState>>,
     pub(super) stop_requested: Arc<AtomicBool>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     shutdown_flush_barrier: Arc<Mutex<Option<Arc<Barrier>>>>,
 }
 
@@ -55,7 +55,7 @@ impl DaemonRuntime {
             paths,
             state: Arc::new(Mutex::new(RuntimeState::default())),
             stop_requested: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             shutdown_flush_barrier: Arc::new(Mutex::new(None)),
         }
     }
@@ -107,12 +107,12 @@ impl DaemonRuntime {
             .shutdown_accepted
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn set_shutdown_flush_barrier(&self, barrier: Arc<Barrier>) {
         *self.shutdown_flush_barrier.lock().unwrap() = Some(barrier);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn wait_after_shutdown_flush(&self) {
         let barrier = self.shutdown_flush_barrier.lock().unwrap().clone();
         if let Some(barrier) = barrier {

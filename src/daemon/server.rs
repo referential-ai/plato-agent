@@ -1,13 +1,10 @@
 use crate::{
     AppResult,
-    daemon::{handlers::handle_line, lock::WorkspaceLock, runtime::DaemonRuntime},
+    daemon::{handlers::handle_line, lock::WorkspaceLock, runtime::DaemonRuntime, transport},
     paths,
 };
 use std::{
-    fs::{self, DirBuilder, Permissions},
-    io::{BufRead, BufReader, Error, ErrorKind, Write},
-    os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
-    os::unix::net::{UnixListener, UnixStream},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -16,7 +13,18 @@ use std::{
     thread,
 };
 
+#[cfg(windows)]
+use std::fs;
+#[cfg(unix)]
+use std::{
+    fs::{self, DirBuilder, Permissions},
+    io::{Error, ErrorKind},
+    os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
+};
+
+#[cfg(unix)]
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(unix)]
 const SOCKET_MODE: u32 = 0o600;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,7 +53,7 @@ impl DaemonPaths {
 
 #[derive(Debug)]
 pub struct DaemonServer {
-    listener: UnixListener,
+    listener: transport::Listener,
     runtime: DaemonRuntime,
     _lock: WorkspaceLock,
 }
@@ -63,16 +71,28 @@ impl DaemonServer {
     }
 
     fn bind_inner(workspace_root: &Path, socket_path: Option<PathBuf>) -> AppResult<Self> {
-        let runtime_home = paths::runtime_home()?;
         let paths = DaemonPaths::resolve(workspace_root, socket_path)?;
-        prepare_runtime_path(&runtime_home, &paths.lock_path)?;
-        prepare_socket_parent(&runtime_home, &paths.socket_path)?;
+        #[cfg(unix)]
+        {
+            let runtime_home = paths::runtime_home()?;
+            prepare_runtime_path(&runtime_home, &paths.lock_path)?;
+            prepare_socket_parent(&runtime_home, &paths.socket_path)?;
+        }
+        #[cfg(windows)]
+        fs::create_dir_all(
+            paths
+                .lock_path
+                .parent()
+                .expect("default Windows lock path has a parent"),
+        )?;
         let lock = WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)?;
         crate::ledger::interrupt_orphaned_sqlite_runs(&paths.ledger_path)?;
+        #[cfg(unix)]
         if paths.socket_path.exists() {
             fs::remove_file(&paths.socket_path)?;
         }
-        let listener = UnixListener::bind(&paths.socket_path)?;
+        let listener = transport::bind(&paths.socket_path)?;
+        #[cfg(unix)]
         if let Err(error) = restrict_socket(&paths.socket_path) {
             drop(listener);
             let _ = fs::remove_file(&paths.socket_path);
@@ -91,12 +111,12 @@ impl DaemonServer {
     }
 
     pub fn serve_forever(&self, shutdown: Arc<AtomicBool>) -> AppResult<()> {
-        for stream in self.listener.incoming() {
+        loop {
+            let stream = transport::accept(&self.listener)?;
             if shutdown.load(Ordering::SeqCst) || self.runtime.stop_requested.load(Ordering::SeqCst)
             {
                 break;
             }
-            let stream = stream?;
             let runtime = self.runtime.clone();
             thread::spawn(move || {
                 if let Err(error) = handle_stream(runtime, stream) {
@@ -108,16 +128,17 @@ impl DaemonServer {
     }
 
     pub fn serve_next(&self) -> AppResult<()> {
-        let (stream, _) = self.listener.accept()?;
+        let stream = transport::accept(&self.listener)?;
         handle_stream(self.runtime.clone(), stream)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn handle_line(&self, line: &str) -> crate::daemon::protocol::Envelope {
         handle_line(&self.runtime, line)
     }
 }
 
+#[cfg(unix)]
 fn prepare_runtime_path(runtime_home: &Path, path: &Path) -> std::io::Result<()> {
     let parent = path
         .parent()
@@ -125,6 +146,7 @@ fn prepare_runtime_path(runtime_home: &Path, path: &Path) -> std::io::Result<()>
     prepare_private_directory(parent, Some(runtime_home))
 }
 
+#[cfg(unix)]
 fn prepare_socket_parent(runtime_home: &Path, socket_path: &Path) -> std::io::Result<()> {
     let parent = socket_path
         .parent()
@@ -133,6 +155,7 @@ fn prepare_socket_parent(runtime_home: &Path, socket_path: &Path) -> std::io::Re
     prepare_private_directory(parent, root)
 }
 
+#[cfg(unix)]
 fn prepare_private_directory(parent: &Path, root: Option<&Path>) -> std::io::Result<()> {
     if root.is_some_and(|root| !parent.starts_with(root)) {
         return Err(Error::new(
@@ -158,6 +181,7 @@ fn prepare_private_directory(parent: &Path, root: Option<&Path>) -> std::io::Res
     Ok(())
 }
 
+#[cfg(unix)]
 fn restrict_private_directory(path: &Path) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
@@ -173,6 +197,7 @@ fn restrict_private_directory(path: &Path) -> std::io::Result<()> {
     verify_mode(path, PRIVATE_DIRECTORY_MODE)
 }
 
+#[cfg(unix)]
 fn restrict_socket(path: &Path) -> std::io::Result<()> {
     fs::set_permissions(path, Permissions::from_mode(SOCKET_MODE))?;
     let metadata = fs::symlink_metadata(path)?;
@@ -185,6 +210,7 @@ fn restrict_socket(path: &Path) -> std::io::Result<()> {
     verify_mode(path, SOCKET_MODE)
 }
 
+#[cfg(unix)]
 fn verify_mode(path: &Path, expected: u32) -> std::io::Result<()> {
     let actual = fs::symlink_metadata(path)?.permissions().mode() & 0o777;
     if actual == expected {
@@ -199,8 +225,8 @@ fn verify_mode(path: &Path, expected: u32) -> std::io::Result<()> {
     ))
 }
 
-fn handle_stream(runtime: DaemonRuntime, stream: UnixStream) -> AppResult<()> {
-    let mut writer = stream.try_clone()?;
+fn handle_stream(runtime: DaemonRuntime, stream: transport::Stream) -> AppResult<()> {
+    let mut writer = transport::try_clone(&stream)?;
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let line = line?;
@@ -223,10 +249,10 @@ fn handle_stream(runtime: DaemonRuntime, stream: UnixStream) -> AppResult<()> {
             Ok(())
         })();
         if stop_after_response {
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             runtime.wait_after_shutdown_flush();
             runtime.stop_requested.store(true, Ordering::SeqCst);
-            let _ = UnixStream::connect(&runtime.paths.socket_path);
+            transport::wake(&runtime.paths.socket_path);
             return write_result;
         }
         write_result?;
@@ -236,11 +262,12 @@ fn handle_stream(runtime: DaemonRuntime, stream: UnixStream) -> AppResult<()> {
 
 impl Drop for DaemonServer {
     fn drop(&mut self) {
+        #[cfg(unix)]
         let _ = fs::remove_file(&self.runtime.paths.socket_path);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::{
@@ -267,6 +294,7 @@ mod tests {
         io::{BufRead, Read},
         net::TcpListener,
         os::unix::fs::PermissionsExt,
+        os::unix::net::UnixStream,
         sync::{Arc, Barrier, mpsc},
         thread,
         time::{Duration, Instant},

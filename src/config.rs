@@ -275,11 +275,13 @@ pub fn resolve_config_path(
     workspace_root: &Path,
     explicit_path: Option<&Path>,
 ) -> AppResult<Option<PathBuf>> {
+    let home = user_home();
     resolve_config_path_with(
         workspace_root,
         explicit_path.map(Path::to_path_buf),
         std::env::var_os(PLATO_CONFIG_ENV).map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
+        home.clone(),
+        user_config_path(home.as_deref()),
     )
 }
 
@@ -288,6 +290,7 @@ fn resolve_config_path_with(
     explicit_path: Option<PathBuf>,
     env_path: Option<PathBuf>,
     home: Option<PathBuf>,
+    user_config: Option<PathBuf>,
 ) -> AppResult<Option<PathBuf>> {
     if let Some(path) = explicit_path {
         return resolve_explicit_config_path(workspace_root, path, home.as_deref()).map(Some);
@@ -301,14 +304,38 @@ fn resolve_config_path_with(
         return Ok(Some(workspace_config));
     }
 
-    if let Some(home) = home {
-        let user_config = home.join(".config").join("plato").join("config.toml");
-        if user_config.exists() {
-            return Ok(Some(user_config));
-        }
+    if let Some(user_config) = user_config
+        && user_config.exists()
+    {
+        return Ok(Some(user_config));
     }
 
     Ok(None)
+}
+
+#[cfg(unix)]
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(windows)]
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(unix)]
+fn user_config_path(home: Option<&Path>) -> Option<PathBuf> {
+    home.map(|home| home.join(".config").join("plato").join("config.toml"))
+}
+
+#[cfg(windows)]
+fn user_config_path(_home: Option<&Path>) -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(|root| root.join("plato").join("config.toml"))
 }
 
 fn resolve_explicit_config_path(
@@ -331,14 +358,24 @@ fn expand_leading_tilde(path: PathBuf, home: Option<&Path>) -> AppResult<PathBuf
     if raw == "~" {
         return home
             .map(Path::to_path_buf)
-            .ok_or_else(|| AppError::Config("HOME is required for ~ expansion".into()));
+            .ok_or_else(|| AppError::Config("user home is required for ~ expansion".into()));
     }
-    if let Some(rest) = raw.strip_prefix("~/") {
+    if let Some(rest) = leading_tilde_rest(raw) {
         let home =
-            home.ok_or_else(|| AppError::Config("HOME is required for ~ expansion".into()))?;
+            home.ok_or_else(|| AppError::Config("user home is required for ~ expansion".into()))?;
         return Ok(home.join(rest));
     }
     Ok(path)
+}
+
+#[cfg(unix)]
+fn leading_tilde_rest(path: &str) -> Option<&str> {
+    path.strip_prefix("~/")
+}
+
+#[cfg(windows)]
+fn leading_tilde_rest(path: &str) -> Option<&str> {
+    path.strip_prefix("~/").or(path.strip_prefix(r"~\"))
 }
 
 #[cfg(test)]
@@ -507,6 +544,7 @@ owner_user_ids = [123456789]
             Some(explicit.clone()),
             Some(PathBuf::from("env.toml")),
             Some(home.path().to_path_buf()),
+            None,
         )
         .unwrap();
 
@@ -525,6 +563,7 @@ owner_user_ids = [123456789]
             None,
             Some(env_path.clone()),
             Some(home.path().to_path_buf()),
+            None,
         )
         .unwrap();
 
@@ -538,9 +577,14 @@ owner_user_ids = [123456789]
         let workspace_config = dir.path().join("plato.toml");
         std::fs::write(&workspace_config, "").unwrap();
 
-        let path =
-            resolve_config_path_with(dir.path(), None, None, Some(home.path().to_path_buf()))
-                .unwrap();
+        let path = resolve_config_path_with(
+            dir.path(),
+            None,
+            None,
+            Some(home.path().to_path_buf()),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(path, Some(workspace_config));
     }
@@ -557,9 +601,14 @@ owner_user_ids = [123456789]
         std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
         std::fs::write(&user_config, "").unwrap();
 
-        let path =
-            resolve_config_path_with(dir.path(), None, None, Some(home.path().to_path_buf()))
-                .unwrap();
+        let path = resolve_config_path_with(
+            dir.path(),
+            None,
+            None,
+            Some(home.path().to_path_buf()),
+            Some(user_config.clone()),
+        )
+        .unwrap();
 
         assert_eq!(path, Some(user_config));
     }
@@ -569,9 +618,19 @@ owner_user_ids = [123456789]
         let dir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
 
-        let path =
-            resolve_config_path_with(dir.path(), None, None, Some(home.path().to_path_buf()))
-                .unwrap();
+        let path = resolve_config_path_with(
+            dir.path(),
+            None,
+            None,
+            Some(home.path().to_path_buf()),
+            Some(
+                home.path()
+                    .join(".config")
+                    .join("plato")
+                    .join("config.toml"),
+            ),
+        )
+        .unwrap();
 
         assert_eq!(path, None);
     }
@@ -586,6 +645,7 @@ owner_user_ids = [123456789]
             Some(PathBuf::from("~/plato.toml")),
             None,
             Some(home.path().to_path_buf()),
+            None,
         )
         .unwrap();
 
@@ -602,12 +662,47 @@ owner_user_ids = [123456789]
             Some(PathBuf::from("config/plato.toml")),
             None,
             Some(home.path().to_path_buf()),
+            None,
         )
         .unwrap();
 
         assert_eq!(
             path,
             Some(workspace.path().join("config").join("plato.toml"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_uses_roaming_app_data_and_user_profile() {
+        let workspace = tempfile::tempdir().unwrap();
+        let roaming = tempfile::tempdir().unwrap();
+        let profile = tempfile::tempdir().unwrap();
+        let user_config = roaming.path().join("plato").join("config.toml");
+        std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        std::fs::write(&user_config, "").unwrap();
+
+        temp_env::with_vars(
+            [
+                (PLATO_CONFIG_ENV, None),
+                ("APPDATA", Some(roaming.path().as_os_str())),
+                ("USERPROFILE", Some(profile.path().as_os_str())),
+            ],
+            || {
+                assert_eq!(
+                    resolve_config_path(workspace.path(), None).unwrap(),
+                    Some(user_config)
+                );
+                assert_eq!(
+                    resolve_config_path(workspace.path(), Some(Path::new("~/plato.toml"))).unwrap(),
+                    Some(profile.path().join("plato.toml"))
+                );
+                assert_eq!(
+                    resolve_config_path(workspace.path(), Some(Path::new(r"~\plato.toml")))
+                        .unwrap(),
+                    Some(profile.path().join("plato.toml"))
+                );
+            },
         );
     }
 }

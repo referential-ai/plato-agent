@@ -5,6 +5,7 @@ use plato_agent::{
         client::{DaemonClient, DaemonConnectionConfig},
         lock::ensure_workspace_unlocked,
         server::DaemonServer,
+        wake_listener,
     },
     ledger::latest_sqlite_session_id,
     new_session_id,
@@ -15,7 +16,6 @@ use plato_agent::{
 use platonic_core::RunId;
 use std::{
     io::{self, Write},
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -45,7 +45,7 @@ struct Cli {
         value_name = "PATH",
         num_args = 0..=1,
         require_equals = true,
-        help = "Use SQLite ledger; bare --db uses the default XDG state path"
+        help = "Use SQLite ledger; bare --db uses the platform user-state path"
     )]
     db: Option<Option<PathBuf>>,
 
@@ -236,7 +236,7 @@ struct EmbeddedDaemon {
 impl Drop for EmbeddedDaemon {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        let _ = UnixStream::connect(&self.socket_path);
+        wake_listener(&self.socket_path);
         if let Some(handle) = self.handle.take() {
             let deadline = Instant::now() + EMBEDDED_DAEMON_SHUTDOWN_TIMEOUT;
             while !handle.is_finished() && Instant::now() < deadline {
@@ -375,6 +375,7 @@ fn write_sqlite_replay_hint(
     Ok(())
 }
 
+#[cfg(unix)]
 fn shell_quote(value: &str) -> String {
     if value
         .chars()
@@ -383,6 +384,18 @@ fn shell_quote(value: &str) -> String {
         value.into()
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(windows)]
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || r"_./:\-".contains(character))
+    {
+        value.into()
+    } else {
+        format!("\"{}\"", value.replace('"', "\"\""))
     }
 }
 
@@ -403,9 +416,16 @@ mod tests {
         write_run_success_output(&mut stdout, &mut stderr, &outcome, &ledger).unwrap();
 
         assert_eq!(String::from_utf8(stdout).unwrap(), "done\n");
+        let stderr = String::from_utf8(stderr).unwrap();
+        #[cfg(unix)]
         assert_eq!(
-            String::from_utf8(stderr).unwrap(),
+            stderr,
             "run_id: run_1\nledger_path: /tmp/plato proof/agent.db\nreplay: plato replay --db='/tmp/plato proof/agent.db' --run run_1\n"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            stderr,
+            "run_id: run_1\nledger_path: /tmp/plato proof/agent.db\nreplay: plato replay --db=\"/tmp/plato proof/agent.db\" --run run_1\n"
         );
     }
 
@@ -652,14 +672,22 @@ mod tests {
     }
 
     fn with_test_xdg<T>(root: &Path, run: impl FnOnce() -> T) -> T {
-        let state_home = root.join("xdg-state");
-        let runtime_home = root.join("xdg-runtime");
-        temp_env::with_vars(
-            [
-                ("XDG_STATE_HOME", Some(state_home.as_os_str())),
-                ("XDG_RUNTIME_DIR", Some(runtime_home.as_os_str())),
-            ],
-            run,
-        )
+        #[cfg(unix)]
+        {
+            let state_home = root.join("xdg-state");
+            let runtime_home = root.join("xdg-runtime");
+            temp_env::with_vars(
+                [
+                    ("XDG_STATE_HOME", Some(state_home.as_os_str())),
+                    ("XDG_RUNTIME_DIR", Some(runtime_home.as_os_str())),
+                ],
+                run,
+            )
+        }
+        #[cfg(windows)]
+        {
+            let local_app_data = root.join("local-app-data");
+            temp_env::with_var("LOCALAPPDATA", Some(local_app_data.as_os_str()), run)
+        }
     }
 }

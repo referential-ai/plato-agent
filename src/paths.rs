@@ -10,12 +10,21 @@ pub fn default_sqlite_path(workspace_root: &Path) -> AppResult<PathBuf> {
         .join("agent.db"))
 }
 
+#[cfg(unix)]
 pub fn default_socket_path(workspace_root: &Path) -> AppResult<PathBuf> {
     Ok(runtime_home()?
         .join("plato-agent")
         .join("workspaces")
         .join(workspace_id(workspace_root)?)
         .join("agent.sock"))
+}
+
+#[cfg(windows)]
+pub fn default_socket_path(workspace_root: &Path) -> AppResult<PathBuf> {
+    Ok(PathBuf::from(format!(
+        r"\\.\pipe\plato-agent-{}",
+        workspace_id(workspace_root)?
+    )))
 }
 
 pub fn default_lock_path(workspace_root: &Path) -> AppResult<PathBuf> {
@@ -36,7 +45,10 @@ fn workspace_id_from_canonical_path(path: &Path) -> String {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("workspace");
-    format!("{}-{}", slug(basename), hash16(path))
+    let slug = slug(basename);
+    #[cfg(windows)]
+    let slug: String = slug.chars().take(64).collect();
+    format!("{slug}-{}", hash16(path))
 }
 
 fn slug(value: &str) -> String {
@@ -75,11 +87,17 @@ fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_bytes()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn path_bytes(path: &Path) -> Vec<u8> {
-    path.as_os_str().to_string_lossy().as_bytes().to_vec()
+    use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
 }
 
+#[cfg(unix)]
 fn state_home() -> AppResult<PathBuf> {
     if let Some(value) = std::env::var_os("XDG_STATE_HOME")
         && !value.is_empty()
@@ -91,6 +109,12 @@ fn state_home() -> AppResult<PathBuf> {
     Ok(PathBuf::from(home).join(".local").join("state"))
 }
 
+#[cfg(windows)]
+fn state_home() -> AppResult<PathBuf> {
+    local_app_data("default --db path")
+}
+
+#[cfg(unix)]
 pub(crate) fn runtime_home() -> AppResult<PathBuf> {
     if let Some(value) = std::env::var_os("XDG_RUNTIME_DIR")
         && !value.is_empty()
@@ -101,17 +125,38 @@ pub(crate) fn runtime_home() -> AppResult<PathBuf> {
     Ok(std::env::temp_dir().join("plato-agent").join(user))
 }
 
+#[cfg(windows)]
+pub(crate) fn runtime_home() -> AppResult<PathBuf> {
+    local_app_data("default daemon runtime path")
+}
+
+#[cfg(windows)]
+fn local_app_data(purpose: &str) -> AppResult<PathBuf> {
+    let value = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Config(format!("LOCALAPPDATA is required for {purpose}")))?;
+    Ok(PathBuf::from(value))
+}
+
 #[cfg(test)]
 pub(crate) fn with_test_xdg<T>(root: &Path, run: impl FnOnce() -> T) -> T {
-    let state_home = root.join("xdg-state");
-    let runtime_home = root.join("xdg-runtime");
-    temp_env::with_vars(
-        [
-            ("XDG_STATE_HOME", Some(state_home.as_os_str())),
-            ("XDG_RUNTIME_DIR", Some(runtime_home.as_os_str())),
-        ],
-        run,
-    )
+    #[cfg(unix)]
+    {
+        let state_home = root.join("xdg-state");
+        let runtime_home = root.join("xdg-runtime");
+        temp_env::with_vars(
+            [
+                ("XDG_STATE_HOME", Some(state_home.as_os_str())),
+                ("XDG_RUNTIME_DIR", Some(runtime_home.as_os_str())),
+            ],
+            run,
+        )
+    }
+    #[cfg(windows)]
+    {
+        let local_app_data = root.join("local-app-data");
+        temp_env::with_var("LOCALAPPDATA", Some(local_app_data.as_os_str()), run)
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +189,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn default_socket_and_lock_paths_use_workspace_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -164,6 +210,65 @@ mod tests {
             assert_eq!(socket_path.file_name().unwrap(), "agent.sock");
             assert_eq!(lock_path.file_name().unwrap(), "agent.lock");
             assert_eq!(socket_path.parent(), lock_path.parent());
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_use_local_app_data_and_workspace_pipe() {
+        let workspace = tempfile::tempdir().unwrap();
+        let local_app_data = tempfile::tempdir().unwrap();
+        temp_env::with_var(
+            "LOCALAPPDATA",
+            Some(local_app_data.path().as_os_str()),
+            || {
+                let workspace_id = workspace_id(workspace.path()).unwrap();
+                let workspace_dir = local_app_data
+                    .path()
+                    .join("plato-agent")
+                    .join("workspaces")
+                    .join(&workspace_id);
+
+                assert_eq!(
+                    default_socket_path(workspace.path()).unwrap(),
+                    PathBuf::from(format!(r"\\.\pipe\plato-agent-{workspace_id}"))
+                );
+                assert_eq!(
+                    default_lock_path(workspace.path()).unwrap(),
+                    workspace_dir.join("agent.lock")
+                );
+                assert_eq!(
+                    default_sqlite_path(workspace.path()).unwrap(),
+                    workspace_dir.join("agent.db")
+                );
+            },
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_endpoint_is_bounded_for_long_workspace_names() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace-".repeat(20));
+        std::fs::create_dir(&workspace).unwrap();
+
+        let endpoint = default_socket_path(&workspace).unwrap();
+        let endpoint = endpoint.to_string_lossy();
+        let workspace_id = workspace_id(&workspace).unwrap();
+
+        assert_eq!(endpoint, format!(r"\\.\pipe\plato-agent-{workspace_id}"));
+        assert!(endpoint.encode_utf16().count() <= 102);
+        assert!(workspace_id.len() <= 81);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_require_local_app_data() {
+        let workspace = tempfile::tempdir().unwrap();
+        temp_env::with_var_unset("LOCALAPPDATA", || {
+            let error = default_lock_path(workspace.path()).unwrap_err();
+
+            assert!(error.to_string().contains("LOCALAPPDATA"));
         });
     }
 }
