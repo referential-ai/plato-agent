@@ -212,9 +212,11 @@ impl DaemonClient {
 
         let mut line = String::new();
         if self.reader.read_line(&mut line)? == 0 {
-            return Err(AppError::DaemonProtocol(
-                "daemon connection closed before response".into(),
-            ));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "daemon connection closed before response",
+            )
+            .into());
         }
         let response = serde_json::from_str::<Envelope>(line.trim())?;
         if response.v != PROTOCOL_VERSION {
@@ -424,6 +426,30 @@ mod tests {
             error,
             AppError::DaemonResponse(ProtocolError { code, message })
                 if code == "not_found" && message == "missing"
+        ));
+    }
+
+    #[test]
+    fn client_maps_eof_before_response_to_unexpected_eof_io() {
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let request = read_request(&mut reader);
+            assert_eq!(request.method.as_deref(), Some("sessions.list"));
+        });
+
+        let mut client = DaemonClient::connect(&socket_path).unwrap();
+        let error = client.sessions_list().unwrap_err();
+        handle.join().unwrap();
+
+        assert!(matches!(
+            error,
+            AppError::Io(error)
+                if error.kind() == std::io::ErrorKind::UnexpectedEof
+                    && error.to_string() == "daemon connection closed before response"
         ));
     }
 

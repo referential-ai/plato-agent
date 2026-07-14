@@ -187,10 +187,12 @@ block until the run finishes.
 
 ## Desktop (Development)
 
-The desktop shell attaches to an existing workspace daemon. It renders full
-typed session history, streams the selected run, and supports new or continued
-messages, approval decisions, and cancel. Provider credentials remain with the
-daemon.
+The desktop shell renders full typed session history, streams the selected run,
+and supports new or continued messages, approval decisions, and cancel.
+Provider credentials remain with the daemon. Linux development attaches to a
+manually started daemon. On Windows, the shell first attaches to a valid daemon
+for the selected workspace; when none is listening, it starts the absolute
+sibling `plato-agentd.exe` sidecar and retries for a bounded interval.
 
 ![Plato desktop showing an exact-run transcript](docs/images/desktop-phase-1.png)
 
@@ -205,9 +207,15 @@ npm run tauri:dev
 ```
 
 On first launch, choose the daemon workspace. The shell remembers its canonical
-path and returns to the picker if that directory disappears. **New chat** clears
+path as the next-launch seed and returns to the picker if that directory
+disappears; each running shell keeps its own selected root. **New chat** clears
 the selected session; otherwise the composer continues it. Switching chats does
-not cancel their active runs. Linux development requires the
+not cancel their active runs. Closing the Windows shell never stops a daemon or
+run. The ready shell checks daemon health without restarting it; a child crash
+shows the disconnected screen, and only **Reconnect** attempts one new start.
+The shell never removes a daemon lock, and reports the endpoint and lock paths
+when startup remains blocked. Only one Windows shell may own a workspace at a
+time. Linux development requires the
 [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/#linux).
 
 ## Discord Gateway

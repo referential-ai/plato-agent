@@ -41,7 +41,7 @@
 	type Screen =
 		| { state: 'loading' }
 		| { state: 'needs_workspace'; reason: string | null }
-		| { state: 'unavailable'; message: string }
+		| { state: 'unavailable'; code: string; message: string }
 		| { state: 'ready'; data: ReadyBootstrap };
 
 	let screen = $state<Screen>({ state: 'loading' });
@@ -64,6 +64,7 @@
 	let selectionGeneration = 0;
 	let submissionGeneration = 0;
 	let pollTimer: ReturnType<typeof setTimeout> | null = null;
+	let daemonTimer: ReturnType<typeof setTimeout> | null = null;
 
 	const workspaceName = $derived(
 		screen.state === 'ready'
@@ -107,6 +108,7 @@
 	onDestroy(() => {
 		workspaceGeneration += 1;
 		pickerGeneration += 1;
+		clearDaemonCheck();
 		invalidateSelection();
 	});
 
@@ -131,6 +133,22 @@
 		return status === 'running' || status === 'cancel_requested';
 	}
 
+	function showUnavailable(failure: DesktopError): void {
+		workspaceGeneration += 1;
+		clearDaemonCheck();
+		invalidateSelection();
+		resetChat();
+		screen = { state: 'unavailable', code: failure.code, message: failure.message };
+	}
+
+	function leaveReadyOnFailure(failure: DesktopError): boolean {
+		if (failure.code !== 'daemon_unavailable' && failure.code !== 'desktop_already_open') {
+			return false;
+		}
+		showUnavailable(failure);
+		return true;
+	}
+
 	function isCurrent(workspace: number, selection: number, runId?: string): boolean {
 		return (
 			workspace === workspaceGeneration &&
@@ -142,6 +160,11 @@
 	function clearPoll(): void {
 		if (pollTimer !== null) clearTimeout(pollTimer);
 		pollTimer = null;
+	}
+
+	function clearDaemonCheck(): void {
+		if (daemonTimer !== null) clearTimeout(daemonTimer);
+		daemonTimer = null;
 	}
 
 	function invalidateSelection(): number {
@@ -180,6 +203,7 @@
 	function initializeReady(result: ReadyBootstrap): void {
 		resetChat();
 		screen = { state: 'ready', data: result };
+		scheduleDaemonCheck(workspaceGeneration, 1_000);
 		const initialRunId = result.selectedRun?.runId;
 		const initial =
 			result.sessions.find((session) => session.runId === initialRunId) ?? result.sessions[0];
@@ -188,6 +212,7 @@
 
 	async function loadBootstrap(): Promise<void> {
 		const generation = ++workspaceGeneration;
+		clearDaemonCheck();
 		invalidateSelection();
 		resetChat();
 		screen = { state: 'loading' };
@@ -201,28 +226,33 @@
 			initializeReady(result);
 		} catch (error) {
 			if (generation === workspaceGeneration) {
-				screen = { state: 'unavailable', message: asDesktopError(error).message };
+				showUnavailable(asDesktopError(error));
 			}
 		}
 	}
 
 	async function chooseWorkspace(): Promise<void> {
 		const picker = ++pickerGeneration;
+		workspaceGeneration += 1;
+		clearDaemonCheck();
+		invalidateSelection();
+		resetChat();
+		screen = { state: 'loading' };
 		selectingWorkspace = true;
 		try {
 			const result = await pickWorkspace();
-			if (result && picker === pickerGeneration) {
-				workspaceGeneration += 1;
-				invalidateSelection();
-				resetChat();
-				if (result.state === 'ready') initializeReady(result);
-				else screen = result;
+			if (picker !== pickerGeneration) return;
+			if (!result) {
+				await loadBootstrap();
+				return;
 			}
+			if (result.state === 'ready') initializeReady(result);
+			else screen = result;
 		} catch (error) {
 			if (picker === pickerGeneration) {
-				const message = asDesktopError(error).message;
-				if (screen.state === 'ready') setActionError(message);
-				else screen = { state: 'unavailable', message };
+				const failure = asDesktopError(error);
+				if (leaveReadyOnFailure(failure)) return;
+				showUnavailable(failure);
 			}
 		} finally {
 			if (picker === pickerGeneration) selectingWorkspace = false;
@@ -254,7 +284,10 @@
 				await recoverWithRetry(latest.runId, workspace, selection);
 			}
 		} catch (error) {
-			if (isCurrent(workspace, selection)) setActionError(asDesktopError(error).message);
+			if (isCurrent(workspace, selection)) {
+				const failure = asDesktopError(error);
+				if (!leaveReadyOnFailure(failure)) setActionError(failure.message);
+			}
 		} finally {
 			if (isCurrent(workspace, selection) && loadingSessionId === sessionId) {
 				loadingSessionId = null;
@@ -314,7 +347,8 @@
 				}
 			} catch (error) {
 				if (isCurrent(workspace, selection, result.runId)) {
-					setActionError(asDesktopError(error).message);
+					const failure = asDesktopError(error);
+					if (!leaveReadyOnFailure(failure)) setActionError(failure.message);
 				}
 			}
 
@@ -329,7 +363,8 @@
 				previousSelection === selectionGeneration &&
 				submitToken === submissionGeneration
 			) {
-				setActionError(asDesktopError(error).message);
+				const failure = asDesktopError(error);
+				if (!leaveReadyOnFailure(failure)) setActionError(failure.message);
 			}
 		} finally {
 			if (submitToken === submissionGeneration) submitting = false;
@@ -387,6 +422,7 @@
 		} catch (error) {
 			if (!isCurrent(workspace, selection, runId)) return;
 			const failure = asDesktopError(error);
+			if (leaveReadyOnFailure(failure)) return;
 			if (failure.code === 'lagged') {
 				await recoverWithRetry(runId, workspace, selection);
 				return;
@@ -478,7 +514,9 @@
 			await recoverAndPoll(runId, workspace, selection, clearRecoveredError);
 		} catch (error) {
 			if (!isCurrent(workspace, selection, runId)) return;
-			setActionError(asDesktopError(error).message);
+			const failure = asDesktopError(error);
+			if (leaveReadyOnFailure(failure)) return;
+			setActionError(failure.message);
 			scheduleRecovery(runId, workspace, selection, clearRecoveredError, 500);
 		}
 	}
@@ -527,7 +565,10 @@
 			const loaded = await readSession(sessionId);
 			if (isCurrent(workspace, selection) && selectedSessionId === sessionId) transcript = loaded;
 		} catch (error) {
-			if (isCurrent(workspace, selection)) setActionError(asDesktopError(error).message);
+			if (isCurrent(workspace, selection)) {
+				const failure = asDesktopError(error);
+				if (!leaveReadyOnFailure(failure)) setActionError(failure.message);
+			}
 		}
 	}
 
@@ -538,7 +579,34 @@
 				screen = { state: 'ready', data: { ...screen.data, sessions } };
 			}
 		} catch (error) {
-			if (isCurrent(workspace, selection)) setActionError(asDesktopError(error).message);
+			if (isCurrent(workspace, selection)) {
+				const failure = asDesktopError(error);
+				if (!leaveReadyOnFailure(failure)) setActionError(failure.message);
+			}
+		}
+	}
+
+	function scheduleDaemonCheck(workspace: number, delay: number): void {
+		clearDaemonCheck();
+		if (workspace !== workspaceGeneration || screen.state !== 'ready') return;
+		daemonTimer = setTimeout(() => {
+			daemonTimer = null;
+			void checkDaemon(workspace);
+		}, delay);
+	}
+
+	async function checkDaemon(workspace: number): Promise<void> {
+		if (workspace !== workspaceGeneration || screen.state !== 'ready') return;
+		try {
+			await listSessions();
+		} catch (error) {
+			if (workspace !== workspaceGeneration || screen.state !== 'ready') return;
+			const failure = asDesktopError(error);
+			if (leaveReadyOnFailure(failure)) return;
+			setActionError(failure.message);
+		}
+		if (workspace === workspaceGeneration && screen.state === 'ready') {
+			scheduleDaemonCheck(workspace, 1_000);
 		}
 	}
 
@@ -575,6 +643,7 @@
 		} catch (error) {
 			if (!isCurrent(workspace, selection, approval.runId)) return;
 			const failure = asDesktopError(error);
+			if (leaveReadyOnFailure(failure)) return;
 			if (failure.code === 'not_found') {
 				setActionError(failure.message, true);
 				await recoverWithRetry(approval.runId, workspace, selection, false);
@@ -600,7 +669,10 @@
 				updateSessionStatus(runId, liveRun.status);
 			}
 		} catch (error) {
-			if (isCurrent(workspace, selection, runId)) setActionError(asDesktopError(error).message);
+			if (isCurrent(workspace, selection, runId)) {
+				const failure = asDesktopError(error);
+				if (!leaveReadyOnFailure(failure)) setActionError(failure.message);
+			}
 		} finally {
 			if (isCurrent(workspace, selection, runId)) canceling = false;
 		}
@@ -656,7 +728,7 @@
 	{:else if screen.state === 'unavailable'}
 		<section class="center-state" role="alert">
 			<div class="offline-mark"></div>
-			<h1>Daemon unavailable</h1>
+			<h1>{screen.code === 'desktop_already_open' ? 'Workspace already open' : 'Daemon unavailable'}</h1>
 			<p class="state-detail">{screen.message}</p>
 			<div class="state-actions">
 				<Button onclick={loadBootstrap}><RefreshCw data-icon="inline-start" />Reconnect</Button>
