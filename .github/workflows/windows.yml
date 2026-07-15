@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Check out plato-agent
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Configure SSH for private platonic-core dependency
         env:
@@ -53,6 +55,33 @@ jobs:
           "@ | Set-Content -Encoding utf8 (Join-Path $ssh "config")
           icacls $ssh /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" | Out-Null
           icacls $key /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
+
+      - name: Fetch locked Rust dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo fetch --locked
+
+      - name: Remove private dependency credentials
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ssh = Join-Path $HOME ".ssh"
+          $paths = @(
+            (Join-Path $ssh "platonic_core_deploy_key"),
+            (Join-Path $ssh "config"),
+            (Join-Path $ssh "known_hosts")
+          )
+          Remove-Item -LiteralPath $paths -Force -ErrorAction SilentlyContinue
+          foreach ($path in $paths) {
+            if (Test-Path -LiteralPath $path) { throw "private dependency credential remains: $path" }
+          }
+          $extraHeaders = @(git config --local --get-regexp '^http\..*\.extraheader$' 2>$null)
+          $gitExit = $LASTEXITCODE
+          if ($gitExit -notin @(0, 1)) { throw "git credential check failed: $gitExit" }
+          if ($extraHeaders.Count -ne 0) { throw "checkout credentials remain" }
+          $global:LASTEXITCODE = 0
+          "CARGO_NET_OFFLINE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy
