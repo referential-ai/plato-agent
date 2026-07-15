@@ -2,9 +2,12 @@
 name = "plato-agent"
 version = "0.1.0"
 edition = "2024"
-publish = false
+publish = ["crates-io"]
 description = "Plato Agent runtime and CLI built on platonic-core."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/referential-ai/plato-agent"
+documentation = "https://docs.rs/plato-agent"
+readme = "README.md"
 
 [[bin]]
 name = "plato"
@@ -25,7 +28,7 @@ path = "src/bin/plato-gateway-discord.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28.1"
-platonic-core = { git = "ssh://git@github.com/referential-ai/platonic-core.git", rev = "ca2a697ae7114815044acb63e578c6b93b9da007" }
+platonic-core = "0.1.0"
 ratatui = "0.29.0"
 rusqlite = { version = "0.39", features = ["bundled"] }
 rustix = { version = "1", features = ["event", "fs", "net", "process", "time"] }

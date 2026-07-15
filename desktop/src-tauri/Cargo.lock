@@ -2563,7 +2563,8 @@ dependencies = [
 [[package]]
 name = "platonic-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/referential-ai/platonic-core.git?rev=ca2a697ae7114815044acb63e578c6b93b9da007#ca2a697ae7114815044acb63e578c6b93b9da007"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdcd19080f94bf595a5ec4e0d7f325664468fc658cada5ff0b392e2087b71714"
 dependencies = [
  "serde",
  "serde_json",

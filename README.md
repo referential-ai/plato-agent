@@ -1,6 +1,8 @@
 # Plato Agent
 
-Plato Agent is the first application shell built on `platonic-core`.
+Plato Agent is an open agent that shows its work: every step is recorded,
+replayable, and auditable. It is the first application shell built on
+`platonic-core`.
 
 **New here? Start with [docs/QUICKSTART.md](docs/QUICKSTART.md) — build, run, and test in five minutes.**
 
