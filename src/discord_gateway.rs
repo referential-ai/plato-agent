@@ -1,6 +1,6 @@
 use crate::{
     AppError, AppResult,
-    config::{Config, DiscordGatewayConfig, resolve_config_path},
+    config::{Config, DiscordGatewayConfig, ResolvedConfigPath, resolve_config},
     daemon::{
         client::{DaemonClient, DaemonConnectionConfig},
         protocol::{HelloResult, RunStateName, TranscriptReadResult},
@@ -52,8 +52,8 @@ pub struct DiscordGatewayOptions {
 }
 
 pub fn run_discord_gateway(options: DiscordGatewayOptions) -> AppResult<()> {
-    let config_path = resolve_config_path(&options.workspace_root, options.config_path.as_deref())?;
-    let config = Config::load(&options.workspace_root, config_path.as_deref())?;
+    let resolved = resolve_config(&options.workspace_root, options.config_path.as_deref())?;
+    let config = Config::load_resolved(resolved.as_ref())?;
     let discord = config
         .gateway
         .clone()
@@ -62,8 +62,14 @@ pub fn run_discord_gateway(options: DiscordGatewayOptions) -> AppResult<()> {
     let token = gateway_token(&config, &discord, |name| std::env::var_os(name))?;
     let daemon = DaemonConnectionConfig::resolve(&options.workspace_root, options.socket_path)?;
     let platform = DiscordPlatform::connect(DISCORD_API_BASE, token)?;
-    let config_path = config_path.map(|path| path.to_string_lossy().into_owned());
+    let config_path = forwarded_config_path(resolved.as_ref());
     DiscordGateway::new(platform, daemon, config_path, discord).run()
+}
+
+fn forwarded_config_path(resolved: Option<&ResolvedConfigPath>) -> Option<String> {
+    resolved
+        .and_then(|resolved| resolved.forwarded_path())
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 fn gateway_token(
@@ -1015,6 +1021,40 @@ mod tests {
         assert_eq!(requests[0].body["content"], "final answer");
         assert_eq!(requests[0].body["allowed_mentions"]["parse"], json!([]));
         assert_eq!(gateway.sessions[&200], "session_1");
+    }
+
+    #[test]
+    fn gateway_handoff_only_forwards_authorized_config_path() {
+        temp_env::with_var("PLATO_CONFIG", None::<&str>, || {
+            for explicit in [None, Some(PathBuf::from("plato.toml"))] {
+                let workspace = tempfile::tempdir().unwrap();
+                let path = workspace.path().join("plato.toml");
+                std::fs::write(&path, "").unwrap();
+                let resolved = resolve_config(workspace.path(), explicit.as_deref())
+                    .unwrap()
+                    .unwrap();
+                let socket_dir = tempfile::tempdir().unwrap();
+                let socket_path = socket_dir.path().join("daemon.sock");
+                let daemon = spawn_finished_daemon(&socket_path, "run.start", "session_1", "done");
+                let rest = spawn_fake_rest(1, 200, None);
+                let platform = test_platform(
+                    &rest.base_url,
+                    discord_message(42, 200, "test config handoff"),
+                );
+                let mut gateway = test_gateway(&workspace, socket_path, platform);
+                gateway.config_path = forwarded_config_path(Some(&resolved));
+
+                gateway.poll_once().unwrap();
+
+                let start = daemon.join().unwrap();
+                if explicit.is_some() {
+                    assert_eq!(start["config_path"], path.to_string_lossy().as_ref());
+                } else {
+                    assert!(start["config_path"].is_null());
+                }
+                rest.handle.join().unwrap();
+            }
+        });
     }
 
     #[test]

@@ -17,6 +17,34 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 const PLATO_CONFIG_ENV: &str = "PLATO_CONFIG";
+const WORKSPACE_PROVIDER_OVERRIDE_ERROR: &str = "workspace plato.toml cannot set provider.api_key_env or provider.base_url; use --config, PLATO_CONFIG, or user config";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ResolvedConfigPath {
+    Authorized(PathBuf),
+    Workspace(PathBuf),
+}
+
+impl ResolvedConfigPath {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Authorized(path) | Self::Workspace(path) => path,
+        }
+    }
+
+    fn into_path(self) -> PathBuf {
+        match self {
+            Self::Authorized(path) | Self::Workspace(path) => path,
+        }
+    }
+
+    pub(crate) fn forwarded_path(&self) -> Option<&Path> {
+        match self {
+            Self::Authorized(path) => Some(path),
+            Self::Workspace(_) => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
@@ -117,16 +145,28 @@ struct RawToolsConfig {
 
 impl Config {
     pub fn load(workspace_root: &Path, explicit_path: Option<&Path>) -> AppResult<Self> {
-        let Some(path) = resolve_config_path(workspace_root, explicit_path)? else {
-            return Ok(Self::default());
-        };
-        Self::load_file(&path)
+        let resolved = resolve_config(workspace_root, explicit_path)?;
+        Self::load_resolved(resolved.as_ref())
     }
 
-    fn load_file(path: &Path) -> AppResult<Self> {
-        let raw = fs::read_to_string(path)?;
-        let raw: RawConfig = toml::from_str(&raw)?;
+    pub(crate) fn load_resolved(resolved: Option<&ResolvedConfigPath>) -> AppResult<Self> {
+        let Some(resolved) = resolved else {
+            return Ok(Self::default());
+        };
+        let raw = Self::read_raw(resolved.path())?;
+        if matches!(resolved, ResolvedConfigPath::Workspace(_))
+            && raw.provider.as_ref().is_some_and(|provider| {
+                provider.api_key_env.is_some() || provider.base_url.is_some()
+            })
+        {
+            return Err(AppError::Config(WORKSPACE_PROVIDER_OVERRIDE_ERROR.into()));
+        }
         Self::from_raw(raw)
+    }
+
+    fn read_raw(path: &Path) -> AppResult<RawConfig> {
+        let raw = fs::read_to_string(path)?;
+        Ok(toml::from_str(&raw)?)
     }
 
     fn from_raw(raw: RawConfig) -> AppResult<Self> {
@@ -275,8 +315,15 @@ pub fn resolve_config_path(
     workspace_root: &Path,
     explicit_path: Option<&Path>,
 ) -> AppResult<Option<PathBuf>> {
+    Ok(resolve_config(workspace_root, explicit_path)?.map(ResolvedConfigPath::into_path))
+}
+
+pub(crate) fn resolve_config(
+    workspace_root: &Path,
+    explicit_path: Option<&Path>,
+) -> AppResult<Option<ResolvedConfigPath>> {
     let home = user_home();
-    resolve_config_path_with(
+    resolve_config_with(
         workspace_root,
         explicit_path.map(Path::to_path_buf),
         std::env::var_os(PLATO_CONFIG_ENV).map(PathBuf::from),
@@ -285,6 +332,7 @@ pub fn resolve_config_path(
     )
 }
 
+#[cfg(test)]
 fn resolve_config_path_with(
     workspace_root: &Path,
     explicit_path: Option<PathBuf>,
@@ -292,22 +340,37 @@ fn resolve_config_path_with(
     home: Option<PathBuf>,
     user_config: Option<PathBuf>,
 ) -> AppResult<Option<PathBuf>> {
+    Ok(
+        resolve_config_with(workspace_root, explicit_path, env_path, home, user_config)?
+            .map(ResolvedConfigPath::into_path),
+    )
+}
+
+fn resolve_config_with(
+    workspace_root: &Path,
+    explicit_path: Option<PathBuf>,
+    env_path: Option<PathBuf>,
+    home: Option<PathBuf>,
+    user_config: Option<PathBuf>,
+) -> AppResult<Option<ResolvedConfigPath>> {
     if let Some(path) = explicit_path {
-        return resolve_explicit_config_path(workspace_root, path, home.as_deref()).map(Some);
+        return resolve_explicit_config_path(workspace_root, path, home.as_deref())
+            .map(|path| Some(ResolvedConfigPath::Authorized(path)));
     }
     if let Some(path) = env_path {
-        return resolve_explicit_config_path(workspace_root, path, home.as_deref()).map(Some);
+        return resolve_explicit_config_path(workspace_root, path, home.as_deref())
+            .map(|path| Some(ResolvedConfigPath::Authorized(path)));
     }
 
     let workspace_config = workspace_root.join("plato.toml");
     if workspace_config.exists() {
-        return Ok(Some(workspace_config));
+        return Ok(Some(ResolvedConfigPath::Workspace(workspace_config)));
     }
 
     if let Some(user_config) = user_config
         && user_config.exists()
     {
-        return Ok(Some(user_config));
+        return Ok(Some(ResolvedConfigPath::Authorized(user_config)));
     }
 
     Ok(None)
@@ -418,11 +481,123 @@ owner_user_ids = [123456789]
         )
         .unwrap();
 
-        let config = Config::load_file(&path).unwrap();
+        let resolved = ResolvedConfigPath::Authorized(path);
+        let config = Config::load_resolved(Some(&resolved)).unwrap();
         let discord = config.gateway.unwrap().discord;
 
         assert_eq!(discord.api_key_env, "DISCORD_BOT_TOKEN");
         assert_eq!(discord.owner_user_ids, vec![123456789]);
+    }
+
+    #[test]
+    fn auto_workspace_config_rejects_sensitive_provider_fields() {
+        for field in [
+            r#"api_key_env = "STOLEN_SECRET""#,
+            r#"base_url = "https://attacker.invalid/v1""#,
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            std::fs::write(
+                workspace.path().join("plato.toml"),
+                format!("[provider]\n{field}\n"),
+            )
+            .unwrap();
+            let resolved = resolve_config_with(workspace.path(), None, None, None, None)
+                .unwrap()
+                .unwrap();
+
+            assert!(matches!(&resolved, ResolvedConfigPath::Workspace(_)));
+            assert_eq!(resolved.forwarded_path(), None);
+            let error = Config::load_resolved(Some(&resolved)).unwrap_err();
+            assert!(matches!(
+                error,
+                AppError::Config(message) if message == WORKSPACE_PROVIDER_OVERRIDE_ERROR
+            ));
+        }
+    }
+
+    #[test]
+    fn auto_workspace_config_allows_other_fields() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("plato.toml"),
+            r#"
+[provider]
+kind = "open_ai"
+model = "gpt-test"
+timeout_ms = 3000
+
+[limits]
+max_turns = 2
+
+[tools]
+enabled = ["file.read"]
+
+[gateway.discord]
+api_key_env = "DISCORD_BOT_TOKEN"
+owner_user_ids = [42]
+"#,
+        )
+        .unwrap();
+        let resolved = resolve_config_with(workspace.path(), None, None, None, None)
+            .unwrap()
+            .unwrap();
+
+        let config = Config::load_resolved(Some(&resolved)).unwrap();
+
+        assert_eq!(config.provider.kind, ProviderKind::OpenAi);
+        assert_eq!(config.provider.model, "gpt-test");
+        assert_eq!(config.provider.api_key_env, "OPENAI_API_KEY");
+        assert_eq!(config.provider.base_url, OPENAI_BASE_URL);
+        assert_eq!(config.provider.timeout_ms, 3000);
+        assert_eq!(config.limits.max_turns, 2);
+        assert_eq!(config.tools.enabled, vec!["file.read"]);
+        assert_eq!(config.gateway.unwrap().discord.owner_user_ids, vec![42]);
+    }
+
+    #[test]
+    fn explicit_environment_and_user_configs_allow_sensitive_provider_fields() {
+        for source in ["explicit", "environment", "user"] {
+            let workspace = tempfile::tempdir().unwrap();
+            let name = if source == "explicit" {
+                "plato.toml".into()
+            } else {
+                format!("{source}.toml")
+            };
+            let path = workspace.path().join(name);
+            std::fs::write(
+                &path,
+                r#"
+[provider]
+api_key_env = "AUTHORIZED_SECRET"
+base_url = "https://provider.example/v1"
+"#,
+            )
+            .unwrap();
+            let resolved = match source {
+                "explicit" => resolve_config_with(
+                    workspace.path(),
+                    Some(PathBuf::from("plato.toml")),
+                    None,
+                    None,
+                    None,
+                ),
+                "environment" => {
+                    resolve_config_with(workspace.path(), None, Some(path.clone()), None, None)
+                }
+                "user" => {
+                    resolve_config_with(workspace.path(), None, None, None, Some(path.clone()))
+                }
+                _ => unreachable!(),
+            };
+            let resolved = resolved.unwrap().unwrap();
+
+            let config = Config::load_resolved(Some(&resolved)).unwrap();
+
+            assert!(matches!(&resolved, ResolvedConfigPath::Authorized(_)));
+            assert_eq!(resolved.forwarded_path(), Some(path.as_path()));
+            assert_eq!(config.provider.api_key_env, "AUTHORIZED_SECRET");
+            assert_eq!(config.provider.base_url, "https://provider.example/v1");
+        }
     }
 
     #[test]
