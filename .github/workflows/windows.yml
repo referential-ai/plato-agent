@@ -21,70 +21,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Configure SSH for private platonic-core dependency
-        env:
-          PLATONIC_CORE_DEPLOY_KEY: ${{ secrets.PLATONIC_CORE_DEPLOY_KEY }}
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          if ([string]::IsNullOrWhiteSpace($env:PLATONIC_CORE_DEPLOY_KEY)) {
-            throw "PLATONIC_CORE_DEPLOY_KEY is required"
-          }
-          $ssh = Join-Path $HOME ".ssh"
-          New-Item -ItemType Directory -Force $ssh | Out-Null
-          $key = Join-Path $ssh "platonic_core_deploy_key"
-          $keyText = $env:PLATONIC_CORE_DEPLOY_KEY -replace "`r`n?", "`n"
-          $keyText = $keyText.TrimEnd([char[]]@([char]10, [char]13)) + [char]10
-          [IO.File]::WriteAllText(
-            $key,
-            $keyText,
-            [Text.UTF8Encoding]::new($false)
-          )
-          @'
-          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
-          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
-          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
-          '@ | Set-Content -Encoding utf8 (Join-Path $ssh "known_hosts")
-          $keyForSsh = $key.Replace('\', '/')
-          @"
-          Host github.com
-            HostName github.com
-            User git
-            IdentityFile $keyForSsh
-            IdentitiesOnly yes
-          "@ | Set-Content -Encoding utf8 (Join-Path $ssh "config")
-          icacls $ssh /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" | Out-Null
-          icacls $key /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
-
       - name: Fetch locked Rust dependencies
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           cargo fetch --locked
-
-      - name: Remove private dependency credentials
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $ssh = Join-Path $HOME ".ssh"
-          $paths = @(
-            (Join-Path $ssh "platonic_core_deploy_key"),
-            (Join-Path $ssh "config"),
-            (Join-Path $ssh "known_hosts")
-          )
-          foreach ($path in $paths) {
-            if (Test-Path -LiteralPath $path) {
-              icacls $path /grant:r "$($env:USERNAME):(F)" | Out-Null
-              if ($LASTEXITCODE -ne 0) { throw "failed to authorize credential cleanup: $path" }
-              Remove-Item -LiteralPath $path -Force
-            }
-            if (Test-Path -LiteralPath $path) { throw "private dependency credential remains: $path" }
-          }
-          $extraHeaders = @(git config --local --get-regexp '^http\..*\.extraheader$' 2>$null)
-          $gitExit = $LASTEXITCODE
-          if ($gitExit -notin @(0, 1)) { throw "git credential check failed: $gitExit" }
-          if ($extraHeaders.Count -ne 0) { throw "checkout credentials remain" }
-          $global:LASTEXITCODE = 0
           "CARGO_NET_OFFLINE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust components

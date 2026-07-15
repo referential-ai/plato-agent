@@ -14,8 +14,6 @@ Implementation starts only after the issue is **Ready for dev** and a maintainer
 - Independent review is required.
 - Only maintainers merge. Green CI and review report readiness; a human maintainer still decides whether to merge.
 
-> **Temporary external-fork CI limit:** Rust-bearing jobs cannot run from forks while `platonic-core` is fetched through a private SSH deploy key. External-fork CI becomes supported after `platonic-core` is published and this repository switches to the crates.io dependency; the Web job is unaffected.
-
 ## Verify
 
 ```bash
