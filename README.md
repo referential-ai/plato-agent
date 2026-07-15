@@ -310,14 +310,18 @@ export DISCORD_BOT_TOKEN="$(cat /path/to/discord-bot-token)"
 cargo run --bin plato-gateway-discord -- --workspace "$PWD"
 ```
 
-Enable the bot's Message Content intent and grant it View Channel and Send
-Messages where it will run. Messages from other user ids are ignored. Each
-allowed channel or DM continues one daemon session; final answers are recovered
-from the ledger after daemon reconnects. Approval-required runs post one bounded
-notification with the tool, effect, and preview; grant or deny the request
-locally in `plato-tui`. The gateway never sends approval decisions. Failed runs
-post `Run failed. Inspect it locally with: plato replay`; canceled and
-interrupted runs stay silent.
+Enable the bot's Message Content intent. Grant View Channel, Send Messages, Add
+Reactions, and Read Message History; also grant Send Messages in Threads when
+using threads. Messages from other user ids are ignored. For allowed messages,
+the gateway adds 👀, refreshes Discord's typing indicator while the run is
+active, then replaces 👀 with ✅ or ❌. Canceled and interrupted runs remove 👀
+without a terminal reaction. Each channel or DM continues one daemon session;
+final answers are recovered from the ledger after daemon reconnects.
+Approval-required runs post one bounded notification with the tool, effect, and
+preview; grant or deny the request locally in `plato-tui`. The gateway never
+sends approval decisions. Failed runs post
+`Run failed. Inspect it locally with: plato replay`; canceled and interrupted
+runs stay silent.
 
 Allowed-owner messages over 4,096 UTF-8 bytes or matching the fixed unsafe-input
 markers are rejected before daemon access with `Message rejected: unsafe or
