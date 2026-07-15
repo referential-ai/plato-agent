@@ -116,13 +116,21 @@ fn state_home() -> AppResult<PathBuf> {
 
 #[cfg(unix)]
 pub(crate) fn runtime_home() -> AppResult<PathBuf> {
-    if let Some(value) = std::env::var_os("XDG_RUNTIME_DIR")
-        && !value.is_empty()
-    {
-        return Ok(PathBuf::from(value));
+    Ok(runtime_home_and_fallback().0)
+}
+
+#[cfg(unix)]
+pub(crate) fn runtime_home_and_fallback() -> (PathBuf, bool) {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        Some(value) => (PathBuf::from(value), false),
+        None => (
+            std::env::temp_dir().join(format!(
+                "plato-agent-{}",
+                rustix::process::geteuid().as_raw()
+            )),
+            true,
+        ),
     }
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-    Ok(std::env::temp_dir().join("plato-agent").join(user))
 }
 
 #[cfg(windows)]
@@ -211,6 +219,28 @@ mod tests {
             assert_eq!(lock_path.file_name().unwrap(), "agent.lock");
             assert_eq!(socket_path.parent(), lock_path.parent());
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_runtime_home_uses_numeric_uid_under_temp_root() {
+        let root = tempfile::tempdir().unwrap();
+        temp_env::with_vars(
+            [
+                ("XDG_RUNTIME_DIR", None),
+                ("TMPDIR", Some(root.path().as_os_str())),
+                ("USER", Some(std::ffi::OsStr::new("spoofed-name"))),
+            ],
+            || {
+                assert_eq!(
+                    runtime_home().unwrap(),
+                    root.path().join(format!(
+                        "plato-agent-{}",
+                        rustix::process::geteuid().as_raw()
+                    ))
+                );
+            },
+        );
     }
 
     #[cfg(windows)]
