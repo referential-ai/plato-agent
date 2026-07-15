@@ -18,6 +18,7 @@ use std::{os::unix::process::CommandExt, process::Child};
 use {self::windows_shell::JobChild, std::os::windows::process::CommandExt};
 
 const MAX_READ_BYTES: usize = 64 * 1024;
+const READ_UTF8_LOOKAHEAD_BYTES: usize = 4;
 const MAX_LIST_ENTRIES: usize = 200;
 const MAX_LIST_DATA_BYTES: usize = 32 * 1024;
 const SHELL_OUTPUT_BYTES: usize = 32 * 1024;
@@ -374,18 +375,20 @@ fn read_file(
 ) -> AppResult<ToolResult> {
     let input: FileReadInput = serde_json::from_value(input)?;
     let path = resolve_existing_path(workspace_root, &input.path)?;
-    let content = fs::read_to_string(&path)?;
-    let truncated = content.len() > MAX_READ_BYTES;
+    let mut file = fs::File::open(&path)?;
+    let bytes = file.metadata()?.len();
+    let content = read_utf8_prefix(&mut file, bytes)?;
+    let truncated = bytes > MAX_READ_BYTES as u64;
     let visible = truncate_utf8(&content, MAX_READ_BYTES);
 
     Ok(ToolResult {
         call_id,
-        summary: format!("read {} bytes from {}", content.len(), input.path),
+        summary: format!("read {bytes} bytes from {}", input.path),
         data: json!({
             "path": input.path,
             "content": visible,
             "truncated": truncated,
-            "bytes": content.len()
+            "bytes": bytes
         }),
         artifacts: vec![],
         visibility: ResultVisibility::Both,
@@ -403,19 +406,20 @@ fn list_directory(
         return Err(AppError::Tool(format!("not a directory: {}", input.path)));
     }
 
-    let mut entries = fs::read_dir(&path)?
-        .map(|entry| {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            Ok(ListEntry {
+    let mut entries = Vec::with_capacity(MAX_LIST_ENTRIES);
+    let mut entry_count = 0usize;
+    for entry in fs::read_dir(&path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        entry_count += 1;
+        retain_list_candidate(
+            &mut entries,
+            ListEntry {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 kind: file_kind(&file_type),
-            })
-        })
-        .collect::<AppResult<Vec<_>>>()?;
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
-
-    let entry_count = entries.len();
+            },
+        );
+    }
     let mut returned = Vec::new();
     let mut data_bytes = 0usize;
     let mut truncated = false;
@@ -449,6 +453,37 @@ fn list_directory(
         artifacts: vec![],
         visibility: ResultVisibility::Both,
     })
+}
+
+fn read_utf8_prefix(reader: &mut impl Read, source_bytes: u64) -> io::Result<String> {
+    let buffer_bytes = MAX_READ_BYTES + READ_UTF8_LOOKAHEAD_BYTES;
+    let mut bytes = Vec::with_capacity(buffer_bytes);
+    reader.take(buffer_bytes as u64).read_to_end(&mut bytes)?;
+
+    let valid_bytes = match std::str::from_utf8(&bytes) {
+        Ok(_) => bytes.len(),
+        Err(error)
+            if source_bytes > buffer_bytes as u64
+                && error.error_len().is_none()
+                && error.valid_up_to() >= MAX_READ_BYTES =>
+        {
+            error.valid_up_to()
+        }
+        Err(error) => return Err(io::Error::new(ErrorKind::InvalidData, error)),
+    };
+    bytes.truncate(valid_bytes);
+    String::from_utf8(bytes).map_err(|error| io::Error::new(ErrorKind::InvalidData, error))
+}
+
+fn retain_list_candidate(entries: &mut Vec<ListEntry>, candidate: ListEntry) {
+    let index = entries.partition_point(|entry| entry.name <= candidate.name);
+    if index >= MAX_LIST_ENTRIES {
+        return;
+    }
+    if entries.len() == MAX_LIST_ENTRIES {
+        entries.pop();
+    }
+    entries.insert(index, candidate);
 }
 
 fn write_file(
@@ -1010,6 +1045,21 @@ mod tests {
     use super::*;
     use platonic_core::ToolCallId;
 
+    struct InstrumentedReader {
+        bytes: Vec<u8>,
+        position: usize,
+    }
+
+    impl Read for InstrumentedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let remaining = &self.bytes[self.position..];
+            let count = remaining.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&remaining[..count]);
+            self.position += count;
+            Ok(count)
+        }
+    }
+
     #[test]
     fn read_file_rejects_paths_outside_workspace() {
         let dir = tempfile::tempdir().unwrap();
@@ -1091,9 +1141,53 @@ mod tests {
     }
 
     #[test]
+    fn read_file_preserves_exact_cap_and_cap_plus_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        fs::write(&path, "a".repeat(MAX_READ_BYTES)).unwrap();
+
+        let exact = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_1").unwrap(),
+            "file.read",
+            json!({"path": "note.txt"}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            exact.summary,
+            format!("read {MAX_READ_BYTES} bytes from note.txt")
+        );
+        assert_eq!(exact.data["bytes"], MAX_READ_BYTES);
+        assert_eq!(exact.data["truncated"], false);
+        assert_eq!(
+            exact.data["content"].as_str().unwrap().len(),
+            MAX_READ_BYTES
+        );
+
+        fs::write(&path, "a".repeat(MAX_READ_BYTES + 1)).unwrap();
+        let over = execute_tool(
+            dir.path(),
+            ToolCallId::new("call_2").unwrap(),
+            "file.read",
+            json!({"path": "note.txt"}),
+        )
+        .unwrap();
+
+        assert_eq!(
+            over.summary,
+            format!("read {} bytes from note.txt", MAX_READ_BYTES + 1)
+        );
+        assert_eq!(over.data["bytes"], MAX_READ_BYTES + 1);
+        assert_eq!(over.data["truncated"], true);
+        assert_eq!(over.data["content"].as_str().unwrap().len(), MAX_READ_BYTES);
+    }
+
+    #[test]
     fn read_file_truncates_on_utf8_boundary() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("note.txt"), "é".repeat(MAX_READ_BYTES)).unwrap();
+        let content = format!("{}éz", "a".repeat(MAX_READ_BYTES - 1));
+        fs::write(dir.path().join("note.txt"), &content).unwrap();
 
         let result = execute_tool(
             dir.path(),
@@ -1105,7 +1199,34 @@ mod tests {
 
         let content = result.data["content"].as_str().unwrap();
         assert!(content.is_char_boundary(content.len()));
-        assert!(result.data["truncated"].as_bool().unwrap());
+        assert_eq!(content.len(), MAX_READ_BYTES - 1);
+        assert_eq!(result.data["bytes"], MAX_READ_BYTES + 2);
+        assert_eq!(result.data["truncated"], true);
+    }
+
+    #[test]
+    fn read_file_does_not_read_or_validate_past_lookahead() {
+        let buffer_bytes = MAX_READ_BYTES + READ_UTF8_LOOKAHEAD_BYTES;
+        let mut bytes = vec![b'a'; buffer_bytes + 1];
+        bytes[buffer_bytes] = 0xff;
+        let mut reader = InstrumentedReader { bytes, position: 0 };
+
+        let content = read_utf8_prefix(&mut reader, (buffer_bytes + 1) as u64).unwrap();
+
+        assert_eq!(reader.position, buffer_bytes);
+        assert_eq!(content.len(), buffer_bytes);
+    }
+
+    #[test]
+    fn read_file_rejects_invalid_utf8_in_bounded_prefix() {
+        let buffer_bytes = MAX_READ_BYTES + READ_UTF8_LOOKAHEAD_BYTES;
+        let mut bytes = vec![b'a'; buffer_bytes + 1];
+        bytes[MAX_READ_BYTES - 1] = 0xff;
+        let mut reader = InstrumentedReader { bytes, position: 0 };
+
+        let error = read_utf8_prefix(&mut reader, (buffer_bytes + 1) as u64).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
     }
 
     #[test]
@@ -1193,6 +1314,30 @@ mod tests {
             result.data["entries"].as_array().unwrap().len(),
             MAX_LIST_ENTRIES
         );
+    }
+
+    #[test]
+    fn list_candidates_stay_bounded_in_adverse_iteration_order() {
+        let total = MAX_LIST_ENTRIES * 10;
+        let mut entries = Vec::with_capacity(MAX_LIST_ENTRIES);
+        let capacity = entries.capacity();
+
+        for index in (0..total).rev() {
+            retain_list_candidate(
+                &mut entries,
+                ListEntry {
+                    name: format!("file_{index:04}.txt"),
+                    kind: "file",
+                },
+            );
+            assert!(entries.len() <= MAX_LIST_ENTRIES);
+            assert_eq!(entries.capacity(), capacity);
+        }
+
+        assert_eq!(entries.len(), MAX_LIST_ENTRIES);
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.name, format!("file_{index:04}.txt"));
+        }
     }
 
     #[cfg(unix)]
