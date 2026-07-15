@@ -23,6 +23,10 @@ Config resolution order:
 4. `~/.config/plato/config.toml` on Unix or `%APPDATA%\plato\config.toml` on Windows
 5. built-in defaults
 
+Auto-discovered `./plato.toml` cannot set `provider.api_key_env` or
+`provider.base_url`. Use `--config`, `$PLATO_CONFIG`, or the user config for
+provider credentials and custom endpoints.
+
 Leading `~` expands in explicit config paths. Relative explicit paths resolve
 against the workspace root. Built-in defaults use OpenRouter:
 
