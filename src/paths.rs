@@ -2,12 +2,32 @@ use crate::{AppError, AppResult};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DefaultSqlitePath {
+    path: PathBuf,
+}
+
+impl DefaultSqlitePath {
+    pub fn as_path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn from_path(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
 pub fn default_sqlite_path(workspace_root: &Path) -> AppResult<PathBuf> {
-    Ok(state_home()?
-        .join("plato-agent")
+    Ok(default_sqlite(workspace_root)?.path)
+}
+
+pub fn default_sqlite(workspace_root: &Path) -> AppResult<DefaultSqlitePath> {
+    let state_root = state_home()?.join("plato-agent");
+    let path = state_root
         .join("workspaces")
         .join(workspace_id(workspace_root)?)
-        .join("agent.db"))
+        .join("agent.db");
+    Ok(DefaultSqlitePath { path })
 }
 
 #[cfg(unix)]

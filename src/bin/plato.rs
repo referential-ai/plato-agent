@@ -7,10 +7,10 @@ use plato_agent::{
         server::DaemonServer,
         wake_listener,
     },
-    ledger::latest_sqlite_session_id,
+    ledger::{latest_default_sqlite_session_id, latest_sqlite_session_id},
     new_session_id,
-    paths::default_sqlite_path,
-    replay_file, replay_sqlite, run_question,
+    paths::default_sqlite,
+    replay_default_sqlite, replay_file, replay_sqlite, run_question,
     tui::{TuiOptions, run_tui},
 };
 use platonic_core::RunId;
@@ -262,20 +262,20 @@ fn run_ledger(
     match events {
         Some(path) => Ok(RunLedger::Jsonl(path)),
         None => {
-            let path = sqlite_path(db, workspace_root)?;
+            let ledger = sqlite_ledger(db, workspace_root)?;
             ensure_workspace_unlocked(workspace_root)?;
-            Ok(RunLedger::Sqlite(path))
+            Ok(ledger)
         }
     }
 }
 
-fn sqlite_path(
+fn sqlite_ledger(
     db: Option<Option<PathBuf>>,
     workspace_root: &Path,
-) -> plato_agent::AppResult<PathBuf> {
+) -> plato_agent::AppResult<RunLedger> {
     match db {
-        None | Some(None) => default_sqlite_path(workspace_root),
-        Some(Some(path)) => Ok(resolve_cli_path(path, workspace_root)),
+        None | Some(None) => default_sqlite(workspace_root).map(RunLedger::DefaultSqlite),
+        Some(Some(path)) => Ok(RunLedger::Sqlite(resolve_cli_path(path, workspace_root))),
     }
 }
 
@@ -300,6 +300,19 @@ fn run_session(
         RunLedger::Sqlite(_) => Ok(Some(RunSession::Fresh {
             session_id: new_session_id(),
         })),
+        RunLedger::DefaultSqlite(path) if continue_session => {
+            let session_id =
+                latest_default_sqlite_session_id(path).map_err(|error| match error {
+                    AppError::NoSqliteSessions | AppError::NoSqliteRuns => AppError::Config(
+                        "plato -c found no previous SQLite session; run plato \"...\" first".into(),
+                    ),
+                    error => error,
+                })?;
+            Ok(Some(RunSession::Continue { session_id }))
+        }
+        RunLedger::DefaultSqlite(_) => Ok(Some(RunSession::Fresh {
+            session_id: new_session_id(),
+        })),
     }
 }
 
@@ -313,7 +326,7 @@ fn replay_ledger(
             "replay accepts either --db or a JSONL file, not both".into(),
         )),
         (None, Some(file)) => Ok(RunLedger::Jsonl(file)),
-        (db, None) => sqlite_path(db, workspace_root).map(RunLedger::Sqlite),
+        (db, None) => sqlite_ledger(db, workspace_root),
     }
 }
 
@@ -335,6 +348,9 @@ fn write_run_success_output(
     if let RunLedger::Sqlite(path) = ledger {
         write_sqlite_replay_hint(stderr, &outcome.run_id, path)?;
     }
+    if let RunLedger::DefaultSqlite(path) = ledger {
+        write_sqlite_replay_hint(stderr, &outcome.run_id, path.as_path())?;
+    }
     Ok(())
 }
 
@@ -348,6 +364,10 @@ fn write_replay_output(
         RunLedger::Sqlite(path) => {
             ensure_workspace_unlocked(workspace_root)?;
             writeln!(stdout, "{}", replay_sqlite(&path, run)?)?;
+        }
+        RunLedger::DefaultSqlite(path) => {
+            ensure_workspace_unlocked(workspace_root)?;
+            writeln!(stdout, "{}", replay_default_sqlite(&path, run)?)?;
         }
         RunLedger::Jsonl(file) => {
             if run.is_some() {
@@ -526,9 +546,9 @@ mod tests {
     fn explicit_sqlite_path_is_resolved_against_workspace_root() {
         let dir = tempfile::tempdir().unwrap();
 
-        let path = sqlite_path(Some(Some(PathBuf::from("agent.db"))), dir.path()).unwrap();
+        let ledger = sqlite_ledger(Some(Some(PathBuf::from("agent.db"))), dir.path()).unwrap();
 
-        assert_eq!(path, dir.path().join("agent.db"));
+        assert_eq!(ledger, RunLedger::Sqlite(dir.path().join("agent.db")));
     }
 
     #[test]
@@ -539,7 +559,7 @@ mod tests {
 
             assert_eq!(
                 ledger,
-                RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap())
+                RunLedger::DefaultSqlite(default_sqlite(workspace.path()).unwrap())
             );
         });
     }
@@ -583,7 +603,7 @@ mod tests {
     fn default_sqlite_run_starts_fresh_session() {
         let workspace = tempfile::tempdir().unwrap();
         with_test_xdg(workspace.path(), || {
-            let ledger = RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap());
+            let ledger = RunLedger::DefaultSqlite(default_sqlite(workspace.path()).unwrap());
 
             let session = run_session(false, &ledger).unwrap().unwrap();
 
@@ -635,7 +655,7 @@ mod tests {
 
             assert_eq!(
                 ledger,
-                RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap())
+                RunLedger::DefaultSqlite(default_sqlite(workspace.path()).unwrap())
             );
         });
     }
@@ -660,7 +680,7 @@ mod tests {
                 &socket,
             )
             .unwrap();
-            let ledger = RunLedger::Sqlite(default_sqlite_path(workspace.path()).unwrap());
+            let ledger = RunLedger::DefaultSqlite(default_sqlite(workspace.path()).unwrap());
             let mut stdout = Vec::new();
 
             let error =

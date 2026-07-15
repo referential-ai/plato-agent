@@ -1,4 +1,8 @@
-use crate::{AppError, AppResult, ledger};
+use crate::{
+    AppError, AppResult,
+    ledger::{self, SqliteLedger},
+    paths::DefaultSqlitePath,
+};
 use platonic_core::{MessageRole, ReadbackEntry, RunReadback};
 use std::path::Path;
 
@@ -19,6 +23,25 @@ pub fn replay_sqlite(path: &Path, run_id: Option<&str>) -> AppResult<String> {
         Ok(session) => format_session_readback(&session),
         Err(AppError::NoSqliteSessions) => {
             let records = ledger::read_sqlite_records(path, None)?;
+            let readback = RunReadback::from_events(&records)?;
+            Ok(format_readback(&readback))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn replay_default_sqlite(path: &DefaultSqlitePath, run_id: Option<&str>) -> AppResult<String> {
+    let ledger = SqliteLedger::open_default_readonly(path)?;
+    if let Some(run_id) = run_id {
+        let records = ledger.read_run(run_id)?;
+        let readback = RunReadback::from_events(&records)?;
+        return Ok(format_readback(&readback));
+    }
+
+    match ledger.read_latest_session() {
+        Ok(session) => format_session_readback(&session),
+        Err(AppError::NoSqliteSessions) => {
+            let (_, records) = ledger.read_latest_run()?;
             let readback = RunReadback::from_events(&records)?;
             Ok(format_readback(&readback))
         }

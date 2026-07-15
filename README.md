@@ -70,6 +70,7 @@ approve `shell.exec`, or bypass workspace path checks.
 - `plato -c "..."` continues the latest session from that store.
 - `--db` also writes to the default platform user-state path.
 - `--db=<path>` writes to that SQLite file; relative paths resolve against the current workspace.
+- On Unix, default ledger directories are `0700` and the database and SQLite sidecars are `0600`; explicit `--db=<path>` permissions remain caller-managed.
 - Use `=` for explicit paths because `--db` also has a bare default form.
 - Live assistant text, `run_id`, `ledger_path`, and replay hints print to stderr. Stdout remains only the final answer.
 - Replay shows final assistant messages, not partial streaming deltas.

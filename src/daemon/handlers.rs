@@ -17,6 +17,7 @@ use crate::{
     },
     ledger::{SessionRunRecords, SqliteLedger},
     new_run_id, new_session_id,
+    paths::DefaultSqlitePath,
     replay::{format_readback, format_session_readback},
     run_question,
     tools::ApprovalOutcome,
@@ -24,7 +25,7 @@ use crate::{
 use platonic_core::{ReadbackEntry, RunReadback};
 use serde_json::json;
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, atomic::Ordering, mpsc},
     thread,
 };
@@ -239,7 +240,7 @@ fn start_run(
     let options = RunOptions {
         question,
         config_path: config_path.map(PathBuf::from),
-        ledger: RunLedger::Sqlite(runtime.paths.ledger_path.clone()),
+        ledger: RunLedger::DefaultSqlite(runtime.paths.default_ledger()),
         workspace_root: runtime.paths.workspace_root.clone(),
         approval_mode: ApprovalMode::external("daemon", approval_handler(record.clone())),
         run_id: Some(run_id),
@@ -498,16 +499,17 @@ fn handle_sessions_list(runtime: &DaemonRuntime, request: Envelope) -> Envelope 
 
 fn session_summaries(runtime: &DaemonRuntime) -> crate::AppResult<Vec<SessionSummary>> {
     let ledger_path = runtime.paths.ledger_path.clone();
-    let mut sessions = crate::ledger::sqlite_session_summaries(&ledger_path)?
-        .into_iter()
-        .map(|session| SessionSummary {
-            session_id: session.session_id,
-            run_id: session.run_id,
-            status: session.status,
-            latest_question: latest_question_preview(&session.latest_question),
-            ledger_path: ledger_path.to_string_lossy().into_owned(),
-        })
-        .collect::<Vec<_>>();
+    let mut sessions =
+        crate::ledger::default_sqlite_session_summaries(&runtime.paths.default_ledger())?
+            .into_iter()
+            .map(|session| SessionSummary {
+                session_id: session.session_id,
+                run_id: session.run_id,
+                status: session.status,
+                latest_question: latest_question_preview(&session.latest_question),
+                ledger_path: ledger_path.to_string_lossy().into_owned(),
+            })
+            .collect::<Vec<_>>();
 
     let state = runtime.state.lock().expect("runtime state lock poisoned");
     let active_sessions = state
@@ -574,9 +576,9 @@ fn handle_transcript_read(
     params: TranscriptReadParams,
 ) -> Envelope {
     let transcript = if let Some(run_id) = params.run_id {
-        read_run_transcript(&runtime.paths.ledger_path, &run_id)
+        read_run_transcript(&runtime.paths.default_ledger(), &run_id)
     } else if let Some(session_id) = params.session_id {
-        read_session_transcript(&runtime.paths.ledger_path, &session_id)
+        read_session_transcript(&runtime.paths.default_ledger(), &session_id)
     } else {
         return Envelope::error(
             request.id,
@@ -613,11 +615,13 @@ fn runtime_pending_approval(
     record.pending_approval()
 }
 
-fn read_run_transcript(path: &Path, run_id: &str) -> AppResult<TranscriptReadResult> {
-    if !path.exists() {
+fn read_run_transcript(path: &DefaultSqlitePath, run_id: &str) -> AppResult<TranscriptReadResult> {
+    if std::fs::symlink_metadata(path.as_path())
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
         return Err(AppError::RunNotFound(run_id.into()));
     }
-    let run = SqliteLedger::open_readonly(path)?.read_session_run(run_id)?;
+    let run = SqliteLedger::open_default_readonly(path)?.read_session_run(run_id)?;
     let readback = RunReadback::from_events(&run.records)?;
     let transcript = format_readback(&readback);
     Ok(TranscriptReadResult {
@@ -632,11 +636,16 @@ fn read_run_transcript(path: &Path, run_id: &str) -> AppResult<TranscriptReadRes
     })
 }
 
-fn read_session_transcript(path: &Path, session_id: &str) -> AppResult<TranscriptReadResult> {
-    if !path.exists() {
+fn read_session_transcript(
+    path: &DefaultSqlitePath,
+    session_id: &str,
+) -> AppResult<TranscriptReadResult> {
+    if std::fs::symlink_metadata(path.as_path())
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
         return Err(AppError::SessionNotFound(session_id.into()));
     }
-    let session = SqliteLedger::open_readonly(path)?.read_session(session_id)?;
+    let session = SqliteLedger::open_default_readonly(path)?.read_session(session_id)?;
     let latest = session
         .runs
         .last()
@@ -735,13 +744,14 @@ fn transcript_error_code(error: &AppError) -> &'static str {
 }
 
 fn latest_session_id(runtime: &DaemonRuntime) -> Result<String, String> {
-    crate::ledger::latest_sqlite_session_id(&runtime.paths.ledger_path).map_err(|error| match error
-    {
-        crate::AppError::NoSqliteSessions | crate::AppError::NoSqliteRuns => {
-            "no previous session exists".into()
-        }
-        error => error.to_string(),
-    })
+    crate::ledger::latest_default_sqlite_session_id(&runtime.paths.default_ledger()).map_err(
+        |error| match error {
+            crate::AppError::NoSqliteSessions | crate::AppError::NoSqliteRuns => {
+                "no previous session exists".into()
+            }
+            error => error.to_string(),
+        },
+    )
 }
 
 fn handle_with_params<T: serde::de::DeserializeOwned>(

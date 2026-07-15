@@ -22,4 +22,4 @@ pub use app::{
     RunOutcome, RunSession, new_run_id, new_session_id, run_question,
 };
 pub use error::{AppError, AppResult};
-pub use replay::{replay_file, replay_sqlite, replay_sqlite_session};
+pub use replay::{replay_default_sqlite, replay_file, replay_sqlite, replay_sqlite_session};
