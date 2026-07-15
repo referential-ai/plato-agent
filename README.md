@@ -316,6 +316,10 @@ locally in `plato-tui`. The gateway never sends approval decisions. Failed runs
 post `Run failed. Inspect it locally with: plato replay`; canceled and
 interrupted runs stay silent.
 
+Allowed-owner messages over 4,096 UTF-8 bytes or matching the fixed unsafe-input
+markers are rejected before daemon access with `Message rejected: unsafe or
+oversized Discord input.` Accepted messages are forwarded unchanged.
+
 ## TUI
 
 `plato --tui` is the interactive local entrypoint. It attaches to the workspace

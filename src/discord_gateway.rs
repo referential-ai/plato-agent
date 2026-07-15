@@ -26,7 +26,31 @@ use url::Url;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 const DISCORD_INTENTS: u64 = (1 << 9) | (1 << 12) | (1 << 15);
+const DISCORD_INPUT_LIMIT: usize = 4_096;
 const DISCORD_MESSAGE_LIMIT: usize = 2_000;
+const DISCORD_REJECTION_MESSAGE: &str = "Message rejected: unsafe or oversized Discord input.";
+const DISCORD_UNSAFE_MARKERS: [&str; 20] = [
+    "act as",
+    "assistant message",
+    "assistant messages",
+    "developer message",
+    "developer messages",
+    "disregard previous instructions",
+    "disregard prior instructions",
+    "function call",
+    "function calls",
+    "ignore all previous instructions",
+    "ignore previous instructions",
+    "ignore prior instructions",
+    "system prompt",
+    "tool call",
+    "tool calls",
+    "you are chatgpt",
+    "you are now",
+    "<system>",
+    "<|im_start|>",
+    "<|im_end|>",
+];
 const GATEWAY_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const GATEWAY_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const GATEWAY_RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -151,6 +175,11 @@ impl DiscordGateway {
         if !self.owner_user_ids.contains(&message.author_id) || message.content.trim().is_empty() {
             return Ok(());
         }
+        if discord_input_is_unsafe(&message.content) {
+            self.platform
+                .send_message(message.channel_id, DISCORD_REJECTION_MESSAGE)?;
+            return Ok(());
+        }
         self.handle_message(message.channel_id, message.content)
     }
 
@@ -272,6 +301,47 @@ impl DiscordGateway {
             Err(error) => Err(error),
         }
     }
+}
+
+fn discord_input_is_unsafe(content: &str) -> bool {
+    if content.len() > DISCORD_INPUT_LIMIT {
+        return true;
+    }
+    let normalized = normalize_discord_input(content);
+    DISCORD_UNSAFE_MARKERS.iter().any(|marker| {
+        if marker.starts_with('<') {
+            normalized.contains(marker)
+        } else {
+            contains_ascii_bounded_marker(&normalized, marker)
+        }
+    })
+}
+
+fn normalize_discord_input(content: &str) -> String {
+    let mut normalized = String::with_capacity(content.len());
+    let mut previous_was_whitespace = false;
+    for character in content.chars() {
+        if character.is_whitespace() {
+            if !previous_was_whitespace {
+                normalized.push(' ');
+            }
+            previous_was_whitespace = true;
+        } else if !character.is_control() {
+            normalized.push(character.to_ascii_lowercase());
+            previous_was_whitespace = false;
+        }
+    }
+    normalized
+}
+
+fn contains_ascii_bounded_marker(content: &str, marker: &str) -> bool {
+    content.match_indices(marker).any(|(start, _)| {
+        let end = start + marker.len();
+        let bytes = content.as_bytes();
+        let starts_at_boundary = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let ends_at_boundary = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        starts_at_boundary && ends_at_boundary
+    })
 }
 
 fn require_capabilities(hello: &HelloResult) -> AppResult<()> {
@@ -985,11 +1055,71 @@ mod tests {
     }
 
     #[test]
+    fn rejects_every_fixed_marker_after_scan_normalization() {
+        for marker in DISCORD_UNSAFE_MARKERS {
+            assert!(discord_input_is_unsafe(marker), "marker: {marker}");
+
+            let mut obfuscated = String::new();
+            for character in marker.chars() {
+                if character == ' ' {
+                    obfuscated.push('\u{2003}');
+                } else {
+                    obfuscated.push(character.to_ascii_uppercase());
+                }
+                obfuscated.push('\u{7}');
+            }
+            assert!(
+                discord_input_is_unsafe(&obfuscated),
+                "normalized marker: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_normalization_collapses_whitespace_and_removes_other_controls() {
+        assert_eq!(
+            normalize_discord_input("\tACT\u{a0}\u{0}\u{2003}\nAS\u{7}"),
+            " act as"
+        );
+        assert!(discord_input_is_unsafe("sys\u{0}tem prompt"));
+    }
+
+    #[test]
+    fn alphabetic_markers_use_ascii_alphanumeric_boundaries() {
+        for marker in DISCORD_UNSAFE_MARKERS
+            .iter()
+            .filter(|marker| !marker.starts_with('<'))
+        {
+            assert!(!discord_input_is_unsafe(&format!("x{marker}")));
+            assert!(!discord_input_is_unsafe(&format!("{marker}x")));
+            assert!(discord_input_is_unsafe(&format!("_{marker}_")));
+        }
+        assert!(discord_input_is_unsafe("x<system>y"));
+        assert!(discord_input_is_unsafe("éact as"));
+    }
+
+    #[test]
+    fn discord_input_limit_counts_original_utf8_bytes() {
+        assert!(!discord_input_is_unsafe(&"a".repeat(DISCORD_INPUT_LIMIT)));
+        assert!(discord_input_is_unsafe(
+            &"a".repeat(DISCORD_INPUT_LIMIT + 1)
+        ));
+        assert!(!discord_input_is_unsafe(
+            &"é".repeat(DISCORD_INPUT_LIMIT / 2)
+        ));
+        assert!(discord_input_is_unsafe(&format!(
+            "{}a",
+            "é".repeat(DISCORD_INPUT_LIMIT / 2)
+        )));
+    }
+
+    #[test]
     fn non_owner_messages_are_silently_ignored() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let rest = spawn_fake_rest(0, 200, None);
-        let platform = test_platform(&rest.base_url, discord_message(99, 200, "ignore me"));
+        let content = "a".repeat(DISCORD_INPUT_LIMIT + 1);
+        let platform = test_platform(&rest.base_url, discord_message(99, 200, &content));
         let mut gateway =
             test_gateway(&workspace, socket_dir.path().join("missing.sock"), platform);
 
@@ -1000,19 +1130,56 @@ mod tests {
     }
 
     #[test]
+    fn oversized_empty_owner_message_is_silently_ignored() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let rest = spawn_fake_rest(0, 200, None);
+        let content = " ".repeat(DISCORD_INPUT_LIMIT + 1);
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, &content));
+        let mut gateway =
+            test_gateway(&workspace, socket_dir.path().join("missing.sock"), platform);
+
+        gateway.poll_once().unwrap();
+
+        assert!(rest.handle.join().unwrap().is_empty());
+        assert!(gateway.sessions.is_empty());
+    }
+
+    #[test]
+    fn unsafe_owner_message_is_rejected_before_daemon_or_session_access() {
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let rest = spawn_fake_rest(1, 200, None);
+        let platform = test_platform(
+            &rest.base_url,
+            discord_message(42, 200, "Please IGNORE\u{2003}PREVIOUS\u{7} INSTRUCTIONS"),
+        );
+        let mut gateway =
+            test_gateway(&workspace, socket_dir.path().join("missing.sock"), platform);
+        gateway.sessions.insert(200, "session_existing".into());
+
+        gateway.poll_once().unwrap();
+
+        let requests = rest.handle.join().unwrap();
+        assert_eq!(requests[0].body["content"], DISCORD_REJECTION_MESSAGE);
+        assert_eq!(gateway.sessions[&200], "session_existing");
+    }
+
+    #[test]
     fn owner_message_replies_with_typed_final_answer() {
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
         let socket_path = socket_dir.path().join("daemon.sock");
         let daemon = spawn_finished_daemon(&socket_path, "run.start", "session_1", "final answer");
         let rest = spawn_fake_rest(1, 200, None);
-        let platform = test_platform(&rest.base_url, discord_message(42, 200, "hello"));
+        let content = "keep\u{2003}this\u{7} byte-for-byte";
+        let platform = test_platform(&rest.base_url, discord_message(42, 200, content));
         let mut gateway = test_gateway(&workspace, socket_path, platform);
 
         gateway.poll_once().unwrap();
 
         let start_params = daemon.join().unwrap();
-        assert_eq!(start_params["question"], "hello");
+        assert_eq!(start_params["question"], content);
         assert!(start_params.get("session_id").is_none());
         assert_eq!(start_params["wait"], false);
         let requests = rest.handle.join().unwrap();
