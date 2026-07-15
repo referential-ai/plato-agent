@@ -112,8 +112,8 @@ ledger_path: <state-path>/agent.db
 
 Default paths are keyed by the workspace id:
 
-- Unix socket: `${XDG_RUNTIME_DIR:-/tmp/plato-agent/$USER}/plato-agent/workspaces/<workspace-id>/agent.sock`
-- Unix lock: `${XDG_RUNTIME_DIR:-/tmp/plato-agent/$USER}/plato-agent/workspaces/<workspace-id>/agent.lock`
+- Unix socket: `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/plato-agent/workspaces/<workspace-id>/agent.sock`
+- Unix lock: `${XDG_RUNTIME_DIR:-<system-temp>/plato-agent-<uid>}/plato-agent/workspaces/<workspace-id>/agent.lock`
 - Unix ledger: `${XDG_STATE_HOME:-$HOME/.local/state}/plato-agent/workspaces/<workspace-id>/agent.db`
 - Windows pipe: `\\.\pipe\plato-agent-<workspace-id>`
 - Windows lock and ledger: `%LOCALAPPDATA%\plato-agent\workspaces\<workspace-id>\agent.lock` and `agent.db`

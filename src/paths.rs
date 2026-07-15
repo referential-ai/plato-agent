@@ -116,13 +116,21 @@ fn state_home() -> AppResult<PathBuf> {
 
 #[cfg(unix)]
 pub(crate) fn runtime_home() -> AppResult<PathBuf> {
-    if let Some(value) = std::env::var_os("XDG_RUNTIME_DIR")
-        && !value.is_empty()
-    {
-        return Ok(PathBuf::from(value));
+    Ok(runtime_home_and_fallback().0)
+}
+
+#[cfg(unix)]
+pub(crate) fn runtime_home_and_fallback() -> (PathBuf, bool) {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        Some(value) => (PathBuf::from(value), false),
+        None => (
+            std::env::temp_dir().join(format!(
+                "plato-agent-{}",
+                rustix::process::geteuid().as_raw()
+            )),
+            true,
+        ),
     }
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-    Ok(std::env::temp_dir().join("plato-agent").join(user))
 }
 
 #[cfg(windows)]

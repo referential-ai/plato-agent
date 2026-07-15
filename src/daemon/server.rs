@@ -19,7 +19,7 @@ use std::fs;
 use std::{
     fs::{self, DirBuilder, Permissions},
     io::{Error, ErrorKind},
-    os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
 };
 
 #[cfg(unix)]
@@ -74,7 +74,10 @@ impl DaemonServer {
         let paths = DaemonPaths::resolve(workspace_root, socket_path)?;
         #[cfg(unix)]
         {
-            let runtime_home = paths::runtime_home()?;
+            let (runtime_home, is_fallback) = paths::runtime_home_and_fallback();
+            if is_fallback {
+                prepare_temp_runtime_home(&runtime_home)?;
+            }
             prepare_runtime_path(&runtime_home, &paths.lock_path)?;
             prepare_socket_parent(&runtime_home, &paths.socket_path)?;
         }
@@ -136,6 +139,55 @@ impl DaemonServer {
     fn handle_line(&self, line: &str) -> crate::daemon::protocol::Envelope {
         handle_line(&self.runtime, line)
     }
+}
+
+#[cfg(unix)]
+fn prepare_temp_runtime_home(path: &Path) -> std::io::Result<()> {
+    match DirBuilder::new().mode(PRIVATE_DIRECTORY_MODE).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    restrict_owned_runtime_home(path, rustix::process::geteuid().as_raw())
+}
+
+#[cfg(unix)]
+fn restrict_owned_runtime_home(path: &Path, expected_uid: u32) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "temporary runtime home is not a real directory: {}",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.uid() != expected_uid {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "temporary runtime home {} is owned by uid {}, expected {expected_uid}",
+                path.display(),
+                metadata.uid()
+            ),
+        ));
+    }
+    fs::set_permissions(path, Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != expected_uid
+    {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "temporary runtime home changed while securing it: {}",
+                path.display()
+            ),
+        ));
+    }
+    verify_mode(path, PRIVATE_DIRECTORY_MODE)
 }
 
 #[cfg(unix)]
@@ -355,6 +407,26 @@ mod tests {
         assert_eq!(mode(&parent), PRIVATE_DIRECTORY_MODE);
         assert_eq!(mode(&socket_path), SOCKET_MODE);
         drop(server);
+    }
+
+    #[test]
+    fn temp_runtime_home_rejects_foreign_owner_before_chmod() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_home = root.path().join("runtime");
+        fs::create_dir(&runtime_home).unwrap();
+        fs::set_permissions(&runtime_home, Permissions::from_mode(0o755)).unwrap();
+        let owner = fs::symlink_metadata(&runtime_home).unwrap().uid();
+        let foreign_uid = if owner == u32::MAX {
+            owner - 1
+        } else {
+            owner + 1
+        };
+
+        let error = restrict_owned_runtime_home(&runtime_home, foreign_uid).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("is owned by uid"));
+        assert_eq!(mode(&runtime_home), 0o755);
     }
 
     #[test]
