@@ -10,14 +10,17 @@ use std::{
 };
 
 const CHILD_ENV: &str = "PLATO_TEST_UNIX_RUNTIME_FALLBACK_CHILD";
+const CHILD_PROOF_ENV: &str = "PLATO_TEST_UNIX_RUNTIME_FALLBACK_PROOF";
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
 #[test]
 fn no_xdg_runtime_fallback_is_private_and_safe() {
     let temp_root = tempfile::tempdir().unwrap();
+    let proof = temp_root.path().join("proof");
     let output = Command::new(env::current_exe().unwrap())
         .args(["--ignored", "--exact", "no_xdg_runtime_fallback_child"])
         .env(CHILD_ENV, "1")
+        .env(CHILD_PROOF_ENV, &proof)
         .env_remove("XDG_RUNTIME_DIR")
         .env("XDG_STATE_HOME", temp_root.path().join("state"))
         .env("TMPDIR", temp_root.path())
@@ -30,6 +33,7 @@ fn no_xdg_runtime_fallback_is_private_and_safe() {
         "child proof failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(proof.exists(), "child proof did not run");
 }
 
 #[test]
@@ -79,6 +83,7 @@ fn no_xdg_runtime_fallback_child() {
 
     assert!(error.to_string().contains("not a real directory"));
     assert!(!runtime_home.join("plato-agent").exists());
+    fs::write(env::var_os(CHILD_PROOF_ENV).unwrap(), b"ok").unwrap();
 }
 
 fn fallback_runtime_home(temp_root: &Path) -> PathBuf {
