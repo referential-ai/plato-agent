@@ -272,8 +272,12 @@ jobs:
             (Join-Path $ssh "config"),
             (Join-Path $ssh "known_hosts")
           )
-          Remove-Item -LiteralPath $paths -Force -ErrorAction SilentlyContinue
           foreach ($path in $paths) {
+            if (Test-Path -LiteralPath $path) {
+              icacls $path /grant:r "$($env:USERNAME):(F)" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "failed to authorize credential cleanup: $path" }
+              Remove-Item -LiteralPath $path -Force
+            }
             if (Test-Path -LiteralPath $path) { throw "private dependency credential remains: $path" }
           }
           $extraHeaders = @(git config --local --get-regexp '^http\..*\.extraheader$' 2>$null)
@@ -374,8 +378,12 @@ jobs:
             (Join-Path $ssh "config"),
             (Join-Path $ssh "known_hosts")
           )
-          Remove-Item -LiteralPath $paths -Force -ErrorAction SilentlyContinue
           foreach ($path in $paths) {
+            if (Test-Path -LiteralPath $path) {
+              icacls $path /grant:r "$($env:USERNAME):(F)" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "failed to authorize credential cleanup: $path" }
+              Remove-Item -LiteralPath $path -Force
+            }
             if (Test-Path -LiteralPath $path) { throw "private dependency credential remains: $path" }
           }
           $extraHeaders = @(git config --local --get-regexp '^http\..*\.extraheader$' 2>$null)
