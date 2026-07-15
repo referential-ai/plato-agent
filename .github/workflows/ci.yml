@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Check out plato-agent
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Configure SSH for private platonic-core dependency
         env:
@@ -37,6 +39,22 @@ jobs:
             IdentitiesOnly yes
           EOF
           chmod 600 ~/.ssh/config
+
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked
+
+      - name: Remove private dependency credentials
+        run: |
+          rm -f ~/.ssh/platonic_core_deploy_key ~/.ssh/config ~/.ssh/known_hosts
+          test ! -e ~/.ssh/platonic_core_deploy_key
+          if git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1; then
+            echo "checkout credentials remain" >&2
+            exit 1
+          else
+            status=$?
+            test "$status" -eq 1 || exit "$status"
+          fi
+          echo 'CARGO_NET_OFFLINE=true' >> "$GITHUB_ENV"
 
       - name: Install Rust components
         run: |
