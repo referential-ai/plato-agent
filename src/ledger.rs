@@ -23,6 +23,8 @@ const SQLITE_SCHEMA_VERSION: u32 = 2;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
+#[cfg(unix)]
+const SIDECAR_HARDEN_ATTEMPTS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -793,15 +795,40 @@ fn restrict_existing_sidecars(database: &Path) -> std::io::Result<()> {
         let mut sidecar = database.as_os_str().to_os_string();
         sidecar.push(suffix);
         let path = PathBuf::from(sidecar);
-        match fs::symlink_metadata(&path) {
-            Ok(_) => {
-                restrict_private_file(&path, false)?;
+        restrict_existing_sidecar(&path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_existing_sidecar(path: &Path) -> std::io::Result<()> {
+    for attempt in 0..SIDECAR_HARDEN_ATTEMPTS {
+        match restrict_private_file(path, false) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if sidecar_is_absent(path)? {
+                    return Ok(());
+                }
+                if attempt + 1 == SIDECAR_HARDEN_ATTEMPTS {
+                    return Err(Error::new(
+                        ErrorKind::PermissionDenied,
+                        format!("SQLite sidecar kept changing: {}", path.display()),
+                    ));
+                }
             }
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
-    Ok(())
+    unreachable!("sidecar hardening loop always returns")
+}
+
+#[cfg(unix)]
+fn sidecar_is_absent(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -1247,6 +1274,39 @@ mod tests {
             sidecar.push(suffix);
             assert_eq!(mode(&PathBuf::from(sidecar)), PRIVATE_FILE_MODE);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_or_reappeared_sidecars_are_rechecked() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let sidecar = root.path().join("agent.db-journal");
+        assert!(sidecar_is_absent(&sidecar).unwrap());
+        restrict_existing_sidecar(&sidecar).unwrap();
+
+        fs::write(&sidecar, []).unwrap();
+        set_mode(&sidecar, 0o644);
+        assert!(!sidecar_is_absent(&sidecar).unwrap());
+        restrict_existing_sidecar(&sidecar).unwrap();
+        assert_eq!(mode(&sidecar), PRIVATE_FILE_MODE);
+
+        fs::remove_file(&sidecar).unwrap();
+        let target = root.path().join("target");
+        fs::write(&target, []).unwrap();
+        symlink(&target, &sidecar).unwrap();
+        assert_eq!(
+            restrict_existing_sidecar(&sidecar).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+
+        fs::remove_file(&sidecar).unwrap();
+        fs::create_dir(&sidecar).unwrap();
+        assert_eq!(
+            restrict_existing_sidecar(&sidecar).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
     }
 
     #[cfg(unix)]
