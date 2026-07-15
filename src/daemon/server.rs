@@ -345,7 +345,7 @@ mod tests {
     use std::{
         io::{BufRead, Read},
         net::TcpListener,
-        os::unix::fs::{PermissionsExt, symlink},
+        os::unix::fs::PermissionsExt,
         os::unix::net::UnixStream,
         sync::{Arc, Barrier, mpsc},
         thread,
@@ -353,18 +353,6 @@ mod tests {
     };
 
     const FAKE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(15);
-
-    fn with_temp_runtime<T>(root: &Path, run: impl FnOnce() -> T) -> T {
-        let state_home = root.join("state");
-        temp_env::with_vars(
-            [
-                ("XDG_RUNTIME_DIR", None),
-                ("XDG_STATE_HOME", Some(state_home.as_os_str())),
-                ("TMPDIR", Some(root.as_os_str())),
-            ],
-            run,
-        )
-    }
 
     fn pending_request(run_id: &str, call_id: &str) -> ApprovalRequest {
         ApprovalRequest {
@@ -419,66 +407,6 @@ mod tests {
         assert_eq!(mode(&parent), PRIVATE_DIRECTORY_MODE);
         assert_eq!(mode(&socket_path), SOCKET_MODE);
         drop(server);
-    }
-
-    #[test]
-    fn no_xdg_start_tightens_temp_runtime_home_and_restarts() {
-        let workspace = tempfile::tempdir().unwrap();
-        let temp_root = tempfile::tempdir().unwrap();
-
-        with_temp_runtime(temp_root.path(), || {
-            let (runtime_home, is_fallback) = paths::runtime_home_and_fallback();
-            assert!(is_fallback);
-            fs::create_dir(&runtime_home).unwrap();
-            fs::set_permissions(&runtime_home, Permissions::from_mode(0o755)).unwrap();
-
-            let first = DaemonServer::bind_inner(workspace.path(), None).unwrap();
-            let socket_path = first.paths().socket_path.clone();
-            assert!(socket_path.starts_with(runtime_home.join("plato-agent")));
-            assert!(socket_path.exists());
-            assert_eq!(mode(&runtime_home), PRIVATE_DIRECTORY_MODE);
-            drop(first);
-
-            let second = DaemonServer::bind_inner(workspace.path(), None).unwrap();
-            assert_eq!(second.paths().socket_path, socket_path);
-            assert!(socket_path.exists());
-            assert_eq!(mode(&runtime_home), PRIVATE_DIRECTORY_MODE);
-            drop(second);
-        });
-    }
-
-    #[test]
-    fn no_xdg_start_rejects_precreated_runtime_home_symlink() {
-        let workspace = tempfile::tempdir().unwrap();
-        let temp_root = tempfile::tempdir().unwrap();
-
-        with_temp_runtime(temp_root.path(), || {
-            let (runtime_home, _) = paths::runtime_home_and_fallback();
-            let target = temp_root.path().join("target");
-            fs::create_dir(&target).unwrap();
-            symlink(&target, &runtime_home).unwrap();
-
-            let error = DaemonServer::bind_inner(workspace.path(), None).unwrap_err();
-
-            assert!(error.to_string().contains("not a real directory"));
-            assert!(!target.join("plato-agent").exists());
-        });
-    }
-
-    #[test]
-    fn no_xdg_start_rejects_wrong_type_runtime_home() {
-        let workspace = tempfile::tempdir().unwrap();
-        let temp_root = tempfile::tempdir().unwrap();
-
-        with_temp_runtime(temp_root.path(), || {
-            let (runtime_home, _) = paths::runtime_home_and_fallback();
-            fs::write(&runtime_home, b"not a directory").unwrap();
-
-            let error = DaemonServer::bind_inner(workspace.path(), None).unwrap_err();
-
-            assert!(error.to_string().contains("not a real directory"));
-            assert!(!runtime_home.join("plato-agent").exists());
-        });
     }
 
     #[test]

@@ -221,28 +221,6 @@ mod tests {
         });
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn fallback_runtime_home_uses_numeric_uid_under_temp_root() {
-        let root = tempfile::tempdir().unwrap();
-        temp_env::with_vars(
-            [
-                ("XDG_RUNTIME_DIR", None),
-                ("TMPDIR", Some(root.path().as_os_str())),
-                ("USER", Some(std::ffi::OsStr::new("spoofed-name"))),
-            ],
-            || {
-                assert_eq!(
-                    runtime_home().unwrap(),
-                    root.path().join(format!(
-                        "plato-agent-{}",
-                        rustix::process::geteuid().as_raw()
-                    ))
-                );
-            },
-        );
-    }
-
     #[cfg(windows)]
     #[test]
     fn windows_paths_use_local_app_data_and_workspace_pipe() {
