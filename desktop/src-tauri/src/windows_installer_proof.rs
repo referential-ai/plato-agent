@@ -55,7 +55,7 @@ fn unsigned_installer_cold_launch_upgrade_and_uninstall_matrix() {
     assert!(run_installer(&base_installer).success());
     let base = InstalledSnapshot::capture("0.1.0");
     let gate = InstallerStartupGate::acquire().unwrap();
-    let mut blocked_app = spawn_app(&base.main);
+    let mut blocked_app = spawn_app(&base.main, None);
     let blocked_status = wait_for_status(&mut blocked_app, PROOF_TIMEOUT, &base.main);
     assert!(
         !blocked_status.success(),
@@ -65,7 +65,7 @@ fn unsigned_installer_cold_launch_upgrade_and_uninstall_matrix() {
 
     let first_provider = PausedFakeProvider::start("installed cold launch reply");
     write_provider_config(first_workspace.path(), &first_provider.base_url);
-    let mut app = spawn_app(&base.main);
+    let mut app = spawn_app(&base.main, Some(&first_workspace.path().join("plato.toml")));
     let mut first_client = connect_workspace(first_workspace.path());
     let cold_run = first_client
         .run_start("prove installed cold launch".into(), None, false)
@@ -120,7 +120,10 @@ fn unsigned_installer_cold_launch_upgrade_and_uninstall_matrix() {
     );
     assert_user_state(&workspace_file, &first_marker, &second_marker);
 
-    let mut upgraded_app = spawn_app(&upgraded.main);
+    let mut upgraded_app = spawn_app(
+        &upgraded.main,
+        Some(&first_workspace.path().join("plato.toml")),
+    );
     let first_client = connect_workspace(first_workspace.path());
     drop(first_client);
 
@@ -290,8 +293,12 @@ fn wait_for_status(child: &mut Child, timeout: Duration, program: &Path) -> Exit
     }
 }
 
-fn spawn_app(executable: &Path) -> Child {
-    Command::new(executable)
+fn spawn_app(executable: &Path, config_path: Option<&Path>) -> Child {
+    let mut command = Command::new(executable);
+    if let Some(config_path) = config_path {
+        command.env("PLATO_CONFIG", config_path);
+    }
+    command
         .env("PLATO_INSTALLER_TEST_KEY", PROOF_KEY)
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
@@ -305,6 +312,7 @@ fn spawn_daemon(executable: &Path, workspace: &Path) -> Child {
     Command::new(executable)
         .arg("--workspace")
         .arg(workspace)
+        .env("PLATO_CONFIG", workspace.join("plato.toml"))
         .env("PLATO_INSTALLER_TEST_KEY", PROOF_KEY)
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
