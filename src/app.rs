@@ -3,6 +3,7 @@ use crate::{
     config::{Config, ProviderKind},
     ledger::{EventRecorder, SessionTurn, SqliteLedger},
     model::{ModelBlock, ModelMessage, ModelRequest, ModelResponse, ModelStop, system_prompt},
+    paths::DefaultSqlitePath,
     provider::openai_compat::{OpenAiCompatibleClient, TokenLimitField},
     tool_catalog::{SHELL_EXEC, ToolSpec, effect_for_tool, tool_specs},
     tools::{
@@ -84,6 +85,7 @@ pub struct AssistantDeltaEvent {
 pub enum RunLedger {
     Jsonl(PathBuf),
     Sqlite(PathBuf),
+    DefaultSqlite(DefaultSqlitePath),
 }
 
 #[derive(Clone, Default)]
@@ -194,14 +196,13 @@ struct ActiveSessionRun {
 
 impl ActiveSessionRun {
     fn begin(
-        ledger_path: &std::path::Path,
+        mut ledger: SqliteLedger,
         session: &RunSession,
         run_id: &RunId,
         question: &str,
         config: &Config,
         tools: &[ToolSpec],
     ) -> AppResult<(Self, Vec<ModelMessage>)> {
-        let mut ledger = SqliteLedger::open_or_create(ledger_path)?;
         let turns = ledger.begin_session_run(
             session.session_id(),
             run_id,
@@ -314,7 +315,18 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
     let (mut session_run, mut messages) = match (&options.ledger, &options.session) {
         (RunLedger::Sqlite(path), Some(session)) => {
             let (session_run, messages) = ActiveSessionRun::begin(
-                path,
+                SqliteLedger::open_or_create(path)?,
+                session,
+                &run_id,
+                &options.question,
+                &config,
+                &tools,
+            )?;
+            (Some(session_run), messages)
+        }
+        (RunLedger::DefaultSqlite(path), Some(session)) => {
+            let (session_run, messages) = ActiveSessionRun::begin(
+                SqliteLedger::open_or_create_default(path)?,
                 session,
                 &run_id,
                 &options.question,
@@ -334,6 +346,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
     let mut recorder = match &options.ledger {
         RunLedger::Jsonl(path) => EventRecorder::create_jsonl(path)?,
         RunLedger::Sqlite(path) => EventRecorder::create_sqlite(path, &run_id)?,
+        RunLedger::DefaultSqlite(path) => EventRecorder::create_default_sqlite(path, &run_id)?,
     };
     let agent_id = AgentId::new("plato")?;
     let model = ModelName::new(config.provider.model.clone())?;
@@ -1904,9 +1917,15 @@ enabled = ["file.read"]
         };
         let config = Config::default();
         let tools = tool_specs(&config.tools.enabled);
-        let (session_run, _) =
-            ActiveSessionRun::begin(&ledger_path, &session, &run_id, "hello", &config, &tools)
-                .unwrap();
+        let (session_run, _) = ActiveSessionRun::begin(
+            SqliteLedger::open_or_create(&ledger_path).unwrap(),
+            &session,
+            &run_id,
+            "hello",
+            &config,
+            &tools,
+        )
+        .unwrap();
         let mut session_run = Some(session_run);
         let mut recorder = EventRecorder::create_sqlite(&ledger_path, &run_id).unwrap();
         let options = RunOptions {

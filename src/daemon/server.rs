@@ -49,6 +49,10 @@ impl DaemonPaths {
             socket_path,
         })
     }
+
+    pub(crate) fn default_ledger(&self) -> paths::DefaultSqlitePath {
+        paths::DefaultSqlitePath::from_path(self.ledger_path.clone())
+    }
 }
 
 #[derive(Debug)]
@@ -89,7 +93,7 @@ impl DaemonServer {
                 .expect("default Windows lock path has a parent"),
         )?;
         let lock = WorkspaceLock::acquire_for_workspace(&paths.workspace_root, &paths.socket_path)?;
-        crate::ledger::interrupt_orphaned_sqlite_runs(&paths.ledger_path)?;
+        crate::ledger::interrupt_orphaned_default_sqlite_runs(&paths.default_ledger())?;
         #[cfg(unix)]
         if paths.socket_path.exists() {
             fs::remove_file(&paths.socket_path)?;
