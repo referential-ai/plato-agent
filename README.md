@@ -8,9 +8,9 @@ replayable, and auditable. It is the first application shell built on
 
 **New here? Start with [docs/QUICKSTART.md](docs/QUICKSTART.md) — build, run, and test in five minutes.**
 
-Migration note: current packages, commands, config, state paths, and release
-assets retain their `plato*` technical names until the compatibility migration
-lands.
+Technical naming: the repository, package, commands, config, state paths, and
+release assets retain their stable `plato*` identities. Public copy uses
+Platonic.
 
 The bootstrap surface is intentionally small:
 
@@ -259,7 +259,7 @@ npm ci
 npm run tauri:bundle:windows
 ```
 
-The installer retains the legacy `Plato` identity under `%LOCALAPPDATA%`,
+The installer retains its technical `Plato` identity under `%LOCALAPPDATA%`,
 bundles the same-revision `plato-agentd.exe`, and downloads the WebView2
 Evergreen bootstrapper when the runtime is absent. Upgrade and uninstall first
 close the desktop, block new installed-sidecar starts, and make one bounded
