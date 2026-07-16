@@ -1130,7 +1130,7 @@ impl DiscordGatewayReceiver {
         if set_read_timeout(&mut socket, self.read_timeout).is_err() {
             return GatewayControl::Resume;
         }
-        let heartbeat_interval = match wait_for_hello(&mut socket, stop) {
+        let heartbeat_interval = match wait_for_hello(&mut socket, stop, GATEWAY_HELLO_TIMEOUT) {
             Ok(interval) => interval,
             Err(control) => return control,
         };
@@ -1328,8 +1328,9 @@ fn gateway_url(base_url: &str) -> AppResult<String> {
 fn wait_for_hello(
     socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
     stop: &AtomicBool,
+    timeout: Duration,
 ) -> Result<Duration, GatewayControl> {
-    let deadline = Instant::now() + GATEWAY_HELLO_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
         let Some(payload) = read_gateway_payload(socket)? else {
             continue;
@@ -1446,7 +1447,11 @@ mod tests {
         path::Path,
         time::Instant,
     };
-    use tungstenite::{accept, error::ProtocolError};
+    use tungstenite::{
+        accept,
+        error::ProtocolError,
+        protocol::{CloseFrame, frame::coding::CloseCode},
+    };
 
     #[test]
     fn gateway_environment_rejects_provider_credentials() {
@@ -2465,6 +2470,142 @@ mod tests {
         assert_eq!(requests[0].authorization, "Bot test-token");
     }
 
+    #[test]
+    fn websocket_recovery_opcode_7_resumes_with_latest_sequence() {
+        let (listener, websocket_url) = test_gateway_listener();
+        let (stop, messages, worker) = spawn_test_gateway_receiver(&websocket_url);
+        let mut socket = accept_test_websocket(&listener);
+        establish_test_gateway_session(&mut socket, &websocket_url);
+
+        send_websocket_json(&mut socket, json!({"op": 7, "d": null}));
+
+        let mut resumed = accept_test_websocket(&listener);
+        let resume = hello_and_read_gateway_auth(&mut resumed, 60_000);
+        finish_recoverable_gateway_receiver(stop, messages, worker);
+        assert_gateway_resume(&resume);
+    }
+
+    #[test]
+    fn websocket_recovery_invalid_session_true_resumes() {
+        let (listener, websocket_url) = test_gateway_listener();
+        let (stop, messages, worker) = spawn_test_gateway_receiver(&websocket_url);
+        let mut socket = accept_test_websocket(&listener);
+        establish_test_gateway_session(&mut socket, &websocket_url);
+
+        send_websocket_json(&mut socket, json!({"op": 9, "d": true}));
+
+        let mut resumed = accept_test_websocket(&listener);
+        let resume = hello_and_read_gateway_auth(&mut resumed, 60_000);
+        finish_recoverable_gateway_receiver(stop, messages, worker);
+        assert_gateway_resume(&resume);
+    }
+
+    #[test]
+    fn websocket_recovery_invalid_session_false_reidentifies() {
+        let (listener, websocket_url) = test_gateway_listener();
+        let (stop, messages, worker) = spawn_test_gateway_receiver(&websocket_url);
+        let mut socket = accept_test_websocket(&listener);
+        establish_test_gateway_session(&mut socket, &websocket_url);
+
+        send_websocket_json(&mut socket, json!({"op": 9, "d": false}));
+
+        let mut reidentified = accept_test_websocket(&listener);
+        let identify = hello_and_read_gateway_auth(&mut reidentified, 60_000);
+        finish_recoverable_gateway_receiver(stop, messages, worker);
+        assert_gateway_identify(&identify);
+    }
+
+    #[test]
+    fn websocket_recovery_close_codes_resume() {
+        for code in [
+            None,
+            Some(1000),
+            Some(4000),
+            Some(4001),
+            Some(4002),
+            Some(4003),
+            Some(4005),
+            Some(4008),
+            Some(4999),
+        ] {
+            assert_recoverable_gateway_close(code, false);
+        }
+    }
+
+    #[test]
+    fn websocket_recovery_close_codes_reidentify() {
+        for code in [4007, 4009] {
+            assert_recoverable_gateway_close(Some(code), true);
+        }
+    }
+
+    #[test]
+    fn websocket_recovery_close_codes_are_fatal() {
+        for code in [4004, 4010, 4011, 4012, 4013, 4014] {
+            assert_fatal_gateway_close(code);
+        }
+    }
+
+    #[test]
+    fn websocket_recovery_missing_heartbeat_ack_resumes() {
+        let (listener, websocket_url) = test_gateway_listener();
+        let (stop, messages, worker) = spawn_test_gateway_receiver(&websocket_url);
+        let mut socket = accept_test_websocket(&listener);
+        let identify = hello_and_read_gateway_auth(&mut socket, 20);
+        assert_gateway_identify(&identify);
+        send_websocket_json(
+            &mut socket,
+            json!({
+                "op": 0,
+                "s": TEST_READY_SEQUENCE,
+                "t": "READY",
+                "d": {
+                    "session_id": TEST_SESSION_ID,
+                    "resume_gateway_url": websocket_url
+                }
+            }),
+        );
+
+        let heartbeat = read_websocket_json(&mut socket)
+            .expect("gateway did not send a heartbeat before the test bound");
+        assert_eq!(heartbeat["op"], 1);
+
+        let mut resumed = accept_test_websocket(&listener);
+        let resume = hello_and_read_gateway_auth(&mut resumed, 60_000);
+        finish_recoverable_gateway_receiver(stop, messages, worker);
+        assert_eq!(resume["op"], 6);
+        assert_eq!(resume["d"]["session_id"], TEST_SESSION_ID);
+        assert_eq!(resume["d"]["seq"], TEST_READY_SEQUENCE);
+    }
+
+    #[test]
+    fn websocket_recovery_missing_hello_returns_resume_within_test_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(TEST_GATEWAY_BOUND)).unwrap();
+            let _socket = accept(stream).unwrap();
+            released.recv_timeout(TEST_GATEWAY_BOUND).unwrap();
+        });
+        let (mut socket, _) = connect(&websocket_url).unwrap();
+        set_read_timeout(&mut socket, Duration::from_millis(5)).unwrap();
+        let stop = AtomicBool::new(false);
+
+        let started = Instant::now();
+        let control = wait_for_hello(&mut socket, &stop, Duration::from_millis(30))
+            .expect_err("missing HELLO unexpectedly succeeded");
+
+        assert!(matches!(control, GatewayControl::Resume));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "missing HELLO exceeded the local test bound"
+        );
+        release.send(()).unwrap();
+        server.join().unwrap();
+    }
+
     fn discord_config() -> DiscordGatewayConfig {
         DiscordGatewayConfig {
             api_key_env: "DISCORD_BOT_TOKEN".into(),
@@ -2688,6 +2829,177 @@ mod tests {
         )
         .unwrap();
         stream.write_all(&body).unwrap();
+    }
+
+    const TEST_GATEWAY_BOUND: Duration = Duration::from_secs(2);
+    const TEST_GATEWAY_READ_TIMEOUT: Duration = Duration::from_millis(10);
+    const TEST_SESSION_ID: &str = "discord_session";
+    const TEST_READY_SEQUENCE: u64 = 17;
+    const TEST_LATEST_SEQUENCE: u64 = 23;
+
+    fn test_gateway_listener() -> (TcpListener, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
+        (listener, websocket_url)
+    }
+
+    fn accept_test_websocket(listener: &TcpListener) -> WebSocket<TcpStream> {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + TEST_GATEWAY_BOUND;
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "gateway connection exceeded the local test bound"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("gateway websocket accept failed: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(TEST_GATEWAY_BOUND)).unwrap();
+        accept(stream).unwrap()
+    }
+
+    fn spawn_test_gateway_receiver(
+        websocket_url: &str,
+    ) -> (
+        Arc<AtomicBool>,
+        Receiver<AppResult<DiscordMessage>>,
+        thread::JoinHandle<()>,
+    ) {
+        let (sender, messages) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let receiver = DiscordGatewayReceiver {
+            token: "test-token".into(),
+            initial_url: websocket_url.into(),
+            read_timeout: TEST_GATEWAY_READ_TIMEOUT,
+            reconnect_delay: Duration::from_millis(1),
+        };
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || receiver.run(sender, worker_stop));
+        (stop, messages, worker)
+    }
+
+    fn finish_recoverable_gateway_receiver(
+        stop: Arc<AtomicBool>,
+        messages: Receiver<AppResult<DiscordMessage>>,
+        worker: thread::JoinHandle<()>,
+    ) {
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        let results = messages.into_iter().collect::<Vec<_>>();
+        assert!(
+            results.is_empty(),
+            "recoverable gateway path emitted {} receiver results",
+            results.len()
+        );
+    }
+
+    fn hello_and_read_gateway_auth(
+        socket: &mut WebSocket<TcpStream>,
+        heartbeat_interval: u64,
+    ) -> Value {
+        send_websocket_json(
+            socket,
+            json!({"op": 10, "d": {"heartbeat_interval": heartbeat_interval}}),
+        );
+        read_websocket_json(socket).expect("gateway disconnected before authenticating")
+    }
+
+    fn establish_test_gateway_session(socket: &mut WebSocket<TcpStream>, websocket_url: &str) {
+        let identify = hello_and_read_gateway_auth(socket, 60_000);
+        assert_gateway_identify(&identify);
+        send_websocket_json(
+            socket,
+            json!({
+                "op": 0,
+                "s": TEST_READY_SEQUENCE,
+                "t": "READY",
+                "d": {
+                    "session_id": TEST_SESSION_ID,
+                    "resume_gateway_url": websocket_url
+                }
+            }),
+        );
+        send_websocket_json(
+            socket,
+            json!({
+                "op": 0,
+                "s": TEST_LATEST_SEQUENCE,
+                "t": "CHANNEL_UPDATE",
+                "d": {}
+            }),
+        );
+    }
+
+    fn assert_gateway_identify(payload: &Value) {
+        assert_eq!(payload["op"], 2);
+        assert_eq!(payload["d"]["token"], "test-token");
+        assert_eq!(payload["d"]["intents"], DISCORD_INTENTS);
+        assert!(payload["d"].get("session_id").is_none());
+        assert!(payload["d"].get("seq").is_none());
+    }
+
+    fn assert_gateway_resume(payload: &Value) {
+        assert_eq!(payload["op"], 6);
+        assert_eq!(payload["d"]["token"], "test-token");
+        assert_eq!(payload["d"]["session_id"], TEST_SESSION_ID);
+        assert_eq!(payload["d"]["seq"], TEST_LATEST_SEQUENCE);
+    }
+
+    fn assert_recoverable_gateway_close(code: Option<u16>, reidentify: bool) {
+        let (listener, websocket_url) = test_gateway_listener();
+        let (stop, messages, worker) = spawn_test_gateway_receiver(&websocket_url);
+        let mut socket = accept_test_websocket(&listener);
+        establish_test_gateway_session(&mut socket, &websocket_url);
+
+        send_websocket_close(&mut socket, code);
+
+        let mut reconnected = accept_test_websocket(&listener);
+        let auth = hello_and_read_gateway_auth(&mut reconnected, 60_000);
+        finish_recoverable_gateway_receiver(stop, messages, worker);
+        if reidentify {
+            assert_gateway_identify(&auth);
+        } else {
+            assert_gateway_resume(&auth);
+        }
+    }
+
+    fn assert_fatal_gateway_close(code: u16) {
+        let (listener, websocket_url) = test_gateway_listener();
+        let (stop, messages, worker) = spawn_test_gateway_receiver(&websocket_url);
+        let mut socket = accept_test_websocket(&listener);
+        let identify = hello_and_read_gateway_auth(&mut socket, 60_000);
+        assert_gateway_identify(&identify);
+
+        send_websocket_close(&mut socket, Some(code));
+
+        let result = match messages.recv_timeout(TEST_GATEWAY_BOUND) {
+            Ok(result) => result,
+            Err(error) => {
+                stop.store(true, Ordering::Relaxed);
+                panic!("fatal close code {code} did not stop the receiver: {error}");
+            }
+        };
+        let error = result.expect_err("fatal close emitted a Discord message");
+        worker.join().unwrap();
+        assert!(messages.into_iter().next().is_none());
+        assert_eq!(
+            error.to_string(),
+            format!("provider error: discord gateway closed with fatal code {code}")
+        );
+    }
+
+    fn send_websocket_close(socket: &mut WebSocket<TcpStream>, code: Option<u16>) {
+        let frame = code.map(|code| CloseFrame {
+            code: CloseCode::from(code),
+            reason: "test close".into(),
+        });
+        socket.send(Message::Close(frame)).unwrap();
     }
 
     fn read_websocket_json(socket: &mut WebSocket<TcpStream>) -> Option<Value> {
