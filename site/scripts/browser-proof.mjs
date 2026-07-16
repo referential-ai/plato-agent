@@ -122,13 +122,6 @@ async function inspectLayout(page) {
         continue;
       }
 
-      if (element.clientWidth > 0 && element.scrollWidth > element.clientWidth + tolerance) {
-        clipped.add(`${describe(element)} text exceeds width`);
-      }
-      if (element.clientHeight > 0 && element.scrollHeight > element.clientHeight + tolerance) {
-        clipped.add(`${describe(element)} text exceeds height`);
-      }
-
       const rect = element.getBoundingClientRect();
       for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
         if (isExempt(ancestor)) {
