@@ -47,6 +47,9 @@ pub enum AppError {
     #[error("question is empty")]
     EmptyQuestion,
 
+    #[error("run did not finish: run canceled")]
+    RunCanceled,
+
     #[error("run did not finish: {0}")]
     RunFailed(String),
 
