@@ -896,6 +896,14 @@ code {
     min-width: 68px;
   }
 
+  .primary-nav {
+    gap: 14px;
+  }
+
+  .primary-nav a {
+    font-size: 13px;
+  }
+
   .hero {
     height: min(500px, calc(100svh - 148px));
     min-height: 410px;

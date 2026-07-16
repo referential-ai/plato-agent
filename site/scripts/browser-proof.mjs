@@ -318,6 +318,7 @@ async function provePage(page, profile, route) {
 
   const layout = await page.evaluate(() => {
     const root = document.documentElement;
+    const navigation = document.querySelector(".primary-nav");
     const controls = [...document.querySelectorAll(".button")].map((element) => ({
       text: element.textContent?.trim() ?? "",
       widthFits: element.scrollWidth <= element.clientWidth + 1,
@@ -326,12 +327,14 @@ async function provePage(page, profile, route) {
     return {
       clientWidth: root.clientWidth,
       scrollWidth: root.scrollWidth,
+      navigationFits: !navigation || navigation.scrollWidth <= navigation.clientWidth + 1,
       reducedMotionScrollBehavior: getComputedStyle(root).scrollBehavior,
       controls,
     };
   });
 
   record(layout.scrollWidth <= layout.clientWidth + 1, `${profile.name} ${route}: horizontal overflow ${layout.scrollWidth}px > ${layout.clientWidth}px`);
+  record(layout.navigationFits, `${profile.name} ${route}: primary navigation requires horizontal scrolling`);
   record(layout.reducedMotionScrollBehavior === "auto", `${profile.name} ${route}: reduced motion must disable smooth scrolling`);
   for (const control of layout.controls) {
     record(control.widthFits && control.heightFits, `${profile.name} ${route}: button text does not fit: ${control.text}`);
