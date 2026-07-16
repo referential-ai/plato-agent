@@ -154,9 +154,9 @@ Function ${prefix}PlatoShutdownDaemons
   nsExec::Exec /TIMEOUT=${PLATO_CONTROL_TIMEOUT_MS} '"$INSTDIR\plato-agentd.exe" control shutdown-if-idle --quiet'
   Pop $0
   ${If} $0 != 0
-    DetailPrint "Plato daemon shutdown failed: $0"
+    DetailPrint "Plato Agent daemon shutdown failed: $0"
     Call ${prefix}PlatoReleaseInstallerGate
-    Abort "Plato has an active run or its local daemon could not be stopped."
+    Abort "Plato Agent has an active run or its local daemon could not be stopped."
   ${EndIf}
 FunctionEnd
 !macroend
@@ -176,7 +176,7 @@ FunctionEnd
   Call PlatoAcquireInstallerGate
   Pop $0
   ${If} $0 != "ok"
-    Abort "Another Plato installation, update, or daemon start is in progress."
+    Abort "Another Plato Agent installation, update, or daemon start is in progress."
   ${EndIf}
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
   Call PlatoShutdownDaemons
@@ -190,7 +190,7 @@ FunctionEnd
   Call un.PlatoAcquireInstallerGate
   Pop $0
   ${If} $0 != "ok"
-    Abort "Another Plato installation, update, or daemon start is in progress."
+    Abort "Another Plato Agent installation, update, or daemon start is in progress."
   ${EndIf}
   !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PRODUCTNAME}"
   Call un.PlatoShutdownDaemons

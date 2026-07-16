@@ -1,6 +1,6 @@
 {
   "identifier": "main",
-  "description": "Typed Plato desktop commands for the main window",
+  "description": "Typed Plato Agent desktop commands for the main window",
   "local": true,
   "windows": ["main"],
   "permissions": [

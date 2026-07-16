@@ -136,8 +136,10 @@ describe('desktop chat', () => {
 
 		render(Page);
 
+		await expect.element(page.getByLabelText('Plato Agent')).toBeVisible();
 		await expect.element(page.getByRole('heading', { name: 'Select a workspace' })).toBeVisible();
 		await page.getByRole('button', { name: 'Choose folder' }).click();
+		await expect.element(page.getByPlaceholder('Message Plato Agent')).toBeVisible();
 		await expect.element(page.getByText('I found the relevant module.')).toBeVisible();
 		await expect.element(page.getByText('The focused proof passed.')).toBeVisible();
 		await expect.element(page.getByRole('region', { name: 'Run 1, finished' })).toBeVisible();
@@ -150,7 +152,7 @@ describe('desktop chat', () => {
 			if (command === 'bootstrap') {
 				return Promise.reject({
 					code: 'desktop_already_open',
-					message: 'This workspace is already open in Plato'
+					message: 'This workspace is already open in Plato Agent'
 				});
 			}
 			throw new Error(`unexpected command ${command}`);
@@ -159,7 +161,7 @@ describe('desktop chat', () => {
 		render(Page);
 
 		await expect.element(page.getByRole('heading', { name: 'Workspace already open' })).toBeVisible();
-		await expect.element(page.getByText('This workspace is already open in Plato')).toBeVisible();
+		await expect.element(page.getByText('This workspace is already open in Plato Agent')).toBeVisible();
 	});
 
 	it('detects an idle daemon exit without restarting it', async () => {
@@ -490,7 +492,7 @@ describe('desktop chat', () => {
 
 		render(Page);
 
-		await expect.element(page.getByRole('region', { name: 'Plato, responding' })).toHaveTextContent('Draft answer');
+		await expect.element(page.getByRole('region', { name: 'Plato Agent, responding' })).toHaveTextContent('Draft answer');
 		await waitFor(() => pollCalls === 1);
 		poll.resolve(
 			eventPage(
@@ -502,7 +504,7 @@ describe('desktop chat', () => {
 			)
 		);
 
-		await expect.element(page.getByRole('region', { name: 'Plato' })).toHaveTextContent('Canonical answer');
+		await expect.element(page.getByRole('region', { name: 'Plato Agent' })).toHaveTextContent('Canonical answer');
 		await expect.element(page.getByText('Draft answer', { exact: true })).not.toBeInTheDocument();
 		await waitFor(() => document.querySelectorAll('.assistant-message').length === 1);
 	});

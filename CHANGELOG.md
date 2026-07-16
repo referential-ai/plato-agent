@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Align current copy with the workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md),
+  preserving all technical identifiers.
+
 ## 0.1.0 - 2026-07-15
 
 First release. Local CLI, daemon, TUI, desktop shell, and Discord gateway over

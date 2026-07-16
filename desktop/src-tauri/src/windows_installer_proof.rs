@@ -35,7 +35,7 @@ fn unsigned_installer_cold_launch_upgrade_and_uninstall_matrix() {
     let upgrade_installer = proof_file("PLATO_DESKTOP_TEST_UPGRADE_INSTALLER");
     assert!(
         registry_string("InstallLocation").unwrap().is_none(),
-        "installer proof requires a clean per-user Plato installation"
+        "installer proof requires a clean per-user installation using the Plato technical identity"
     );
 
     let first_workspace = tempfile::tempdir().unwrap();
