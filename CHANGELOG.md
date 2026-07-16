@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Present current product and UI copy as **Platonic by Referential.ai** while
-  preserving existing technical identifiers.
+- Align current copy with the workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md),
+  preserving all technical identifiers.
 
 ## 0.1.0 - 2026-07-15
 

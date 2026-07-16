@@ -31,7 +31,7 @@ const EMBEDDED_DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Parser)]
 #[command(name = "plato")]
-#[command(about = "Platonic CLI")]
+#[command(about = "Plato Agent CLI")]
 struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     config: Option<PathBuf>,

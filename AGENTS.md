@@ -1,6 +1,8 @@
-# Platonic Application Agent Guide
+# Plato Agent Guide
 
-`plato-agent` is the application/runtime shell built on `platonic-core`.
+The workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md)
+owns the hierarchy and exact forms. This repository hosts Plato Agent; its
+technical identities remain unchanged.
 
 ## Repo Boundary
 

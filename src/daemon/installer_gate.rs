@@ -59,7 +59,7 @@ impl InstallerStartupGate {
                 WAIT_TIMEOUT => {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
-                        "Platonic installation or update is in progress",
+                        "Plato Agent installation or update is in progress",
                     ));
                 }
                 WAIT_FAILED => return Err(io::Error::last_os_error()),

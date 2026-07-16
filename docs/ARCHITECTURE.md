@@ -1,4 +1,4 @@
-# Platonic Architecture
+# Plato Agent Architecture
 
 This document copies the topology decision from the Platonic workspace issue that bootstrapped `referential-ai/plato-agent`.
 

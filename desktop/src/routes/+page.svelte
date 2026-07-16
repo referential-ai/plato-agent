@@ -679,13 +679,13 @@
 	}
 </script>
 
-<svelte:head><title>{workspaceName ? `${workspaceName} - Platonic` : 'Platonic'}</title></svelte:head>
+<svelte:head><title>{workspaceName ? `${workspaceName} - Plato Agent` : 'Plato Agent'}</title></svelte:head>
 
 <main>
 	<header class="app-header" inert={pendingApproval !== null}>
-		<div class="brand" aria-label="Platonic">
+		<div class="brand" aria-label="Plato Agent">
 			<span class="brand-mark">P</span>
-			<span>Platonic</span>
+			<span>Plato Agent</span>
 		</div>
 		{#if screen.state === 'ready'}
 			<div class="workspace-label" title={screen.data.workspaceRoot}>

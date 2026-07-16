@@ -488,7 +488,7 @@ impl DesktopLifecycle {
                 |error| match error {
                     lifecycle::WorkspaceInstanceError::AlreadyOpen { .. } => DesktopError::new(
                         "desktop_already_open",
-                        "This workspace is already open in another Platonic desktop window",
+                        "This workspace is already open in another Plato Agent desktop window",
                     ),
                     lifecycle::WorkspaceInstanceError::Io(error) => DesktopError::new(
                         "desktop_single_instance_failed",
@@ -1853,7 +1853,7 @@ pub fn run() {
     #[cfg(windows)]
     drop(
         plato_agent::daemon::installer_gate::InstallerStartupGate::acquire()
-            .expect("Platonic installation or update is in progress"),
+            .expect("Plato Agent installation or update is in progress"),
     );
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -1879,7 +1879,7 @@ pub fn run() {
             cancel_run
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Platonic desktop");
+        .expect("error while running Plato Agent desktop");
 }
 
 #[cfg(all(test, unix))]

@@ -1,16 +1,21 @@
-# Platonic
+# Plato Agent
 
-**by Referential.ai**
+The reference agent runtime for the Platonic framework.
 
-Platonic is an open agent that shows its work: every step is recorded,
-replayable, and auditable. It is the first application shell built on
-`platonic-core`.
+**Platonic**
+
+*by Referential.ai*
+
+Plato Agent is the named application built on the Platonic framework. It shows
+its work: every step is recorded, replayable, and auditable.
+
+The workspace [naming authority](https://github.com/referential-ai/platonic-workspace/blob/main/product/branding.md)
+owns the hierarchy and exact forms.
 
 **New here? Start with [docs/QUICKSTART.md](docs/QUICKSTART.md) — build, run, and test in five minutes.**
 
-Technical naming: the repository, package, commands, config, state paths, and
-release assets retain their stable `plato*` identities. Public copy uses
-Platonic.
+Existing crate, repository, library, command, config, state, and release
+identities remain unchanged.
 
 The bootstrap surface is intentionally small:
 
@@ -224,7 +229,7 @@ manually started daemon. On Windows, the shell first attaches to a valid daemon
 for the selected workspace; when none is listening, it starts the absolute
 sibling `plato-agentd.exe` sidecar and retries for a bounded interval.
 
-![Platonic desktop showing an exact-run transcript](docs/images/desktop-platonic.png)
+![Plato Agent desktop showing an exact-run transcript](docs/images/desktop-plato-agent.png)
 
 ```bash
 # Terminal 1, from the repository root
@@ -274,7 +279,7 @@ Linux releases target x86-64 Ubuntu 24.04 on the WebKitGTK 4.1 ABI. The
 AppImage contains the same-revision `plato-agentd` sidecar. It first attaches
 to a valid workspace daemon; if none is available, it restores only the user's
 login-shell `PATH`, starts the bundled sidecar, and retries for a bounded
-interval. Closing Platonic detaches without stopping the daemon or active runs.
+interval. Closing Plato Agent detaches without stopping the daemon or active runs.
 Startup failures report the sidecar, socket, and lock paths and never delete a
 lock or fall back to a system daemon.
 
@@ -382,7 +387,7 @@ Keys:
 ```bash
 cargo run --bin plato -- "read README.md and summarize it"
 cargo run --bin plato -- -c "what did you just summarize?"
-cargo run --bin plato -- --yolo "write local-proof.txt with hello from Platonic"
+cargo run --bin plato -- --yolo "write local-proof.txt with hello from Plato Agent"
 cargo run --bin plato -- "run cargo test --locked and summarize the result"
 cargo run --bin plato -- replay
 cargo run --bin plato -- replay events.jsonl
@@ -404,7 +409,7 @@ kind = "open_router"
 model = "~openai/gpt-latest"
 api_key_env = "OPENROUTER_API_KEY"
 http_referer = "https://example.invalid"
-app_title = "Platonic"
+app_title = "Plato Agent"
 
 [limits]
 token_budget = 4000

@@ -13,5 +13,5 @@ fn main() {
             "cancel_run",
         ]),
     ))
-    .expect("failed to build Platonic desktop shell");
+    .expect("failed to build Plato Agent desktop shell");
 }
