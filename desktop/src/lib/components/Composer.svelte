@@ -53,7 +53,7 @@
 		disabled={disabled}
 		rows="1"
 		aria-label="Message"
-		placeholder="Message Plato"
+		placeholder="Message Platonic"
 		onkeydown={handleKeydown}
 	></textarea>
 

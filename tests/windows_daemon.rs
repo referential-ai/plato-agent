@@ -74,7 +74,7 @@ fn installer_gate_refuses_daemon_before_endpoint_or_lock_creation() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("Plato installation or update is in progress")
+            .contains("Platonic installation or update is in progress")
     );
     assert!(!lock_path.exists());
     assert!(DaemonClient::connect(&socket_path).is_err());

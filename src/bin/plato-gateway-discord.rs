@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "plato-gateway-discord")]
-#[command(about = "Discord gateway for a local Plato Agent daemon")]
+#[command(about = "Discord gateway for a local Platonic daemon")]
 struct Cli {
     #[arg(long, default_value = ".")]
     workspace: PathBuf,

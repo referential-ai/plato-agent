@@ -1,10 +1,16 @@
-# Plato Agent
+# Platonic
 
-Plato Agent is an open agent that shows its work: every step is recorded,
+**by Referential.ai**
+
+Platonic is an open agent that shows its work: every step is recorded,
 replayable, and auditable. It is the first application shell built on
 `platonic-core`.
 
 **New here? Start with [docs/QUICKSTART.md](docs/QUICKSTART.md) — build, run, and test in five minutes.**
+
+Migration note: current packages, commands, config, state paths, and release
+assets retain their `plato*` technical names until the compatibility migration
+lands.
 
 The bootstrap surface is intentionally small:
 
@@ -218,7 +224,7 @@ manually started daemon. On Windows, the shell first attaches to a valid daemon
 for the selected workspace; when none is listening, it starts the absolute
 sibling `plato-agentd.exe` sidecar and retries for a bounded interval.
 
-![Plato desktop showing an exact-run transcript](docs/images/desktop-phase-1.png)
+![Platonic desktop showing an exact-run transcript](docs/images/desktop-platonic.png)
 
 ```bash
 # Terminal 1, from the repository root
@@ -253,12 +259,12 @@ npm ci
 npm run tauri:bundle:windows
 ```
 
-The installer writes Plato under `%LOCALAPPDATA%`, bundles the same-revision
-`plato-agentd.exe`, and downloads the WebView2 Evergreen bootstrapper when the
-runtime is absent. Upgrade and uninstall first close the desktop, block new
-installed-sidecar starts, and make one bounded aggregate
-`plato-agentd control shutdown-if-idle` invocation. An active daemon or
-unvalidated lock aborts before installed Plato binaries or user files change;
+The installer retains the legacy `Plato` identity under `%LOCALAPPDATA%`,
+bundles the same-revision `plato-agentd.exe`, and downloads the WebView2
+Evergreen bootstrapper when the runtime is absent. Upgrade and uninstall first
+close the desktop, block new installed-sidecar starts, and make one bounded
+aggregate `plato-agentd control shutdown-if-idle` invocation. An active daemon or
+unvalidated lock aborts before installed binaries or user files change;
 idle daemons exit and remove their locks. These unsigned artifacts are for
 development proof only and are not distributed.
 
@@ -268,7 +274,7 @@ Linux releases target x86-64 Ubuntu 24.04 on the WebKitGTK 4.1 ABI. The
 AppImage contains the same-revision `plato-agentd` sidecar. It first attaches
 to a valid workspace daemon; if none is available, it restores only the user's
 login-shell `PATH`, starts the bundled sidecar, and retries for a bounded
-interval. Closing Plato detaches without stopping the daemon or active runs.
+interval. Closing Platonic detaches without stopping the daemon or active runs.
 Startup failures report the sidecar, socket, and lock paths and never delete a
 lock or fall back to a system daemon.
 
@@ -376,7 +382,7 @@ Keys:
 ```bash
 cargo run --bin plato -- "read README.md and summarize it"
 cargo run --bin plato -- -c "what did you just summarize?"
-cargo run --bin plato -- --yolo "write local-proof.txt with hello from Plato"
+cargo run --bin plato -- --yolo "write local-proof.txt with hello from Platonic"
 cargo run --bin plato -- "run cargo test --locked and summarize the result"
 cargo run --bin plato -- replay
 cargo run --bin plato -- replay events.jsonl
@@ -398,7 +404,7 @@ kind = "open_router"
 model = "~openai/gpt-latest"
 api_key_env = "OPENROUTER_API_KEY"
 http_referer = "https://example.invalid"
-app_title = "Plato Agent"
+app_title = "Platonic"
 
 [limits]
 token_budget = 4000

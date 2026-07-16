@@ -1,4 +1,4 @@
-# Plato Agent Agent Guide
+# Platonic Application Agent Guide
 
 `plato-agent` is the application/runtime shell built on `platonic-core`.
 

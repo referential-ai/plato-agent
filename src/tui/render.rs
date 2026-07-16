@@ -101,7 +101,7 @@ fn history_lines(state: &TuiState) -> Vec<Line<'static>> {
 fn intro_lines(state: &TuiState) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![Span::styled(
-            "Plato Agent",
+            "Platonic",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -216,7 +216,7 @@ fn header_rule(state: &TuiState) -> Line<'static> {
     };
     Line::from(vec![
         Span::styled(
-            "Plato Agent",
+            "Platonic",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -700,7 +700,7 @@ mod tests {
 
         let output = render_to_text(&state);
 
-        assert!(output.contains("Plato Agent"));
+        assert!(output.contains("Platonic"));
         assert!(output.contains("Local Rust agent runtime"));
         assert!(output.contains("work-1234"));
         assert!(output.contains("model pending"));

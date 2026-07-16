@@ -53,10 +53,10 @@
 						<section
 							class="message assistant-message"
 							class:live={!entry.final}
-							aria-label={entry.final ? 'Plato' : 'Plato, responding'}
+							aria-label={entry.final ? 'Platonic' : 'Platonic, responding'}
 						>
 							<div class="message-label">
-								Plato
+								Platonic
 								{#if !entry.final}<span class="live-label">Live</span>{/if}
 							</div>
 							<p>{entry.text}</p>

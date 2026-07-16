@@ -1,4 +1,4 @@
-# Quickstart — run and test Plato
+# Quickstart — run and test Platonic
 
 Everything below is copy-pasteable. Companion docs: [`../README.md`](../README.md) (full reference), [`ARCHITECTURE.md`](ARCHITECTURE.md) (topology and law).
 
