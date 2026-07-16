@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Introducing Platonic | Platonic field notes</title>
+    <meta
+      name="description"
+      content="Platonic starts with typed boundaries and a durable ledger. Plato Agent makes that framework concrete."
+    >
+    <meta name="theme-color" content="#ffffff">
+    <meta property="og:type" content="article">
+    <meta property="og:title" content="Introducing Platonic: visible work, replayable by default">
+    <meta
+      property="og:description"
+      content="Why the framework starts with typed boundaries and a durable ledger."
+    >
+    <meta
+      property="og:image"
+      content="https://referential.ai/assets/plato-agent-desktop.png"
+    >
+    <link rel="canonical" href="https://referential.ai/blog/introducing-platonic/">
+    <link
+      rel="alternate"
+      type="application/atom+xml"
+      title="Platonic field notes"
+      href="/feed.xml"
+    >
+    <link rel="stylesheet" href="/assets/site.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+
+    <header class="site-header">
+      <div class="shell header-inner">
+        <a class="brand" href="/" aria-label="Platonic home">
+          <span>Platonic</span>
+          <small>by Referential.ai</small>
+        </a>
+        <nav class="primary-nav" aria-label="Primary" data-allow-scroll>
+          <a href="/#why">Framework</a>
+          <a href="/#replay">Replay</a>
+          <a href="/#resources">Resources</a>
+          <a href="/blog/" aria-current="page">Blog</a>
+        </nav>
+        <a
+          class="button button-small"
+          href="/#start"
+        >
+          Start
+        </a>
+      </div>
+    </header>
+
+    <main id="main-content">
+      <article class="article-page">
+        <header class="article-header">
+          <div class="shell article-shell">
+            <a class="back-link" href="/blog/">Field notes</a>
+            <h1>Introducing Platonic: visible work, replayable by default</h1>
+            <p class="article-deck">
+              A framework for disciplined agent execution, made concrete by Plato Agent.
+            </p>
+            <p class="byline">
+              <time datetime="2026-07-15">July 15, 2026</time>
+              <span>Referential AI</span>
+            </p>
+          </div>
+        </header>
+
+        <div class="shell article-shell article-body">
+          <p class="article-lede">
+            Agent systems become difficult to trust when their most important choices are
+            hidden inside control flow. Platonic begins from a stricter premise: work that
+            changes an outcome should cross a typed boundary and leave durable evidence.
+          </p>
+
+          <h2>The framework</h2>
+          <p>
+            Platonic is the common foundation. It assembles bounded context, separates tool
+            proposals from policy decisions, and treats the event ledger as the source of
+            truth for replay and audit. Hosts still own real IO; the framework keeps the
+            execution contract small and inspectable.
+          </p>
+
+          <h2>The reference runtime</h2>
+          <p>
+            Plato Agent is the named application and reference runtime built on Platonic. It
+            connects providers, local tools, approvals, persistence, daemon clients, and the
+            desktop experience without moving those concerns into the kernel.
+          </p>
+          <p>
+            A session can continue across clients, pause for a local approval, recover after
+            interruption, and replay from recorded events. The application shows the
+            framework under real product pressure while preserving the boundary between
+            durable semantics and host mechanics.
+          </p>
+
+          <figure class="article-image">
+            <a href="/assets/plato-agent-desktop.png">
+              <img
+                src="/assets/plato-agent-desktop.png"
+                alt="Plato Agent desktop showing a completed session explaining the Platonic framework boundary."
+                width="1180"
+                height="760"
+              >
+            </a>
+            <figcaption>Plato Agent is the reference runtime; Platonic is the framework.</figcaption>
+          </figure>
+
+          <h2>Start with evidence</h2>
+          <p>
+            The quickest way to understand the system is to run a bounded task and replay
+            its ledger. The canonical quickstart covers the build, first run, approvals, and
+            offline readback without creating a second documentation path here.
+          </p>
+
+          <div class="article-actions">
+            <a
+              class="button"
+              href="https://github.com/referential-ai/plato-agent/blob/main/docs/QUICKSTART.md"
+            >
+              Open the quickstart
+            </a>
+            <a class="text-link" href="https://github.com/referential-ai/plato-agent">
+              Explore the source
+            </a>
+          </div>
+        </div>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-inner">
+        <p class="footer-lockup"><strong>Platonic</strong> <span>by Referential.ai</span></p>
+        <nav aria-label="Footer">
+          <a href="https://github.com/referential-ai/plato-agent">Source</a>
+          <a href="https://github.com/referential-ai/plato-agent/releases">Releases</a>
+          <a href="/feed.xml">Feed</a>
+        </nav>
+        <p>Apache-2.0 or MIT.</p>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://referential.ai/sitemap.xml

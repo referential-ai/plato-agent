@@ -1,0 +1,15 @@
+**
+!site/
+!site/Dockerfile
+!site/nginx.conf
+!site/index.html
+!site/feed.xml
+!site/sitemap.xml
+!site/robots.txt
+!site/assets/
+!site/assets/**
+!site/blog/
+!site/blog/**
+!docs/
+!docs/images/
+!docs/images/desktop-plato-agent.png
