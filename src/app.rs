@@ -391,7 +391,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
             let delta_turn_id = turn_id.clone();
             client.send_streaming(&request, |text| {
                 if cancel_requested(&options) {
-                    return Err(AppError::RunFailed(RUN_CANCELED_REASON.into()));
+                    return Err(AppError::RunCanceled);
                 }
                 if text.is_empty() {
                     return Ok(());
@@ -440,7 +440,7 @@ pub fn run_question(options: RunOptions) -> AppResult<RunOutcome> {
                     session_run.fail(&reason, canceled)?;
                 }
                 if canceled {
-                    return Err(AppError::RunFailed(reason));
+                    return Err(AppError::RunCanceled);
                 }
                 return Err(error);
             }
@@ -818,7 +818,11 @@ fn fail_run<T>(
     if let Some(session_run) = session_run.as_mut() {
         session_run.fail(&reason, canceled)?;
     }
-    Err(AppError::RunFailed(reason))
+    if canceled {
+        Err(AppError::RunCanceled)
+    } else {
+        Err(AppError::RunFailed(reason))
+    }
 }
 
 fn stream_enabled(options: &RunOptions) -> bool {
@@ -1952,10 +1956,7 @@ enabled = ["file.read"]
 
         let error = check_cancel(&mut recorder, &options, &run_id, &mut session_run).unwrap_err();
 
-        assert!(
-            matches!(&error, AppError::RunFailed(reason) if reason == RUN_CANCELED_REASON),
-            "unexpected cancel error: {error:?}"
-        );
+        assert!(matches!(error, AppError::RunCanceled));
         let records =
             crate::ledger::read_sqlite_records(&ledger_path, Some("run_check_cancel")).unwrap();
         assert!(records.iter().any(|record| matches!(
@@ -2045,10 +2046,7 @@ enabled = ["file.read"]
             started.elapsed() < std::time::Duration::from_secs(2),
             "stream cancel should not wait for provider timeout"
         );
-        assert!(matches!(
-            error,
-            AppError::RunFailed(reason) if reason == RUN_CANCELED_REASON
-        ));
+        assert!(matches!(error, AppError::RunCanceled));
         let _provider_request = server.handle.join().unwrap();
 
         let records =
