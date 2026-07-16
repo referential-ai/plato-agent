@@ -1,0 +1,161 @@
+name: Site
+
+on:
+  pull_request:
+    paths:
+      - site/**
+      - .dockerignore
+      - docs/images/desktop-plato-agent.png
+      - .github/workflows/site.yml
+  push:
+    branches:
+      - main
+    paths:
+      - site/**
+      - .dockerignore
+      - docs/images/desktop-plato-agent.png
+      - .github/workflows/site.yml
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/referential-ai/platonic-site
+
+jobs:
+  verify:
+    name: Verify site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out plato-agent
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install site dependencies
+        working-directory: site
+        run: npm ci
+
+      - name: Check the static site
+        working-directory: site
+        run: npm run check
+
+      - name: Check external links
+        working-directory: site
+        run: npm run check:external
+
+      - name: Require digest-pinned container bases
+        run: |
+          set -euo pipefail
+          from_count=$(grep -Ec '^[[:space:]]*FROM[[:space:]]+' site/Dockerfile)
+          pinned_count=$(grep -Ec '^[[:space:]]*FROM[[:space:]]+[^[:space:]@]+@sha256:[0-9a-f]{64}([[:space:]]|$)' site/Dockerfile)
+          test "$from_count" -gt 0
+          test "$from_count" -eq "$pinned_count"
+
+      - name: Build and smoke-test the container
+        run: |
+          set -euo pipefail
+          docker build --pull --file site/Dockerfile --tag platonic-site:verify .
+          docker run --detach \
+            --name platonic-site-verify \
+            --publish 127.0.0.1:8080:8080 \
+            platonic-site:verify
+          for _ in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:8080/ >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs platonic-site-verify
+          exit 1
+
+      - name: Install Chromium
+        working-directory: site
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser proof
+        working-directory: site
+        env:
+          BASE_URL: http://127.0.0.1:8080
+        run: npm run test:browser
+
+      - name: Upload browser proof
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: site-browser-${{ github.sha }}
+          path: site/artifacts/browser
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Stop the verification container
+        if: ${{ always() }}
+        run: docker rm --force platonic-site-verify >/dev/null 2>&1 || true
+
+  publish:
+    name: Publish site image
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out plato-agent
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Build and publish the full-SHA tag
+        id: publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          tag="$IMAGE_NAME:$GITHUB_SHA"
+          docker build --pull --file site/Dockerfile --tag "$tag" .
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          logout() { docker logout ghcr.io >/dev/null 2>&1 || true; }
+          trap logout EXIT
+          docker push "$tag" | tee "$RUNNER_TEMP/site-push.log"
+          digest=$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' "$RUNNER_TEMP/site-push.log" | tail -n 1)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf "Published \`%s@%s\`.\n" "$IMAGE_NAME" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io >/dev/null
+          trap - EXIT
+
+      - name: Prove anonymous tag and digest readback
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          tag="$IMAGE_NAME:$GITHUB_SHA"
+          digest_ref="$IMAGE_NAME@$DIGEST"
+          anonymous_config="$RUNNER_TEMP/docker-anonymous"
+          mkdir -p "$anonymous_config"
+          printf '{"auths":{}}\n' > "$anonymous_config/config.json"
+
+          docker image rm "$tag" >/dev/null
+          DOCKER_CONFIG="$anonymous_config" docker pull "$tag"
+          docker image inspect "$tag" --format '{{json .RepoDigests}}' \
+            | jq --exit-status --arg expected "$digest_ref" "index(\$expected) != null"
+
+          docker image rm "$tag" >/dev/null
+          DOCKER_CONFIG="$anonymous_config" docker pull "$digest_ref"
+          docker image inspect "$digest_ref" --format '{{json .RepoDigests}}' \
+            | jq --exit-status --arg expected "$digest_ref" "index(\$expected) != null"
+          printf "Anonymous readback passed for \`%s\` and \`%s\`.\n" \
+            "$tag" "$digest_ref" >> "$GITHUB_STEP_SUMMARY"

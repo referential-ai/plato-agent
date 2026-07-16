@@ -1,0 +1,25 @@
+{
+  "name": "platonic-site",
+  "private": true,
+  "description": "Validation and browser proof for the static Platonic site.",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24.8.0"
+  },
+  "scripts": {
+    "check": "npm run check:html && npm run check:site",
+    "check:external": "node scripts/check-site.mjs --external",
+    "check:html": "html-validate \"index.html\" \"blog/**/*.html\"",
+    "check:site": "node scripts/check-site.mjs",
+    "proof:browser": "npm run test:browser",
+    "test:browser": "node scripts/browser-proof.mjs"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "fast-xml-parser": "5.10.1",
+    "html-validate": "11.5.6",
+    "parse5": "8.0.1",
+    "playwright": "1.61.1"
+  }
+}

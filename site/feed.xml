@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en">
+  <title>Platonic field notes</title>
+  <id>https://referential.ai/feed.xml</id>
+  <link rel="self" type="application/atom+xml" href="https://referential.ai/feed.xml"/>
+  <link rel="alternate" type="text/html" href="https://referential.ai/blog/"/>
+  <updated>2026-07-15T00:00:00Z</updated>
+  <author>
+    <name>Referential AI</name>
+    <uri>https://referential.ai/</uri>
+  </author>
+  <entry>
+    <title>Introducing Platonic: visible work, replayable by default</title>
+    <id>https://referential.ai/blog/introducing-platonic/</id>
+    <link rel="alternate" type="text/html" href="https://referential.ai/blog/introducing-platonic/"/>
+    <published>2026-07-15T00:00:00Z</published>
+    <updated>2026-07-15T00:00:00Z</updated>
+    <summary>
+      Why the framework starts with typed boundaries and a durable ledger, and how Plato Agent puts them to work.
+    </summary>
+  </entry>
+</feed>
