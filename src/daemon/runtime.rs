@@ -1,5 +1,5 @@
 use crate::{
-    AppResult, ApprovalRequest, AssistantDeltaEvent,
+    AppError, AppResult, ApprovalRequest, AssistantDeltaEvent,
     daemon::{
         protocol::{PendingApprovalSnapshot, RunStateName},
         server::DaemonPaths,
@@ -243,15 +243,14 @@ impl RunRecord {
         status.error = None;
     }
 
-    pub(super) fn set_failed(&self, error: String) {
+    pub(super) fn set_terminal_error(&self, error: &AppError) {
         let mut status = self.status.lock().expect("run status lock poisoned");
-        status.state = if self.cancel.load(Ordering::SeqCst) {
-            RunStateName::Canceled
-        } else {
-            RunStateName::Failed
+        status.state = match error {
+            AppError::RunCanceled => RunStateName::Canceled,
+            _ => RunStateName::Failed,
         };
         status.final_answer = None;
-        status.error = Some(error);
+        status.error = Some(error.to_string());
     }
 
     pub(super) fn pending_approval(&self) -> Option<PendingApprovalSnapshot> {
@@ -340,6 +339,20 @@ mod tests {
             format!("session_{index}"),
             PathBuf::from("/tmp/agent.db"),
         ))
+    }
+
+    #[test]
+    fn late_cancel_does_not_reclassify_failure() {
+        let record = run_record(1);
+        record.cancel.store(true, Ordering::SeqCst);
+
+        record.set_terminal_error(&AppError::RunFailed("provider failed".into()));
+
+        assert_eq!(record.status().state, RunStateName::Failed);
+        assert_eq!(
+            record.status().error.as_deref(),
+            Some("run did not finish: provider failed")
+        );
     }
 
     #[test]

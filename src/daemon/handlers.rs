@@ -257,7 +257,7 @@ fn start_run(
                 run_start_response(request_id, method, &record)
             }
             Err(error) => {
-                record.set_failed(error.to_string());
+                record.set_terminal_error(&error);
                 Envelope::error(
                     request_id,
                     Some(method.into()),
@@ -270,7 +270,7 @@ fn start_run(
         let worker_record = record.clone();
         thread::spawn(move || match run_question(options) {
             Ok(outcome) => worker_record.set_finished(outcome.final_answer),
-            Err(error) => worker_record.set_failed(error.to_string()),
+            Err(error) => worker_record.set_terminal_error(&error),
         });
         run_start_response(request_id, method, &record)
     }
