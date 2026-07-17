@@ -6,6 +6,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -18,7 +22,7 @@ jobs:
         working-directory: desktop
     steps:
       - name: Check out plato-agent
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
 
@@ -33,7 +37,7 @@ jobs:
           fi
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
@@ -65,9 +69,14 @@ jobs:
         working-directory: desktop
     steps:
       - name: Check out plato-agent
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
 
       - name: Fetch locked Rust dependencies
         run: |
@@ -86,7 +95,7 @@ jobs:
             libxdo-dev
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
@@ -97,9 +106,6 @@ jobs:
 
       - name: Install web dependencies
         run: npm ci
-
-      - name: Run root Rust tests
-        run: cargo test --manifest-path ../Cargo.toml --locked
 
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
@@ -165,7 +171,7 @@ jobs:
           )
 
       - name: Upload Linux AppImage proof artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-appimage
           path: artifacts/linux-appimage/*
@@ -179,7 +185,7 @@ jobs:
       RUST_BACKTRACE: "1"
     steps:
       - name: Check out plato-agent
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
 
@@ -234,9 +240,14 @@ jobs:
       RUST_BACKTRACE: "1"
     steps:
       - name: Check out plato-agent
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
 
       - name: Fetch locked Rust dependencies
         shell: pwsh
@@ -247,7 +258,7 @@ jobs:
           "CARGO_NET_OFFLINE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
