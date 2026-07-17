@@ -898,7 +898,7 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
     }
 
     #[test]
-    fn run_cancel_unblocks_pending_approval_within_bound() {
+    fn run_cancel_without_wait_records_canceled_in_memory_and_sqlite() {
         let provider = spawn_tool_call_provider();
         let workspace = tempfile::tempdir().unwrap();
         let socket_dir = tempfile::tempdir().unwrap();
@@ -947,8 +947,58 @@ api_key_env = "PLATO_AGENT_TEST_MISSING_KEY"
             thread::sleep(Duration::from_millis(5));
         }
 
-        assert_eq!(record.status().state, RunStateName::Canceled);
+        assert_canceled_terminal(&server, &record);
         assert_eq!(record.pending_approval(), None);
+        provider.handle.join().unwrap();
+    }
+
+    #[test]
+    fn run_cancel_with_wait_records_canceled_in_memory_and_sqlite() {
+        let provider = spawn_tool_call_provider();
+        let workspace = tempfile::tempdir().unwrap();
+        let socket_dir = tempfile::tempdir().unwrap();
+        let socket_path = socket_dir.path().join("agent.sock");
+        let config_path = workspace.path().join("plato.toml");
+        write_provider_config(&config_path, &provider.base_url, "file.write");
+        let server = DaemonServer::bind(workspace.path(), Some(socket_path)).unwrap();
+        let runtime = server.runtime.clone();
+        let request = format!(
+            r#"{{"v":1,"id":"run_1","kind":"request","method":"run.start","params":{{"question":"write a file","config_path":"{}","wait":true}}}}"#,
+            config_path.display()
+        );
+        let run = thread::spawn(move || handle_line(&runtime, &request));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let record = loop {
+            let record = server
+                .runtime
+                .state
+                .lock()
+                .unwrap()
+                .runs
+                .values()
+                .next()
+                .cloned();
+            if let Some(record) = record
+                && record.approvals.lock().unwrap().contains_key("call_1")
+            {
+                break record;
+            }
+            assert!(Instant::now() < deadline, "approval did not become pending");
+            thread::sleep(Duration::from_millis(5));
+        };
+
+        let cancel = server.handle_line(&format!(
+            r#"{{"v":1,"id":"cancel_1","kind":"request","method":"run.cancel","params":{{"run_id":"{}"}}}}"#,
+            record.run_id
+        ));
+        assert_eq!(cancel.kind, EnvelopeKind::Response);
+        let response = run.join().unwrap();
+        assert_eq!(response.kind, EnvelopeKind::Error);
+        let error = response.error.unwrap();
+        assert_eq!(error.code, ERROR_RUN_FAILED);
+        assert_eq!(error.message, "run did not finish: run canceled");
+        assert_canceled_terminal(&server, &record);
         provider.handle.join().unwrap();
     }
 
@@ -2083,6 +2133,28 @@ enabled = ["{enabled_tool}"]
             assert!(Instant::now() < deadline, "run {run_id} did not finish");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn assert_canceled_terminal(server: &DaemonServer, record: &RunRecord) {
+        let status = record.status();
+        assert_eq!(status.state, RunStateName::Canceled);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("run did not finish: run canceled")
+        );
+
+        let ledger = SqliteLedger::open_readonly(&server.paths().ledger_path).unwrap();
+        let session = ledger.read_session(&record.session_id).unwrap();
+        let run = session
+            .runs
+            .iter()
+            .find(|run| run.run_id == record.run_id)
+            .unwrap();
+        assert_eq!(run.status, RunStateName::Canceled);
+        assert!(matches!(
+            run.records.last().map(|record| &record.event),
+            Some(HarnessEvent::RunFailed { reason, .. }) if reason == "run canceled"
+        ));
     }
 
     fn seed_finished_session(path: &Path, run_id: &str, session_id: &str, answer: &str) {
