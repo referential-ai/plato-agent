@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE_NAME: ghcr.io/referential-ai/platonic-site
+  IMAGE_NAME: registry.digitalocean.com/kb-sf-repo-1/referential-website
 
 jobs:
   verify:
@@ -69,18 +69,18 @@ jobs:
       - name: Build and smoke-test the container
         run: |
           set -euo pipefail
-          docker build --pull --file site/Dockerfile --tag platonic-site:verify .
+          docker build --pull --file site/Dockerfile --tag referential-website:verify .
           docker run --detach \
-            --name platonic-site-verify \
+            --name referential-website-verify \
             --publish 127.0.0.1:8080:8080 \
-            platonic-site:verify
+            referential-website:verify
           for _ in {1..30}; do
             if curl --fail --silent --show-error http://127.0.0.1:8080/ >/dev/null; then
               exit 0
             fi
             sleep 1
           done
-          docker logs platonic-site-verify
+          docker logs referential-website-verify
           exit 1
 
       - name: Install Chromium
@@ -104,7 +104,7 @@ jobs:
 
       - name: Stop the verification container
         if: ${{ always() }}
-        run: docker rm --force platonic-site-verify >/dev/null 2>&1 || true
+        run: docker rm --force referential-website-verify >/dev/null 2>&1 || true
 
   publish:
     name: Publish site image
@@ -114,52 +114,71 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      packages: write
     steps:
       - name: Check out plato-agent
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
 
-      - name: Build and publish the full-SHA tag
-        id: publish
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+      - name: Set up doctl
+        uses: digitalocean/action-doctl@3cb3953159719656269e044e0e24ca16dd2a690f # v2.5.2
+        with:
+          version: "1.163.0"
+          no_auth: "true"
+
+      - name: Verify the doctl version
+        run: test "$(doctl version)" = "doctl version 1.163.0-release"
+
+      - name: Build the full-SHA tag
         run: |
           set -euo pipefail
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
           tag="$IMAGE_NAME:$GITHUB_SHA"
           docker build --pull --file site/Dockerfile --tag "$tag" .
-          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          logout() { docker logout ghcr.io >/dev/null 2>&1 || true; }
-          trap logout EXIT
-          docker push "$tag" | tee "$RUNNER_TEMP/site-push.log"
+
+      - name: Publish and prove authenticated tag and digest readback
+        id: publish
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test -n "$DIGITALOCEAN_ACCESS_TOKEN"
+
+          registry=registry.digitalocean.com
+          tag="$IMAGE_NAME:$GITHUB_SHA"
+          umask 077
+          push_config=$(mktemp -d "$RUNNER_TEMP/docker-push.XXXXXX")
+          pull_config=$(mktemp -d "$RUNNER_TEMP/docker-pull.XXXXXX")
+          cleanup() {
+            unset DIGITALOCEAN_ACCESS_TOKEN
+            DOCKER_CONFIG="$push_config" docker logout "$registry" >/dev/null 2>&1 || true
+            DOCKER_CONFIG="$pull_config" docker logout "$registry" >/dev/null 2>&1 || true
+            rm -rf -- "$push_config" "$pull_config"
+          }
+          trap cleanup EXIT
+
+          doctl --config /dev/null registry docker-config \
+            --read-write --expiry-seconds 900 > "$push_config/config.json"
+          doctl --config /dev/null registry docker-config \
+            --read-write --expiry-seconds 900 > "$pull_config/config.json"
+          unset DIGITALOCEAN_ACCESS_TOKEN
+
+          DOCKER_CONFIG="$push_config" docker push "$tag" | tee "$RUNNER_TEMP/site-push.log"
           digest=$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' "$RUNNER_TEMP/site-push.log" | tail -n 1)
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
           printf "Published \`%s@%s\`.\n" "$IMAGE_NAME" "$digest" >> "$GITHUB_STEP_SUMMARY"
-          docker logout ghcr.io >/dev/null
-          trap - EXIT
-
-      - name: Prove anonymous tag and digest readback
-        env:
-          DIGEST: ${{ steps.publish.outputs.digest }}
-        run: |
-          set -euo pipefail
-          tag="$IMAGE_NAME:$GITHUB_SHA"
-          digest_ref="$IMAGE_NAME@$DIGEST"
-          anonymous_config="$RUNNER_TEMP/docker-anonymous"
-          mkdir -p "$anonymous_config"
-          printf '{"auths":{}}\n' > "$anonymous_config/config.json"
 
           docker image rm "$tag" >/dev/null
-          DOCKER_CONFIG="$anonymous_config" docker pull "$tag"
+          DOCKER_CONFIG="$pull_config" docker pull "$tag"
+          digest_ref="$IMAGE_NAME@$digest"
           docker image inspect "$tag" --format '{{json .RepoDigests}}' \
             | jq --exit-status --arg expected "$digest_ref" "index(\$expected) != null"
 
           docker image rm "$tag" >/dev/null
-          DOCKER_CONFIG="$anonymous_config" docker pull "$digest_ref"
+          DOCKER_CONFIG="$pull_config" docker pull "$digest_ref"
           docker image inspect "$digest_ref" --format '{{json .RepoDigests}}' \
             | jq --exit-status --arg expected "$digest_ref" "index(\$expected) != null"
-          printf "Anonymous readback passed for \`%s\` and \`%s\`.\n" \
+          printf "Authenticated readback passed for \`%s\` and \`%s\`.\n" \
             "$tag" "$digest_ref" >> "$GITHUB_STEP_SUMMARY"
