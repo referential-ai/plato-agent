@@ -826,6 +826,22 @@ mod tests {
     }
 
     #[test]
+    fn streaming_tool_calls_require_an_id() {
+        let raw = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"file_read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let error = parse_chat_completion_stream(Cursor::new(raw), &mut |_| Ok(())).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AppError::Provider(message) if message == "provider stream returned tool call without id"
+        ));
+    }
+
+    #[test]
     fn streaming_parser_rejects_adversarial_inputs() {
         let huge_event = format!(
             "data: {}\n\ndata: [DONE]\n\n",
